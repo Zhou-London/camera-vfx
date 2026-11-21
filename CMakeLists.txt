@@ -47,6 +47,10 @@ add_executable(mfenum tools/mfenum.cpp)
 add_executable(pacing_test tests/pacing_test.cpp src/pacing/clocks.cpp src/pacing/pacer.cpp src/pacing/cadence.cpp src/util/common.cpp)
 target_include_directories(pacing_test PRIVATE src)
 
+# Pacing regression from a real PS5 start-up (cadence retime after an irregular transition).
+add_executable(startup_test tests/startup_test.cpp src/pacing/clocks.cpp src/pacing/pacer.cpp src/pacing/cadence.cpp src/util/common.cpp)
+target_include_directories(startup_test PRIVATE src)
+
 # Repeat-frame detector test + benchmark (CPU only).
 add_executable(repeat_test tests/repeat_test.cpp src/capture/frame_diff.cpp src/util/common.cpp)
 target_include_directories(repeat_test PRIVATE src)

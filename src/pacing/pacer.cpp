@@ -237,8 +237,11 @@ PaceDecision Pacer::Decide(int64_t s, int64_t V) {
         const bool holding = lastLateT_ && (s - lastLateT_) < Qpc::FromMs(cfg_.holdAfterLateSec * 1000.0);
         const double err = minSlack - margin;
         if (err > 0 && fullWindow && !holding) {
-            // Release slowly (bounded playback-speed change).
-            const double step = std::min(gridMode ? err * 0.05 : maxRelease, maxRelease);
+            // Release slowly (bounded playback-speed change). A large proven excess (e.g. after a cadence
+            // retime on top of a transient) is given back faster: <= fastReleasePerSec ms/s (0.8 % speed).
+            const double rel = err > (double)Qpc::FromMs(cfg_.fastReleaseAboveMs)
+                                   ? (double)Qpc::FromMs(cfg_.fastReleasePerSec) * dt / (double)Qpc::Freq() : maxRelease;
+            const double step = std::min(gridMode ? err * 0.05 : rel, rel);
             if (gridMode || TrialMinSlack(delay_ - step - guard) >= margin) delay_ -= step;
         } else if (err < 0) {
             // Slack eroding (e.g. phase drift): approach the margin smoothly (4x faster than release).

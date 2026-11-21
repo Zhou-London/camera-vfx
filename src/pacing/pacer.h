@@ -48,6 +48,8 @@ struct PacerConfig {
     double snapEps = 0.06;          // t <= eps (or >= 1-eps) is snapped to a real frame
     double marginMs = 1.0;          // slack safety margin
     double releasePerSec = 2.0;     // max ms of delay reduction per second (playback speed change)
+    double fastReleasePerSec = 8.0; // ... while the proven excess slack is above fastReleaseAboveMs
+    double fastReleaseAboveMs = 4.0;
     double initialDelayMs = 30.0;
     double minDelayMs = 0.0;
     double maxDelayMs = 80.0;
