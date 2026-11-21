@@ -23,6 +23,8 @@
 #include "interpolator.h"
 #include "nvOpticalFlowD3D12.h"
 #include <vector>
+#include <map>
+#include <string>
 #include <cmath>
 
 namespace camss {
@@ -32,8 +34,8 @@ static const char* kNvofCS = R"(
 cbuffer CB : register(b0) {
     uint W, H, FW, FH;          // source size, flow grid size
     float G, invG, t, pad0;     // grid cell size in pixels
-    float invW, invH, pad1, pad2;
-    float alpha, pOcc, pEdge, pad3;         // tflow scoring
+    float invW, invH, lambda, beta;         // small-motion prior, alias-equivalence weight
+    float alpha, pOcc, pEdge; uint ringCount;   // tflow scoring
     float sGood, sBad, invSig2, pwOcc;      // confidence / compose weighting
 };
 
@@ -76,23 +78,33 @@ float4 PatchB(float2 p) {
 }
 
 struct Best { float s; float2 u; float m; };
+float Mad(float4 a, float4 b) { float4 d = abs(a - b); return 0.25 * (d.x + d.y + d.z + d.w); }
 
 void Eval(float2 x, float2 u, inout Best b) {
     float2 p0 = x - t * u, p1 = x + (1.0 - t) * u;
     bool in0 = Inside(p0), in1 = Inside(p1);
-    float g0 = length(LoadM0(p0) - u);
-    float g1 = length(LoadM1(p1) + u);
+    float2 f0 = LoadM0(p0), f1 = LoadM1(p1);
+    float4 pa = PatchA(p0), pb = PatchB(p1);
+    // Geometric consistency with the NVOF fields, alias-tolerant: on periodic or flat content NVOF often
+    // returns a vector that differs from u by a period of the texture ((54,-64) instead of (-10,0) on a
+    // 64 px checkerboard). Such a vector is photometrically equivalent to u: frame-a point p0 lands on the
+    // same-looking content in b whether it moves by f0 or by u. So the disagreement counts only as much as
+    // the appearance difference it implies.
+    float g0 = min(length(f0 - u), beta * Mad(PatchB(p0 + f0), pb));
+    float g1 = min(length(f1 + u), beta * Mad(PatchA(p1 + f1), pa));
+    // Among equivalent explanations prefer the smallest motion (the one that gives the right
+    // intermediate frame for periodic content; costs ~1 px of score for 40 px motion).
+    float prior = lambda * length(u);
     if (in0 && in1) {
-        float4 d = abs(PatchA(p0) - PatchB(p1));
-        float s = g0 + g1 + alpha * 0.25 * (d.x + d.y + d.z + d.w);
+        float s = g0 + g1 + alpha * Mad(pa, pb) + prior;
         if (s < b.s) { b.s = s; b.u = u; b.m = 0; }
     }
     if (in0) {
-        float s = g0 + (in1 ? pOcc : pEdge);
+        float s = g0 + (in1 ? pOcc : pEdge) + prior;
         if (s < b.s) { b.s = s; b.u = u; b.m = -1; }
     }
     if (in1) {
-        float s = g1 + (in0 ? pOcc : pEdge);
+        float s = g1 + (in0 ? pOcc : pEdge) + prior;
         if (s < b.s) { b.s = s; b.u = u; b.m = 1; }
     }
 }
@@ -117,6 +129,17 @@ void TFlowCS(uint3 id : SV_DispatchThreadID) {
     [unroll] for (int k = 0; k < 5; k++) {
         EvalChain(x, LoadM0(x + offs[k]), b);
         EvalChain(x, -LoadM1(x + offs[k]), b);
+    }
+    // Sparse wide ring: on periodic content the NVOF field is a patchwork of aliases; the true motion
+    // usually exists somewhere within a few tens of pixels.
+    [loop] for (int r = 0; r < ringCount; r++) {
+        float rad = G * 6.0 * (float)(1 << r);
+        [unroll] for (int k = 0; k < 8; k++) {
+            float ang = 0.785398 * k + 0.4 * r;
+            float2 o = rad * float2(cos(ang), sin(ang));
+            Eval(x, LoadM0(x + o), b);
+            Eval(x, -LoadM1(x + o), b);
+        }
     }
     float conf = saturate((sBad - b.s) / (sBad - sGood));
     TOut[id.xy] = float4(b.u, b.m, conf);
@@ -210,8 +233,8 @@ NvofApi& Api() { static NvofApi a; return a; }
 struct CBData {
     UINT W, H, FW, FH;
     float G, invG, t, pad0;
-    float invW, invH, pad1, pad2;
-    float alpha, pOcc, pEdge, pad3;
+    float invW, invH, lambda, beta;
+    float alpha, pOcc, pEdge; UINT ringCount;
     float sGood, sBad, invSig2, pwOcc;
 };
 
@@ -318,6 +341,7 @@ public:
             ctx->CSSetSamplers(0, 1, &ls);
             ctx->Dispatch((fw_ + 15) / 16, (fh_ + 7) / 8, 1);
             dev_->ClearCS();
+            if (getenv("NVOF_HIST") && t == 0.5f) DebugHist(p);
         }
         ID3D11ShaderResourceView* srvs[3] = {tflow_.srv.Get(), a.rgb.srv.Get(), b.rgb.srv.Get()};
         ctx->CSSetShader(csCompose_.Get(), nullptr, 0);
@@ -436,6 +460,37 @@ private:
         }
     }
 
+    // DEBUG: histograms of raw NVOF F01.x and chosen u.x over the left 75 % (checker region).
+    void DebugHist(Pair* p) {
+        auto* ctx = dev_->ctx();
+        auto rb = [&](ID3D11Texture2D* src, std::vector<uint8_t>& buf, UINT bpp) {
+            D3D11_TEXTURE2D_DESC d{}; src->GetDesc(&d);
+            d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> st; dev_->dev()->CreateTexture2D(&d, nullptr, &st);
+            ctx->CopyResource(st.Get(), src);
+            D3D11_MAPPED_SUBRESOURCE m{}; ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m);
+            buf.resize((size_t)d.Width * d.Height * bpp);
+            for (UINT y = 0; y < d.Height; y++) memcpy(&buf[(size_t)y * d.Width * bpp], (uint8_t*)m.pData + (size_t)y * m.RowPitch, d.Width * bpp);
+            ctx->Unmap(st.Get(), 0);
+        };
+        std::vector<uint8_t> f, b, tf;
+        rb(p->flowF.t11.tex.Get(), f, 4); rb(p->flowB.t11.tex.Get(), b, 4); rb(tflow_.tex.Get(), tf, 16);
+        std::map<int, int> hf, hb, ht, hy;
+        for (UINT y = 0; y < fh_; y++) for (UINT x = 0; x < fw_ * 3 / 4; x++) {
+            size_t i = (size_t)y * fw_ + x;
+            int16_t fx = *(int16_t*)&f[i * 4], bx = *(int16_t*)&b[i * 4], fy = *(int16_t*)&f[i * 4 + 2];
+            float ux = *(float*)&tf[i * 16];
+            hf[(int)std::lround(fx / 32.0)]++; hb[(int)std::lround(bx / 32.0)]++; ht[(int)std::lround(ux)]++; hy[(int)std::lround(fy / 32.0)]++;
+        }
+        auto pr = [](const char* n, std::map<int, int>& h) {
+            std::vector<std::pair<int, int>> v(h.begin(), h.end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            std::string s; for (size_t i = 0; i < v.size() && i < 10; i++) s += " " + std::to_string(v[i].first) + ":" + std::to_string(v[i].second);
+            LOGI("hist %s%s", n, s.c_str());
+        };
+        pr("F01.x", hf); pr("F01.y", hy); pr("F10.x", hb); pr("u.x", ht);
+    }
+
     void SetCB(float t) {
         CBData cb{};
         cb.W = w_; cb.H = h_; cb.FW = fw_; cb.FH = fh_;
@@ -444,7 +499,9 @@ private:
         // Tuned on the synthetic scenes in tests/nvof_test.cpp (flat optimum, +-0.3 dB around these).
         cb.alpha = 15.0f;      // px of geometric error per unit mean-abs luma difference
         cb.pOcc = 5.0f;        // penalty (px) for a one-sided (occlusion) explanation
-        cb.pEdge = 0.5f;       // penalty when the other side falls outside the image
+        cb.pEdge = 0.5f;
+        cb.lambda = 0.03f; cb.beta = 30.0f; cb.ringCount = 3;
+        if (getenv("NVOF_A")) { float r = 3; sscanf(getenv("NVOF_A"), "%f,%f,%f", &cb.lambda, &cb.beta, &r); cb.ringCount = (UINT)r; }       // penalty when the other side falls outside the image
         cb.sGood = 4.0f; cb.sBad = 16.0f;   // score -> confidence ramp
         cb.invSig2 = 1.0f / 0.01f;          // photometric weight in compose (mean sq RGB diff)
         cb.pwOcc = 0.05f;                   // weight of one-sided candidates in compose

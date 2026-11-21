@@ -2,7 +2,8 @@
 // interpolated frame vs the analytically correct intermediate frame (flow interpolator vs blend),
 // GPU/CPU timings, and a cross-engine (D3D11 queue <-> OFA engine) ordering check.
 //
-// Usage: nvof_test [--dump <dir>] [--frames N] [--quick] [--probe]
+// Usage: nvof_test [--dump <dir>] [--frames N] [--quick] [--probe] [--app]
+//   --app    only the `camss --selftest` pattern (per-region PSNR, consecutive and non-consecutive pairs);
 //   --quick  PSNR table only;  --probe  raw NVOF D3D11-API ordering probe only;
 //   --dump   writes [ground truth | output | |error|x4] crops for t=0.5 of the last pair of each case.
 #include "interp/interpolator.h"
@@ -485,6 +486,119 @@ static void OrderingProbe(Ctx& c) {
 }
 
 
+
+// ------------------------------------------------------------------------------------------ app selftest pattern
+// Compute-shader copy of SyntheticSource (src/gfx/blit.cpp kSynthPS) used by `camss --selftest`:
+// 64 px flat checkerboard panning -10 px/frame, 48 px yellow bar +16 px/frame, orbiting 60 px circle
+// (~13.5 px/frame), 12 px stripes moving down 4 px/frame in the right 20 %.
+static const char* kAppSynthCS = R"(
+cbuffer CB : register(b0) { float time; float2 size; float pad; };
+RWTexture2D<unorm float4> O : register(u0);
+[numthreads(16, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= (uint)size.x || id.y >= (uint)size.y) return;
+    float2 p = float2(id.xy) + 0.5;
+    float3 c;
+    float2 q = p + float2(time * 600.0, 0);
+    float chk = ((int)floor(q.x / 64) + (int)floor(q.y / 64)) & 1;
+    c = lerp(float3(0.2, 0.22, 0.25), float3(0.35, 0.37, 0.4), chk);
+    float bx = frac(time * 0.5) * size.x;
+    if (abs(p.x - bx) < 24) c = float3(1, 0.9, 0.2);
+    float2 ctr = size * 0.5 + float2(cos(time * 2.5), sin(time * 2.5)) * size.y * 0.3;
+    if (length(p - ctr) < 60) c = float3(0.2, 0.6, 1.0);
+    if (p.x > size.x * 0.8 && frac((p.y - time * 240.0) / 12.0) < 0.5) c *= 0.4;
+    O[id.xy] = float4(c, 1);
+}
+)";
+
+struct AppSynth {
+    ComPtr<ID3D11ComputeShader> cs;
+    ComPtr<ID3D11Buffer> cb;
+    void Init(Device& d) { cs = d.CompileCS(kAppSynthCS, "main", "app_synth"); cb = d.CreateConstantBuffer(16); }
+    void Render(Device& d, const Device::Tex& dst, double time) {
+        struct { float time; float size[2]; float pad; } c{(float)std::fmod(time, 3600.0), {(float)W, (float)H}, 0};
+        d.UpdateCB(cb.Get(), &c, sizeof(c));
+        auto* ctx = d.ctx();
+        ctx->CSSetShader(cs.Get(), nullptr, 0);
+        ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
+        ctx->CSSetUnorderedAccessViews(0, 1, dst.uav.GetAddressOf(), nullptr);
+        ctx->Dispatch((W + 15) / 16, (H + 7) / 8, 1);
+        d.ClearCS();
+    }
+};
+
+// Region of a pixel for the app pattern over the time span [t0, t1]: 0 checker, 1 bar, 2 circle, 3 stripes.
+static int AppRegion(int x, int y, double t0, double t1) {
+    const double px = x + 0.5, py = y + 0.5;
+    for (double tt : {t0, t1}) {
+        double cx = W * 0.5 + std::cos(tt * 2.5) * H * 0.3, cy = H * 0.5 + std::sin(tt * 2.5) * H * 0.3;
+        if (std::hypot(px - cx, py - cy) < 60 + 16) return 2;
+    }
+    for (double tt : {t0, t1}) {
+        double bx = (tt * 0.5 - std::floor(tt * 0.5)) * W;
+        if (std::fabs(px - bx) < 24 + 16) return 1;
+    }
+    if (px > W * 0.8) return 3;
+    return 0;
+}
+static const char* kAppRegionNames[4] = {"checker", "bar", "circle", "stripes"};
+
+static void AppPatternTest(Ctx& c, std::vector<std::pair<std::string, Interpolator*>>& ips, const std::string& dumpDir) {
+    AppSynth synth; synth.Init(c.dev);
+    const double fps = 60.0;
+    const float ts[3] = {0.25f, 0.5f, 0.75f};
+    Device::Tex out = c.dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+    Device::Tex gt = c.dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+    std::vector<uint8_t> o, g;
+    for (int consecutive = 0; consecutive < 2; consecutive++) {
+        printf("\n=== app selftest pattern (%s pairs, 12 pairs, t=.25/.5/.75): mean PSNR dB = full | checker | bar | circle | stripes ===\n",
+               consecutive ? "consecutive" : "non-consecutive n=100+7p, like camss --selftest");
+        for (auto& [name, ip] : ips) {
+            std::array<SourceFrame, 8> st;
+            for (auto& f : st) f.rgb = c.dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+            double psum = 0, rse[4] = {}; uint64_t rn[4] = {};
+            for (int p = 0; p < 12; p++) {
+                int64_t n = consecutive ? 100 + p : 100 + p * 7;
+                SourceFrame& A = st[n % 8];
+                SourceFrame& B = st[(n + 1) % 8];
+                synth.Render(c.dev, A.rgb, n / fps); A.n = n; A.generation++;
+                synth.Render(c.dev, B.rgb, (n + 1) / fps); B.n = n + 1; B.generation++;
+                ip->Prepare(A, B);
+                WaitIdle(c);
+                for (int k = 0; k < 3; k++) {
+                    synth.Render(c.dev, gt, (n + ts[k]) / fps);
+                    ip->Interpolate(A, B, ts[k], out);
+                    Readback(c, out, o);
+                    Readback(c, gt, g);
+                    double se = 0;
+                    for (UINT y = 0; y < H; y++)
+                        for (UINT x = 0; x < W; x++) {
+                            size_t i = ((size_t)y * W + x) * 4;
+                            double e = 0;
+                            for (int ch = 0; ch < 3; ch++) { double d = (double)o[i + ch] - g[i + ch]; e += d * d; }
+                            se += e;
+                            int r = AppRegion((int)x, (int)y, n / fps, (n + 1) / fps);
+                            rse[r] += e; rn[r] += 3;
+                        }
+                    psum += Psnr(se, (uint64_t)W * H * 3);
+                    if (!dumpDir.empty() && p == 3 && k == 1 && !consecutive) {
+                        double tt = (n + 0.5) / fps;
+                        int cx = (int)(W * 0.5 + std::cos(tt * 2.5) * H * 0.3), cy = (int)(H * 0.5 + std::sin(tt * 2.5) * H * 0.3);
+                        int bx = (int)((tt * 0.5 - std::floor(tt * 0.5)) * W);
+                        std::string base = dumpDir + "/app_" + name.substr(0, 4) + name.substr(name.size() - 1);
+                        WriteCompare(base + "_circle.png", g, o, cx, cy);
+                        WriteCompare(base + "_bar.png", g, o, bx, 300);
+                        WriteCompare(base + "_stripes.png", g, o, (int)W - 160, 300);
+                        WriteCompare(base + "_checker.png", g, o, 400, 800);
+                    }
+                }
+            }
+            printf("%-8s %6.2f | %6.2f | %6.2f | %6.2f | %6.2f\n", name.c_str(), psum / 36, Psnr(rse[0], rn[0]), Psnr(rse[1], rn[1]),
+                   Psnr(rse[2], rn[2]), Psnr(rse[3], rn[3]));
+        }
+    }
+}
+
 // Crash reporter: prints the faulting module/offset and a symbolized stack (debug aid).
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
@@ -515,13 +629,14 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
 int main(int argc, char** argv) {
     std::string dumpDir;
     int frames = 8;
-    bool quick = false;
+    bool quick = false, appOnly = false;
     bool probeOnly = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--probe")) probeOnly = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quick")) quick = true;
+        else if (!strcmp(argv[i], "--app")) appOnly = true;
     }
     SetUnhandledExceptionFilter(CrashFilter);
     SetLogLevel(LogLevel::Info);
@@ -538,7 +653,7 @@ int main(int argc, char** argv) {
         HR_CHECK(c.dev.dev()->CreateQuery(&qd, &c.evt));
 
         printf("\n=== raw NVOF ordering probe (grid4 MEDIUM BOTH, flow consumed by a D3D11 compute shader) ===\n");
-        OrderingProbe(c);
+        if (!appOnly) OrderingProbe(c);
         if (probeOnly) return 0;
         SourceFrame fr[3];
         for (auto& f : fr) f.rgb = c.dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
@@ -555,6 +670,14 @@ int main(int argc, char** argv) {
 
         const float ts[3] = {0.25f, 0.5f, 0.75f};
         std::vector<uint8_t> outPix, gtPix;
+
+        // -------------------------------------------------------------- app selftest pattern
+        {
+            std::vector<std::pair<std::string, Interpolator*>> list;
+            for (auto& n : ips) list.push_back({n.name, n.ip.get()});
+            AppPatternTest(c, list, dumpDir);
+            if (appOnly) return 0;
+        }
 
         // -------------------------------------------------------------- quality
         printf("\n=== PSNR (dB) vs analytic intermediate frame, 1920x1080, %d frames/case (full frame | interior w/o 48px border) ===\n", frames);
