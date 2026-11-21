@@ -58,7 +58,7 @@ private:
     int ChooseMultiplier(double contentFps) const;
     // (Re)creates the Maxine chain with the current quality settings (run-time F / Q keys).
     bool BuildVfx();
-    void RebuildVfx();
+    void RebuildVfx(int oldFgMode, int oldSrQuality);   // falls back to these on failure
     void WarmUp(bool initial);
     void PrintDetail();
     void StartAudio();
@@ -100,8 +100,11 @@ private:
     bool adaptive_ = false;          // repeat-aware frame generation active
     int64_t lastUniqueN_ = -1;       // newest source frame carrying new content
     uint64_t repeats_ = 0;           // repeated source frames skipped
+    uint64_t lastSeq_ = 0;           // capture sequence of the last frame seen by the app
+    bool contentLost_ = false;       // a new-content frame was lost: treat the next frames as new until one is stored
     int curK_ = 2;                   // output frames per content frame (VRR)
     uint64_t lastReportOut_ = 0;     // output count at the previous report (output rate)
+    double lastOutFps_ = 0;
     int64_t lastArrival_ = 0;
     int64_t lastPresentCall_ = 0;
     UINT lastStatsPresent_ = 0, lastStatsRefresh_ = 0;

@@ -1,6 +1,8 @@
 #include "app.h"
 #include "vfx/vfx_chain.h"
 #include <cmath>
+#include <cstdarg>
+#include <exception>
 #include <cwchar>
 #include <shellapi.h>
 #include <timeapi.h>
@@ -109,7 +111,8 @@ bool App::Init(HINSTANCE inst) {
     adaptive_ = o_.fgAdaptive && haveFg && !(o_.mode == PaceMode::Passthrough && !o_.autoMode);
     curK_ = ChooseMultiplier(o_.capFps);
     PacerConfig pc;
-    pc.mode = o_.mode;
+    // Auto: assume VRR until the probe decides (the initial delay below is VRR based); SetMode retimes.
+    pc.mode = o_.autoMode ? PaceMode::Vrr : o_.mode;
     pc.vrrMultiplier = curK_;
     pc.snapEps = o_.snapEps;
     pc.marginMs = o_.marginMs;
@@ -147,6 +150,11 @@ bool App::Init(HINSTANCE inst) {
 bool App::BuildVfx() {
     const bool vfxFg = o_.interp == "vfx", vfxSr = o_.sr == "vfx", vfxHdr = o_.hdr == "vfx";
     if (!(vfxFg || vfxSr || vfxHdr)) return true;
+    if (vfxSr && o_.srQuality >= 8 && o_.srQuality <= 15 && (outW_ != srcW_ || outH_ != srcH_)) {
+        LOGE("sr-quality %s works only without upscaling (output %ux%u != source %ux%u); use low..ultra, hb-*, streaming-* or --out %ux%u",
+             SrQualityName(o_.srQuality), outW_, outH_, srcW_, srcH_, srcW_, srcH_);
+        return false;
+    }
     VfxChain::Config c;
     c.fg = vfxFg; c.fgMode = o_.vfgMode;
     c.sr = vfxSr; c.srQuality = o_.srQuality;
@@ -198,14 +206,23 @@ void App::WarmUp(bool initial) {
     LOGI("warm-up of processing stages: %.0f ms", Qpc::ToMs(Qpc::Now() - t0));
 }
 
-void App::RebuildVfx() {
+void App::RebuildVfx(int oldFg, int oldSr) {
     LOGI("reloading Maxine models: frame generation %s, super resolution %s ...",
          o_.interp == "vfx" ? FgQualityName(o_.vfgMode) : "-", o_.sr == "vfx" ? SrQualityName(o_.srQuality) : "-");
     dev_.ctx()->Flush();
     WaitGpuIdle(dev_);
     if (rtx_) rtx_->ClearViewCache();   // views may reference the old chain's output texture
     vfx_.reset();
-    if (!BuildVfx()) { LOGE("Maxine chain rebuild failed; continuing without it"); return; }
+    if (!BuildVfx()) {
+        LOGE("Maxine chain rebuild failed; going back to the previous quality");
+        o_.vfgMode = oldFg; o_.srQuality = oldSr;
+        if (!BuildVfx()) {
+            LOGE("Maxine chain unavailable; continuing without frame generation / super resolution");
+            if (!interp_) { adaptive_ = false; if (cap_) cap_->detectRepeats = false; curK_ = 1; pacer_.SetMultiplier(1); pacer_.SetContentPeriod(1.0); }
+            stats_.Clear();
+            return;
+        }
+    }
     WarmUp(false);
     stats_.Clear();
 }
@@ -273,7 +290,11 @@ void App::IngestCaptured(const RawFrame& rf) {
 
     // A repeated frame (content slower than the signal) only advances the signal clock: it is not
     // converted, stored or interpolated from; the pair is formed by the real content frames.
-    const bool unique = !(adaptive_ && rf.repeat);
+    // A frame the app never saw (pending list overflow) may have carried new content: the capture
+    // side compares against content the app does not have, so treat frames as new until one is stored.
+    if (lastSeq_ && rf.seq != lastSeq_ + 1) contentLost_ = true;
+    lastSeq_ = rf.seq;
+    const bool unique = !(adaptive_ && rf.repeat) || contentLost_;
     if (!unique) {
         repeats_++;
         pacer_.OnSourceFrame(n, rf.uploadedQpc, false);
@@ -281,7 +302,12 @@ void App::IngestCaptured(const RawFrame& rf) {
         return;
     }
     SourceFrame& f = store_[(size_t)(n % kStore)];
-    if (!cap_->LockSlot(rf)) { stats_.Add("cap.overwritten", 1); return; }
+    if (!cap_->LockSlot(rf)) {
+        stats_.Add("cap.overwritten", 1);
+        if (!rf.repeat || contentLost_) contentLost_ = true;   // its repeats must replace it (see above)
+        return;
+    }
+    contentLost_ = false;
     conv_.Convert(cap_->PlaneSrv(rf.slot, 0), cap_->PlaneCount() > 1 ? cap_->PlaneSrv(rf.slot, 1) : nullptr, f.rgb);
     cap_->UnlockSlot(rf);
     f.n = n; f.seq = rf.seq; f.generation++;
@@ -336,6 +362,7 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     auto* ctx = dev_.ctx();
     SourceFrame* A = Frame(d.nA);
     SourceFrame* B = d.nB != d.nA ? Frame(d.nB) : nullptr;
+    if (!A && B) { A = B; B = nullptr; }   // A's store slot was reused (long static scene): show B
     if (!A) return false;
     const bool wantInterp = interpOn_ && B && d.t > 0.f;
     bool doInterp = false;   // what actually ran (drives latency accounting)
@@ -539,6 +566,17 @@ void App::PollPresentStats() {
     }
 }
 
+// snprintf accumulation that can never run past the buffer.
+static int Append(char* buf, size_t size, int n, const char* fmt, ...) {
+    if (n < 0) n = 0;
+    if ((size_t)n >= size) return (int)size - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf + n, size - (size_t)n, fmt, ap);
+    va_end(ap);
+    return r < 0 ? n : (int)std::min<size_t>((size_t)n + (size_t)r, size - 1);
+}
+
 void App::PrintDetail() {
     const int64_t now = Qpc::Now();
     char head[512];
@@ -564,7 +602,8 @@ void App::Report(bool final) {
     const double interval = o_.reportSec > 0 ? o_.reportSec : 2.0;
     if (!final && now - lastReport_ < Qpc::FromMs(interval * 1000.0)) return;
     const double dt = Qpc::ToSec(now - lastReport_);
-    const double outFps = dt > 0 ? (double)(outCount_ - lastReportOut_) / dt : 0;
+    double outFps = dt > 0.25 ? (double)(outCount_ - lastReportOut_) / dt : lastOutFps_;   // final report may follow a periodic one
+    lastOutFps_ = outFps;
     lastReport_ = now;
     lastReportOut_ = outCount_;
 
@@ -581,19 +620,20 @@ void App::Report(bool final) {
     const double sigHz = pacer_.SourceHz();
     const double contentFps = sigHz > 0 ? sigHz / pacer_.ContentPeriod() : 0;
     const char* modeName = o_.mode == PaceMode::Vrr ? "vrr" : o_.mode == PaceMode::Fixed ? "fixed" : "passthrough";
-    char line[640];
+    char line[1024];
     int n = snprintf(line, sizeof(line), "in %.2f Hz", sigHz);
     if (adaptive_) {
-        if (cadence_.UniqueFraction() < 0.05) n += snprintf(line + n, sizeof(line) - n, " | content static");
-        else n += snprintf(line + n, sizeof(line) - n, " | content %.1f fps", contentFps);
+        if (cadence_.UniqueFraction() < 0.05) n = Append(line, sizeof(line), n, " | content static");
+        else n = Append(line, sizeof(line), n, " | content %.1f fps", contentFps);
     }
-    n += snprintf(line + n, sizeof(line) - n, " -> out %.1f fps (%s%s", outFps, modeName, o_.mode == PaceMode::Passthrough ? ")" : "");
-    if (o_.mode != PaceMode::Passthrough) n += snprintf(line + n, sizeof(line) - n, ", x%d)", curK_);
-    if (haveLat) n += snprintf(line + n, sizeof(line) - n, " | %s %.1f/%.1f ms", metric, p50, p99);
-    if (o_.mode != PaceMode::Passthrough) n += snprintf(line + n, sizeof(line) - n, " | D %.1f lead %.1f", pacer_.DelayMs(), leadMs_);
+    n = Append(line, sizeof(line), n, " -> out %.1f fps (%s%s", outFps, modeName, o_.mode == PaceMode::Passthrough ? ")" : "");
+    if (o_.mode == PaceMode::Vrr) n = Append(line, sizeof(line), n, ", x%d)", curK_);
+    else if (o_.mode == PaceMode::Fixed) n = Append(line, sizeof(line), n, ")");
+    if (haveLat) n = Append(line, sizeof(line), n, " | %s %.1f/%.1f ms", metric, p50, p99);
+    if (o_.mode != PaceMode::Passthrough) n = Append(line, sizeof(line), n, " | D %.1f lead %.1f", pacer_.DelayMs(), leadMs_);
     double g50, g99;
     if (stats_.Get("vfx.gpu_total", g50, g99)) {
-        n += snprintf(line + n, sizeof(line) - n, " | gpu %.2f/%.2f ms", g50, g99);
+        n = Append(line, sizeof(line), n, " | gpu %.2f/%.2f ms", g50, g99);
         // The processing must fit into one output interval, or frames are skipped.
         const double budget = o_.mode == PaceMode::Vrr && contentFps > 0 ? 1000.0 / (contentFps * curK_)
                             : o_.mode == PaceMode::Fixed ? 1000.0 / std::max(1.0, pres_.refreshHz()) : 0;
@@ -601,25 +641,29 @@ void App::Report(bool final) {
             LOG_EVERY_MS(LogLevel::Warn, 10000, "GPU time %.1f ms per output frame exceeds the %.1f ms frame budget: frames are skipped; "
                          "lower fg-quality / sr-quality (keys F / Q) or the multiplier", g50, budget);
     }
-    n += snprintf(line + n, sizeof(line) - n, " | late %llu hold %llu drop %llu", (unsigned long long)pacer_.LateCount(),
+    n = Append(line, sizeof(line), n, " | late %llu hold %llu drop %llu", (unsigned long long)pacer_.LateCount(),
                   (unsigned long long)pacer_.StallCount(), (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0));
-    if (o_.mode == PaceMode::Fixed) n += snprintf(line + n, sizeof(line) - n, " miss %llu", (unsigned long long)missed_);
+    if (o_.mode == PaceMode::Fixed) n = Append(line, sizeof(line), n, " miss %llu", (unsigned long long)missed_);
     if (audio_.Running()) {
         AudioStats as = audio_.Stats();
-        n += snprintf(line + n, sizeof(line) - n, " | audio %.0f ms%s buf %.0f ms", as.latencyMs, audio_.Muted() ? " (muted)" : "", as.bufferMs);
-        if (as.syncDelayMs > 0.5) n += snprintf(line + n, sizeof(line) - n, " sync +%.0f", as.syncDelayMs);
-        if (as.underruns) n += snprintf(line + n, sizeof(line) - n, " underrun %llu", (unsigned long long)as.underruns);
+        if (!as.running) n = Append(line, sizeof(line), n, " | audio: reopening device");
+        else if (!as.playing) n = Append(line, sizeof(line), n, " | audio: buffering");
+        else n = Append(line, sizeof(line), n, " | audio %.0f ms%s buf %.0f ms", as.latencyMs, audio_.Muted() ? " (muted)" : "", as.bufferMs);
+        if (as.running && as.syncDelayMs > 0.5) n = Append(line, sizeof(line), n, " sync +%.0f", as.syncDelayMs);
+        if (as.underruns) n = Append(line, sizeof(line), n, " underrun %llu", (unsigned long long)as.underruns);
     }
     if (o_.decodeTimecode) {
         double l50, l99;
-        if (stats_.Get("loop.scanout_to_arrival_ms", l50, l99)) n += snprintf(line + n, sizeof(line) - n, " | loop %.1f/%.1f ms", l50, l99);
-        else n += snprintf(line + n, sizeof(line) - n, " | loop: no timecode");
+        if (stats_.Get("loop.scanout_to_arrival_ms", l50, l99)) n = Append(line, sizeof(line), n, " | loop %.1f/%.1f ms", l50, l99);
+        else n = Append(line, sizeof(line), n, " | loop: no timecode");
     }
     if (final || o_.reportDetail) PrintDetail();
     if (o_.reportSec > 0 || final) LOGI("%s", line);
 
     char title[256];
-    snprintf(title, sizeof(title), "camss | %s x%d | %s p50 %.1f p99 %.1f ms | D %.1f ms", modeName, curK_, metric, p50, p99,
+    char kk[16] = "";
+    if (o_.mode == PaceMode::Vrr) snprintf(kk, sizeof(kk), " x%d", curK_);
+    snprintf(title, sizeof(title), "camss | %s%s | %s p50 %.1f p99 %.1f ms | D %.1f ms", modeName, kk, metric, p50, p99,
              pacer_.DelayMs());
     pres_.SetTitle(title);
 }
@@ -631,13 +675,15 @@ void App::HandleKeys() {
     case 'S': srOn_ = !srOn_; LOGI("super resolution %s", srOn_ ? "on" : "off"); break;
     case 'F':
         if (o_.interp != "vfx") { LOGI("F: frame generation quality applies to --interp vfx"); break; }
-        o_.vfgMode = (o_.vfgMode + 1) % 3;
-        RebuildVfx();
+        { const int of = o_.vfgMode; o_.vfgMode = (o_.vfgMode + 1) % 3; RebuildVfx(of, o_.srQuality); }
         break;
     case 'Q':
         if (o_.sr != "vfx") { LOGI("Q: super resolution quality applies to --sr vfx"); break; }
-        o_.srQuality = NextSrQuality(o_.srQuality);
-        RebuildVfx();
+        {
+            const int nq = NextSrQuality(o_.srQuality);
+            if (nq == o_.srQuality) { LOGI("Q: no other level in the %s family", SrQualityName(nq)); break; }
+            const int os = o_.srQuality; o_.srQuality = nq; RebuildVfx(o_.vfgMode, os);
+        }
         break;
     case 'M':
         if (audio_.Running()) { audio_.SetMuted(!audio_.Muted()); LOGI("audio %s", audio_.Muted() ? "muted" : "unmuted"); }
@@ -772,7 +818,12 @@ int App::Run() {
 } // namespace camss
 
 // ------------------------------------------------------------------ entry
-static BOOL WINAPI CtrlHandler(DWORD) { camss::g_quitRequested = true; return TRUE; }
+static BOOL WINAPI CtrlHandler(DWORD ev) {
+    camss::g_quitRequested = true;
+    // Closing the console / logoff / shutdown ends the process when this returns: write out the log.
+    if (ev == CTRL_CLOSE_EVENT || ev == CTRL_LOGOFF_EVENT || ev == CTRL_SHUTDOWN_EVENT) camss::LogFlush(1000);
+    return TRUE;
+}
 
 // Log the faulting module + offset on a crash (no dump files, no system settings touched).
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
@@ -793,6 +844,7 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
     SetUnhandledExceptionFilter(CrashFilter);
+    std::set_terminate([] { camss::LogFlush(200); std::abort(); });
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HR_CHECK(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     HR_CHECK(MFStartup(MF_VERSION));

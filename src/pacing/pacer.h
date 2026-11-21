@@ -108,7 +108,8 @@ public:
     double DelayMs() const { return Qpc::ToMs((int64_t)delay_); }
     uint64_t LateCount() const { return lateCount_; }
     uint64_t StallCount() const { return stallCount_; }
-    void SetMode(PaceMode m) { cfg_.mode = m; }
+    // Switches the pacing mode and shifts D by the change of the theoretical steady-state delay.
+    void SetMode(PaceMode m);
     double MinSlackMs() const { return minSlackMs_; }
 
 private:

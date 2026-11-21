@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <charconv>
 
 namespace camss {
 
@@ -42,8 +43,31 @@ static bool ParseInt(const std::string& v, int& out, int lo, int hi) {
 }
 static std::string Fmt(double v) {
     char b[64];
-    snprintf(b, sizeof(b), "%g", v);
-    return b;
+    auto r = std::to_chars(b, b + sizeof(b), v);   // shortest text that reads back to the same value
+    return std::string(b, r.ptr);
+}
+// "WxH" / "WxH@FPS" with plain decimal sizes (no sign, no trailing text), sizes 16..16384; spaces allowed.
+static bool ParseSize(const std::string& in, UINT& w, UINT& h, double* fps) {
+    std::string s;
+    for (char c : Lower(Trim(in))) if (c != ' ' && c != '\t') s += c;
+    size_t x = s.find('x'), at = s.find('@');
+    if (x == std::string::npos || (at != std::string::npos && at < x) || (!fps && at != std::string::npos)) return false;
+    auto num = [](const std::string& t, uint64_t& v) {
+        if (t.empty() || t.size() > 6) return false;
+        for (char c : t) if (c < '0' || c > '9') return false;
+        v = std::stoull(t);
+        return true;
+    };
+    uint64_t W, H;
+    if (!num(s.substr(0, x), W) || !num(s.substr(x + 1, at == std::string::npos ? std::string::npos : at - x - 1), H)) return false;
+    if (W < 16 || H < 16 || W > 16384 || H > 16384) return false;
+    if (at != std::string::npos) {
+        double f;
+        if (!ParseDouble(s.substr(at + 1), f, 1, 1000)) return false;
+        *fps = f;
+    }
+    w = (UINT)W; h = (UINT)H;
+    return true;
 }
 static std::string Fmt(int v) { return std::to_string(v); }
 static std::string Fmt(bool v) { return v ? "true" : "false"; }
@@ -126,7 +150,7 @@ static const std::vector<OptDef>& Table() {
         {"no-config", nullptr, "actions", "do not read a configuration file", ACTION((void)0)},
 
         // ---- capture
-        {"device", "NAME|INDEX", "capture", "video capture device: substring of its name, or index from --list",
+        {"device", "NAME|INDEX", "capture", "video capture device: substring of its name, or index from --list (default: the first device)",
          [](Options& o, const std::string& v) {
              std::string s = Trim(v);
              int idx;
@@ -147,12 +171,11 @@ static const std::vector<OptDef>& Table() {
         {"capture", "WxH@FPS", "capture", "capture mode",
          [](Options& o, const std::string& v) {
              UINT w = 0, h = 0; double f = o.capFps;
-             int n = sscanf(Trim(v).c_str(), "%ux%u@%lf", &w, &h, &f);
-             if (n < 2 || !w || !h || f <= 0 || f > 1000) return false;
+             if (!ParseSize(v, w, h, &f)) return false;
              o.capW = w; o.capH = h; o.capFps = f;
              return true;
          },
-         [](const Options& o) { char b[64]; snprintf(b, sizeof(b), "%ux%u@%g", o.capW, o.capH, o.capFps); return std::string(b); }},
+         [](const Options& o) { return std::to_string(o.capW) + "x" + std::to_string(o.capH) + "@" + Fmt(o.capFps); }},
         {"range", "limited|full", "capture", "YCbCr range",
          [](Options& o, const std::string& v) {
              std::string s = Lower(Trim(v));
@@ -195,7 +218,7 @@ static const std::vector<OptDef>& Table() {
              std::string s = Lower(Trim(v));
              if (s == "auto" || s == "0" || s.empty()) { o.outW = o.outH = 0; return true; }
              UINT w = 0, h = 0;
-             if (sscanf(s.c_str(), "%ux%u", &w, &h) != 2 || !w || !h) return false;
+             if (!ParseSize(s, w, h, nullptr)) return false;
              o.outW = w; o.outH = h;
              return true;
          },
@@ -230,7 +253,7 @@ static const std::vector<OptDef>& Table() {
         {"lead", "MS", "pacing / display", "initial render lead", DBL(leadMs, 0.2, 50)},
         {"delay", "MS", "pacing / display", "initial pipeline delay (0 = estimated, then adapts)", DBL(initialDelayMs, 0, 80)},
         {"margin", "MS", "pacing / display", "pacing slack margin", DBL(marginMs, 0, 20)},
-        {"sync", "0|1", "pacing / display", "passthrough: present interval (0 = immediate, tearing)", INT(passSync, 0, 4)},
+        {"sync", "0..4", "pacing / display", "passthrough: present interval (0 = immediate, tearing)", INT(passSync, 0, 4)},
         {"windowed", nullptr, "pacing / display", "window instead of borderless fullscreen (VRR usually needs fullscreen)", SW(windowed)},
         {"monitor", "N", "pacing / display", "display output index", INT(monitor, 0, 16)},
 
@@ -301,13 +324,19 @@ static int ApplyConfigText(const std::string& text, const std::string& fileName,
         lineNo++;
         std::string s = Trim(line);
         if (s.empty() || s[0] == '#' || s[0] == ';' || s[0] == '[') continue;
-        // Inline comment: " #" or " ;" (device names may contain '#' without a leading space).
-        for (size_t i = 1; i < s.size(); i++)
-            if ((s[i] == '#' || s[i] == ';') && (s[i - 1] == ' ' || s[i - 1] == '\t')) { s = Trim(s.substr(0, i)); break; }
         size_t eq = s.find('=');
         if (eq == std::string::npos) { LOGW("%s:%d: expected 'key = value': %s", fileName.c_str(), lineNo, s.c_str()); problems++; continue; }
         std::string key = NormKey(s.substr(0, eq)), val = Trim(s.substr(eq + 1));
-        if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\''))) val = val.substr(1, val.size() - 2);
+        if (!val.empty() && (val[0] == '"' || val[0] == '\'')) {
+            // Quoted value: taken literally up to the matching quote; a comment may follow it.
+            size_t close = val.find(val[0], 1);
+            if (close == std::string::npos) { LOGW("%s:%d: missing closing quote: %s", fileName.c_str(), lineNo, s.c_str()); problems++; continue; }
+            val = val.substr(1, close - 1);
+        } else {
+            // Inline comment: " #" or " ;" (names may contain '#' without a leading space).
+            for (size_t i = 1; i < val.size(); i++)
+                if ((val[i] == '#' || val[i] == ';') && (val[i - 1] == ' ' || val[i - 1] == '\t')) { val = Trim(val.substr(0, i)); break; }
+        }
         const OptDef* d = Find(key);
         if (!d || !d->get) { LOGW("%s:%d: unknown option '%s' (ignored)", fileName.c_str(), lineNo, key.c_str()); problems++; continue; }
         if (!d->set(o, val)) { LOGW("%s:%d: invalid value '%s' for %s (expected %s; ignored)", fileName.c_str(), lineNo, val.c_str(), d->name, d->arg ? d->arg : "true|false"); problems++; }
@@ -324,9 +353,28 @@ ParseResult LoadOptions(int argc, wchar_t** argv, Options& o) {
     std::wstring explicitConfig;
     bool noConfig = false;
     for (size_t i = 0; i < args.size(); i++) {
-        if (args[i] == "--no-config") noConfig = true;
-        else if (args[i] == "--config" && i + 1 < args.size()) explicitConfig = Utf8ToWide(args[i + 1].c_str());
-        else if (args[i].rfind("--config=", 0) == 0) explicitConfig = Utf8ToWide(args[i].substr(9).c_str());
+        if (args[i].rfind("--", 0) != 0) continue;
+        std::string key = args[i].substr(2), val;
+        size_t eq = key.find('=');
+        const bool hasVal = eq != std::string::npos;
+        if (hasVal) { val = key.substr(eq + 1); key = key.substr(0, eq); }
+        key = NormKey(key);
+        if (key == "no-config") {
+            bool b = true;
+            if (hasVal && !ParseBool(val, b)) { LOGE("invalid value '%s' for --no-config", val.c_str()); return ParseResult::Error; }
+            noConfig = b;
+        } else if (key == "config") {
+            if (!hasVal) {
+                if (i + 1 >= args.size() || args[i + 1].rfind("--", 0) == 0) { LOGE("missing value for --config (FILE)"); return ParseResult::Error; }
+                val = args[++i];
+            }
+            if (Trim(val).empty()) { LOGE("missing value for --config (FILE)"); return ParseResult::Error; }
+            explicitConfig = Utf8ToWide(val.c_str());
+        } else {
+            // skip the value of an option that takes one, so it is never mistaken for --config
+            const OptDef* d = Find(key);
+            if (d && d->arg && !hasVal) i++;
+        }
     }
     if (!noConfig) {
         std::wstring path;
@@ -341,7 +389,7 @@ ParseResult LoadOptions(int argc, wchar_t** argv, Options& o) {
             if (!ReadFileUtf8(path, text)) { LOGE("cannot read %s", name.c_str()); return ParseResult::Error; }
             int problems = ApplyConfigText(text, name, o);
             o.configPath = name;
-            LOGI("config: %s%s", name.c_str(), problems ? " (with warnings, see above)" : "");
+            if (problems) LOGW("config: %s has problems (see above)", name.c_str());
         }
     }
 
@@ -365,15 +413,22 @@ ParseResult LoadOptions(int argc, wchar_t** argv, Options& o) {
         }
         if (!d) { LOGE("unknown option --%s (see --help)", key.c_str()); return ParseResult::Error; }
         if (!d->arg) {
-            if (negate) val = "false";
-            else if (!hasVal) val = "true";
+            if (negate) {
+                bool b = true;
+                if (hasVal && !ParseBool(val, b)) { LOGE("invalid value '%s' for --no-%s (expected true|false)", val.c_str(), d->name); return ParseResult::Error; }
+                val = b ? "false" : "true";
+            } else if (!hasVal) val = "true";
         } else if (!hasVal) {
-            if (i + 1 >= args.size()) { LOGE("missing value for --%s (%s)", d->name, d->arg); return ParseResult::Error; }
+            if (i + 1 >= args.size() || args[i + 1].rfind("--", 0) == 0) {
+                LOGE("missing value for --%s (%s)", d->name, d->arg);
+                return ParseResult::Error;
+            }
             val = args[++i];
         }
         if (!d->set(o, val)) { LOGE("invalid value '%s' for --%s (expected %s)", val.c_str(), d->name, d->arg ? d->arg : "true|false"); return ParseResult::Error; }
     }
     if (o.help) { PrintUsage(); return ParseResult::Exit; }
+    if (!o.printConfig && !o.configPath.empty()) LOGI("config: %s", o.configPath.c_str());
     if (o.printConfig) { PrintConfig(o); return ParseResult::Exit; }
     return ParseResult::Run;
 }
@@ -390,7 +445,7 @@ void PrintUsage() {
         char left[96];
         snprintf(left, sizeof(left), "  --%s%s%s", d.name, d.arg ? " " : "", d.arg ? d.arg : "");
         std::string help = d.help;
-        if (d.get) {
+        if (d.get && !strstr(d.help, "default:")) {
             std::string v = d.get(def);
             help += " (default: " + (v.empty() ? std::string("none") : v) + ")";
         }
@@ -408,7 +463,10 @@ void PrintConfig(const Options& o) {
     for (auto& d : Table()) {
         if (!d.get) continue;
         if (strcmp(group, d.group)) { group = d.group; printf("\n[%s]\n", group); }
-        printf("%s = %s\n", d.name, d.get(o).c_str());
+        std::string v = d.get(o);
+        const bool quote = !v.empty() && (v.find_first_of("#;=\"'") != std::string::npos || v.front() == ' ' || v.back() == ' ');
+        if (quote) printf("%s = \"%s\"\n", d.name, v.c_str());
+        else printf("%s = %s\n", d.name, v.c_str());
     }
 }
 

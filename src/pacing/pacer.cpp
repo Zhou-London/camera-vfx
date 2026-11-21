@@ -71,6 +71,17 @@ double Pacer::SteadyExtraTicks(double pc, int k) const {
     return pc * P;
 }
 
+void Pacer::SetMode(PaceMode m) {
+    if (m == cfg_.mode) return;
+    const double before = SteadyExtraTicks(pc_, cfg_.vrrMultiplier);
+    cfg_.mode = m;
+    delay_ += SteadyExtraTicks(pc_, cfg_.vrrMultiplier) - before;
+    delay_ = std::clamp(delay_, (double)Qpc::FromMs(cfg_.minDelayMs), (double)Qpc::FromMs(cfg_.maxDelayMs));
+    slack_.clear();
+    lastLateNeed_ = -1;
+    regrid_ = true;
+}
+
 void Pacer::Retime(double pc, int k) {
     const double before = SteadyExtraTicks(pc_, cfg_.vrrMultiplier);
     pc_ = pc;
