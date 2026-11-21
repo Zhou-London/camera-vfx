@@ -113,6 +113,7 @@ private:
     int64_t lastIndex_ = -1;
     uint64_t seq_ = 0;
     int64_t lastSampleTime_ = -1;
+    int64_t lastArrival_ = 0;
     std::atomic<ULONG> ref_{1};
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> dropped_{0}, errors_{0};

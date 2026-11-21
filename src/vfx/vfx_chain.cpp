@@ -78,6 +78,9 @@ struct VfxImpl {
     // Output D3D textures (one per possible final format/size) + interop images.
     Device::Tex outTex[2];              // [0] = out res, [1] = src res (SR toggled off)
     NvCVImage outD3d[2];
+    Device::Tex packedTex[2];           // R32_UINT interop targets for RGB10A2 output
+    ComPtr<ID3D11ComputeShader> unpackCS;
+    ComPtr<ID3D11Buffer> unpackCB;
     bool outPq = false;
     // Timing.
     CudaRt rt;
@@ -112,11 +115,6 @@ struct VfxImpl {
     }
 };
 
-VfxChain::VfxChain() : p_(std::make_unique<VfxImpl>()) {}
-VfxChain::~VfxChain() = default;
-bool VfxChain::HasFg() const { return p_->fg.h != nullptr; }
-bool VfxChain::OutputIsPq() const { return p_->outPq; }
-
 static std::wstring ResolveRuntimeDir(const std::wstring& configured) {
     namespace fs = std::filesystem;
     std::vector<fs::path> candidates;
@@ -131,9 +129,59 @@ static std::wstring ResolveRuntimeDir(const std::wstring& configured) {
     candidates.push_back(fs::path(CAMSS_VFX_RUNTIME_DIR));
 #endif
     for (auto& c : candidates)
-        if (fs::exists(c / L"NVVideoEffects.dll") && fs::exists(c / L"nvVFXVideoFrameGeneration.dll")) return c.wstring();
+        if (fs::exists(c / L"NVVideoEffects.dll") && fs::exists(c / L"nvVFXVideoFrameGeneration.dll")) {
+            // Backslashes + absolute: LOAD_WITH_ALTERED_SEARCH_PATH misbehaves with forward slashes.
+            fs::path p = fs::absolute(c).lexically_normal();
+            p.make_preferred();
+            std::wstring w = p.wstring();
+            while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) w.pop_back();
+            return w;
+        }
     return {};
 }
+
+// Loads the VFX 1.3 runtime exactly once, before any NvCVImage object exists: the
+// NvCVImage default constructor already calls into NVCVImage.dll through the proxy,
+// which would otherwise bind whatever NVCVImage.dll is first on PATH (e.g. an older
+// 0.7.x install in Program Files that lacks RGB10A2 and the 1.x effects).
+static std::wstring g_runtimeDir;
+static bool LoadVfxRuntime() {
+    static int state = 0;   // 0 = not tried, 1 = ok, -1 = failed
+    if (state) return state > 0;
+    state = -1;
+    std::wstring dir = ResolveRuntimeDir(L"");
+    if (dir.empty()) { LOGE("VFX runtime (NVVideoEffects 1.3 + feature DLLs) not found; set CAMSS_VFX_RUNTIME"); return false; }
+    if (HMODULE pre = GetModuleHandleW(L"NVCVImage.dll")) {
+        wchar_t m[MAX_PATH] = L"?"; GetModuleFileNameW(pre, m, MAX_PATH);
+        LOGW("an NVCVImage.dll is already loaded (%s)", WideToUtf8(m).c_str());
+    }
+    SetDllDirectoryW(dir.c_str());     // feature DLLs (nvVFX*.dll, nvngx_*.dll, cudart) resolve from here
+    AddDllDirectory(dir.c_str());
+    HMODULE hImg = LoadLibraryExW((dir + L"\\NVCVImage.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!hImg) { LOGE("failed to load %s\\NVCVImage.dll (err %lu)", WideToUtf8(dir.c_str()).c_str(), GetLastError()); return false; }
+    HMODULE hVfx = LoadLibraryExW((dir + L"\\NVVideoEffects.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!hVfx) { LOGE("failed to load %s\\NVVideoEffects.dll (err %lu)", WideToUtf8(dir.c_str()).c_str(), GetLastError()); return false; }
+    static std::string dirA = WideToUtf8(dir.c_str());
+    g_nvVFXSDKPath = dirA.data();      // used by NVVideoEffectsProxy.cpp
+    g_runtimeDir = dir;
+    // The proxies resolve "NVCVImage" / "NVVideoEffects" by module name: verify they bind ours.
+    wchar_t m1[MAX_PATH] = L"?";
+    GetModuleFileNameW(GetModuleHandleW(L"NVCVImage.dll"), m1, MAX_PATH);
+    if (_wcsicmp(m1, (dir + L"\\NVCVImage.dll").c_str()) != 0) {
+        LOGE("wrong NVCVImage.dll bound (%s); the VFX 1.3 runtime needs its own copy", WideToUtf8(m1).c_str());
+        return false;
+    }
+    unsigned ver = 0;
+    NvVFX_GetVersion(&ver);
+    LOGI("VFX runtime %u.%u.%u.%u from %s", ver >> 24, (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff, dirA.c_str());
+    state = 1;
+    return true;
+}
+
+VfxChain::VfxChain() { LoadVfxRuntime(); p_ = std::make_unique<VfxImpl>(); }
+VfxChain::~VfxChain() = default;
+bool VfxChain::HasFg() const { return p_->fg.h != nullptr; }
+bool VfxChain::OutputIsPq() const { return p_->outPq; }
 
 static bool CreateEffect(const char* sel, Effect& e) {
     NvCV_Status s = NvVFX_CreateEffect(sel, &e.h);
@@ -145,21 +193,8 @@ bool VfxChain::Init(Device& dev, const Config& cfg, SourceFrame* store, int stor
     VfxImpl& p = *p_;
     p.dev = &dev; p.cfg = cfg; p.store = store; p.storeCount = storeCount;
 
-    std::wstring dir = ResolveRuntimeDir(cfg.runtimeDir);
-    if (dir.empty()) { LOGE("VFX runtime (NVVideoEffects 1.3 + feature DLLs) not found; set CAMSS_VFX_RUNTIME"); return false; }
-    // Make the 1.3 runtime win over the 0.7.x install in Program Files.
-    SetDllDirectoryW(dir.c_str());
-    AddDllDirectory(dir.c_str());
-    if (!LoadLibraryExW((dir + L"\\NVCVImage.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) ||
-        !LoadLibraryExW((dir + L"\\NVVideoEffects.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
-        LOGE("failed to load VFX runtime from %s (err %lu)", WideToUtf8(dir.c_str()).c_str(), GetLastError());
-        return false;
-    }
-    static std::string dirA = WideToUtf8(dir.c_str());
-    g_nvVFXSDKPath = dirA.data();
-    unsigned ver = 0;
-    NvVFX_GetVersion(&ver);
-    LOGI("VFX runtime %u.%u.%u.%u from %s", ver >> 24, (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff, dirA.c_str());
+    if (!LoadVfxRuntime()) return false;
+    const std::wstring& dir = g_runtimeDir;
     if (cfg.profile && !p.rt.Load(dir)) { LOGW("cudart events unavailable; VFX GPU timing disabled"); p.cfg.profile = false; }
 
     VFX_CHECK(NvVFX_CudaStreamCreate(&p.stream));
@@ -236,12 +271,40 @@ bool VfxChain::Init(Device& dev, const Config& cfg, SourceFrame* store, int stor
     p.outPq = cfg.hdr;
     DXGI_FORMAT of = p.outPq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT ow = cfg.sr ? cfg.outW : sw, oh = cfg.sr ? cfg.outH : sh;
-    p.outTex[0] = dev.CreateTex(ow, oh, of, true, true);
-    VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[0], p.outTex[0].tex.Get()));
-    if (cfg.sr) {
-        p.outTex[1] = dev.CreateTex(sw, sh, of, true, true);
-        VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[1], p.outTex[1].tex.Get()));
+    // CUDA interop cannot register R10G10B10A2 textures, so HDR output goes through an
+    // R32_UINT texture (identical 32-bit packing, reinterpreted as RGB10A2 for the copy)
+    // and a tiny D3D compute pass unpacks it into R10G10B10A2_UNORM.
+    NvCVImage ref10;
+    if (p.outPq) {
+        VFX_CHECK(NvCVImage_Alloc(&ref10, 16, 16, kNVCV_RGB10A2, kNVCV_P32, NVCV_CHUNKY, NVCV_GPU, 0));
+        static const char* kUnpackCS = R"(
+Texture2D<uint> Src : register(t0);
+RWTexture2D<unorm float4> Dst : register(u0);
+cbuffer CB : register(b0) { uint w; uint h; uint2 pad; };
+[numthreads(16, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    uint v = Src[id.xy];
+    Dst[id.xy] = float4(float(v & 1023u), float((v >> 10) & 1023u), float((v >> 20) & 1023u), 1023.0) / 1023.0;
+}
+)";
+        p.unpackCS = dev.CompileCS(kUnpackCS, "main", "unpack_rgb10a2_cs");
+        p.unpackCB = dev.CreateConstantBuffer(16);
     }
+    auto makeOut = [&](int i, UINT w, UINT h) -> bool {
+        p.outTex[i] = dev.CreateTex(w, h, of, true, true);
+        if (!p.outPq) { VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.outTex[i].tex.Get())); return true; }
+        p.packedTex[i] = dev.CreateTex(w, h, DXGI_FORMAT_R32_UINT, true, false);
+        VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.packedTex[i].tex.Get()));
+        p.outD3d[i].pixelFormat = ref10.pixelFormat;
+        p.outD3d[i].componentType = ref10.componentType;
+        p.outD3d[i].pixelBytes = ref10.pixelBytes;
+        p.outD3d[i].componentBytes = ref10.componentBytes;
+        p.outD3d[i].numComponents = ref10.numComponents;
+        return true;
+    };
+    if (!makeOut(0, ow, oh)) return false;
+    if (cfg.sr && !makeOut(1, sw, sh)) return false;
     VFX_CHECK(NvCVImage_Alloc(&p.tmp, ow, oh, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32));
 
     if (p.cfg.profile)
@@ -329,6 +392,19 @@ const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B,
         static int warned = 0;
         if (warned++ < 3) LOGE("VFX output transfer failed: %d (%s)", (int)s, NvCV_GetErrorStringFromCode(s));
         return nullptr;
+    }
+    if (p.outPq) {
+        // Unpack the R32_UINT staging texture into R10G10B10A2_UNORM (D3D side, after unmap).
+        auto* ctx = p.dev->ctx();
+        const Device::Tex& o = p.outTex[oi];
+        struct { UINT w, h, pad[2]; } cb{o.w, o.h, {0, 0}};
+        p.dev->UpdateCB(p.unpackCB.Get(), &cb, sizeof(cb));
+        ctx->CSSetShader(p.unpackCS.Get(), nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, p.packedTex[oi].srv.GetAddressOf());
+        ctx->CSSetUnorderedAccessViews(0, 1, o.uav.GetAddressOf(), nullptr);
+        ctx->CSSetConstantBuffers(0, 1, p.unpackCB.GetAddressOf());
+        ctx->Dispatch((o.w + 15) / 16, (o.h + 7) / 8, 1);
+        p.dev->ClearCS();
     }
     return &p.outTex[oi];
 }

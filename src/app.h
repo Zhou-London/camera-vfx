@@ -33,7 +33,7 @@ struct Options {
     int vrrK = 2;
     bool lateLatch = true;
     double leadMs = 3.0;            // initial render lead (late latch / VRR)
-    double initialDelayMs = 30.0;
+    double initialDelayMs = 0;      // 0 = estimate from mode
     double marginMs = 1.0;
     double snapEps = 0.06;
     int passSync = 1;               // passthrough: present sync interval
@@ -58,10 +58,15 @@ struct Options {
     bool decodeTimecode = false;    // decode timecode band from capture (HDMI loopback)
     bool marker = false;            // flashing photodiode marker square
     double reportSec = 2.0;
+    double warmupSec = 6.0;         // statistics are reset once after this
+    bool autoMode = true;           // probe the display for VRR, then pick vrr or fixed
     bool debug = false;
+    bool statsDebug = false;
+    bool selftest = false;       // dump raw DXGI frame statistics for the first frames
 };
 
 bool ParseOptions(int argc, wchar_t** argv, Options& o);
+int RunSelfTest(const Options& o);
 void PrintUsage();
 
 class App {
@@ -87,14 +92,15 @@ private:
     void Ingest(int64_t now);
     void IngestCaptured(const RawFrame& f);
     SourceFrame* Frame(int64_t n);
-    bool Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT sync, bool tearing);
+    // presentAt != 0: hold the Present() until that QPC time (VRR: the flip happens at present).
+    bool Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT sync, bool tearing, int64_t presentAt = 0);
     void PollPresentStats();
     void FinalizeRecord(OutRecord& r);
     void Report(bool final);
     void HandleKeys();
     void RunFixed();
     void RunVrr();
-    void RunPassthrough();
+    void RunPassthrough(double untilSec = 0, int sync = -1);
 
     Options o_;
     Device dev_;
@@ -121,10 +127,18 @@ private:
 
     int64_t synthNext_ = 0, synthN_ = 0, synthT0_ = 0;
     int64_t lastArrival_ = 0;
+    int64_t lastPresentCall_ = 0;
+    UINT lastStatsPresent_ = 0, lastStatsRefresh_ = 0;
+    double vrrRatio_ = 3.0;
+    bool vrrActive_ = false;
+    double presentIntervalEma_ = 0;
+    bool warmupDone_ = false;
     std::deque<OutRecord> records_;
     uint64_t outCount_ = 0;
     uint64_t missed_ = 0, finalizedCount_ = 0;
     double leadMs_ = 3.0;
+    double lastVfxGpuMs_ = 0;
+    RollingStat frameCost_{300};   // recent per-frame cost (ms) for the render-lead estimate
     int64_t lastMissQpc_ = 0, lastLeadAdjust_ = 0;
     FILE* csv_ = nullptr;
     int64_t startQpc_ = 0, lastReport_ = 0;

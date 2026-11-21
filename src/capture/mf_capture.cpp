@@ -202,9 +202,19 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
     if (dur <= 0) dur = (LONGLONG)(1e7 / std::max(1.0, info_.fps));
     if (lastSampleTime_ >= 0) {
         LONGLONG gap = timestamp - lastSampleTime_;
-        if (gap > dur * 3 / 2) dropped_ += (uint64_t)((gap + dur / 2) / dur - 1);
+        if (gap > dur * 3 / 2) {
+            uint64_t lost = (uint64_t)((gap + dur / 2) / dur - 1);
+            dropped_ += lost;
+            static int64_t lastWarn = 0;
+            if (arrival - lastWarn > Qpc::FromMs(500)) {
+                LOGW("capture gap: %.1f ms (%llu frame(s) lost), callback-to-callback %.1f ms", gap / 1e4, (unsigned long long)lost,
+                     lastArrival_ ? Qpc::ToMs(arrival - lastArrival_) : 0.0);
+                lastWarn = arrival;
+            }
+        }
     }
     lastSampleTime_ = timestamp;
+    lastArrival_ = arrival;
     if (firstSampleTime_ < 0) firstSampleTime_ = timestamp;
 
     RawFrame f;

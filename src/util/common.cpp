@@ -1,6 +1,7 @@
 #include "common.h"
 #include <comdef.h>
 #include <vector>
+#include <psapi.h>
 
 namespace camss {
 
@@ -64,6 +65,15 @@ void PreciseSleeper::SleepUntil(int64_t deadline, double spinMs) {
             WaitForSingleObject(timer_, INFINITE);
     }
     while (Qpc::Now() < deadline) YieldProcessor();
+}
+
+void DumpModules(const wchar_t* filter, const char* when) {
+    HMODULE mods[2048]; DWORD need = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need)) return;
+    for (DWORD i = 0; i < need / sizeof(HMODULE); i++) {
+        wchar_t m[MAX_PATH]; GetModuleFileNameW(mods[i], m, MAX_PATH);
+        if (wcsstr(m, filter)) LOGI("[%s] module %s", when, WideToUtf8(m).c_str());
+    }
 }
 
 std::string WideToUtf8(const wchar_t* w) {

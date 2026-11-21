@@ -62,6 +62,7 @@ private:
 };
 
 std::string WideToUtf8(const wchar_t* w);
+void DumpModules(const wchar_t* filter, const char* when);
 std::wstring Utf8ToWide(const char* s);
 
 } // namespace camss

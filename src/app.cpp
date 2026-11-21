@@ -19,11 +19,11 @@ void PrintUsage() {
         "  --synthetic                built-in moving test pattern instead of a capture device\n"
         "  --range limited|full       YCbCr range (default limited), --bt601 for SD matrix\n"
         "\n"
-        "  --mode passthrough|fixed|vrr    pacing mode (default fixed)\n"
+        "  --mode auto|passthrough|fixed|vrr  pacing (default auto: probe display for VRR)\n"
         "  --k N                      VRR output multiplier (default 2 -> 120 fps from 60)\n"
         "  --no-latch                 fixed mode: render immediately after vblank instead of late\n"
         "  --lead MS                  initial render lead (default 3.0)\n"
-        "  --delay MS                 initial pipeline delay (default 30, adapts)\n"
+        "  --delay MS                 initial pipeline delay (default: estimated, then adapts)\n"
         "  --margin MS                pacing slack margin (default 1.0)\n"
         "  --snap EPS                 snap |t| < eps to a real frame (default 0.06)\n"
         "  --sync 0|1                 passthrough: present interval (0 = immediate, tearing)\n"
@@ -46,6 +46,7 @@ void PrintUsage() {
         "  --timecode                 draw loopback timecode band (for HDMI-out -> capture-in tests)\n"
         "  --decode-timecode          decode the timecode band from captured frames\n"
         "  --marker                   flashing corner square for photodiode / slow-motion camera tests\n"
+        "  --warmup SEC               reset statistics once after SEC seconds (default 6)\n"
         "  --report SEC               stats report interval (default 2)\n"
         "  --debug                    D3D11 debug layer, verbose log\n"
         "\n"
@@ -80,6 +81,7 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         else if (a == L"--bt601") o.color.bt601 = true;
         else if (a == L"--mode") {
             std::wstring v = next();
+            o.autoMode = v == L"auto";
             o.mode = v == L"passthrough" ? PaceMode::Passthrough : v == L"vrr" ? PaceMode::Vrr : PaceMode::Fixed;
         }
         else if (a == L"--k") o.vrrK = std::max(1, _wtoi(next()));
@@ -107,7 +109,10 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         else if (a == L"--decode-timecode") o.decodeTimecode = true;
         else if (a == L"--marker") o.marker = true;
         else if (a == L"--report") o.reportSec = _wtof(next());
+        else if (a == L"--warmup") o.warmupSec = _wtof(next());
         else if (a == L"--debug") o.debug = true;
+        else if (a == L"--stats-debug") o.statsDebug = true;
+        else if (a == L"--selftest") o.selftest = true;
         else { LOGE("unknown option %s", narrow(a.c_str()).c_str()); PrintUsage(); return false; }
     }
     return true;
@@ -153,6 +158,7 @@ bool App::Init(HINSTANCE inst) {
     po.allowTearing = true;
     if (o_.windowed) { po.windowW = 1920; po.windowH = 1080; }
     if (!pres_.Init(dev_, po, inst)) return false;
+    hdrOut_ = pres_.hdr();
     blit_.Init(dev_);
     outW_ = o_.outW ? o_.outW : pres_.width();
     outH_ = o_.outH ? o_.outH : pres_.height();
@@ -196,7 +202,10 @@ bool App::Init(HINSTANCE inst) {
     pc.vrrMultiplier = o_.vrrK;
     pc.snapEps = o_.snapEps;
     pc.marginMs = o_.marginMs;
-    pc.initialDelayMs = o_.initialDelayMs;
+    // Start near the expected steady state (VRR k-grid needs (k-1)/k of a source period,
+    // arbitrary-phase fixed refresh up to a full period) so the servo converges quickly.
+    pc.initialDelayMs = o_.initialDelayMs > 0 ? o_.initialDelayMs
+                                               : 1000.0 / o_.capFps * (o_.mode == PaceMode::Vrr || o_.autoMode ? (double)(o_.vrrK - 1) / o_.vrrK : 1.0) + 7.0;
     pacer_.Configure(pc, o_.capFps);
     vsync_.Start(pres_.output(), pres_.refreshHz());
 
@@ -254,8 +263,10 @@ void App::Ingest(int64_t now) {
             SourceFrame& f = store_[(size_t)(n % kStore)];
             synth_.Render(f.rgb, (double)n / o_.capFps);
             f.n = n; f.seq = (uint64_t)n + 1; f.generation++;
-            f.sampleQpc = synthNext_; f.arrivalQpc = now; f.uploadedQpc = now; f.readyQpc = now;
-            pacer_.OnSourceFrame(n, now);
+            // A clock-driven source: frame n exists from its tick time on (like a capture
+            // card delivering at exactly 60 Hz); rendering it lazily here does not change that.
+            f.sampleQpc = synthNext_; f.arrivalQpc = synthNext_; f.uploadedQpc = synthNext_; f.readyQpc = synthNext_;
+            pacer_.OnSourceFrame(n, synthNext_);
             if (vfx_) vfx_->Ingest(f);
             if (interp_) if (SourceFrame* prev = Frame(n - 1)) interp_->Prepare(*prev, f);
             synthNext_ += per;
@@ -265,7 +276,7 @@ void App::Ingest(int64_t now) {
     for (const RawFrame& rf : cap_->Drain()) IngestCaptured(rf);
 }
 
-bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT sync, bool tearing) {
+bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT sync, bool tearing, int64_t presentAt) {
     auto* ctx = dev_.ctx();
     SourceFrame* A = Frame(d.nA);
     SourceFrame* B = d.nB != d.nA ? Frame(d.nB) : nullptr;
@@ -282,7 +293,10 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
         int64_t t0 = Qpc::Now();
         const Device::Tex* out = vfx_->Process(*A, doInterp ? B : nullptr, doInterp ? d.t : 0.f, srOn_);
         stats_.Add("vfx.cpu_ms", Qpc::ToMs(Qpc::Now() - t0));
-        for (auto& kv : vfx_->PopTimings()) stats_.Add(kv.first, kv.second);
+        for (auto& kv : vfx_->PopTimings()) {
+            stats_.Add(kv.first, kv.second);
+            if (!strcmp(kv.first, "vfx.gpu_total")) lastVfxGpuMs_ = kv.second;
+        }
         if (out) {
             finalSrv = out->srv.Get(); stageTex = out->tex.Get(); finalW = out->w; finalH = out->h;
             if (vfx_->OutputIsPq()) enc = Encoding::Pq;
@@ -315,6 +329,12 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     prof_.Mark(ctx, "blit");
     prof_.End(ctx);
 
+    const int64_t submitDone = Qpc::Now();
+    if (presentAt) {
+        dev_.ctx()->Flush();                       // get the GPU going while we wait
+        if (Qpc::Now() > presentAt) stats_.Add("present.late_ms", Qpc::ToMs(Qpc::Now() - presentAt));
+        sleeper_.SleepUntil(presentAt, 0.25);
+    }
     const int64_t presentCall = Qpc::Now();
     HRESULT hr = pres_.Present(sync, tearing);
     const int64_t after = Qpc::Now();
@@ -329,11 +349,19 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     const SourceFrame* newest = (doInterp && B) ? B : A;
     r.newestArrival = newest->arrivalQpc; r.newestSample = newest->sampleQpc; r.newestUploaded = newest->uploadedQpc;
     r.contentSample = doInterp ? (int64_t)((double)A->sampleQpc + (double)(B->sampleQpc - A->sampleQpc) * d.t) : A->sampleQpc;
-    r.renderCpuMs = Qpc::ToMs(presentCall - renderStart);
+    r.renderCpuMs = Qpc::ToMs(submitDone - renderStart);   // excludes the deliberate present hold
     records_.push_back(r);
 
     stats_.Add("render.cpu_ms", r.renderCpuMs);
+    // Per-frame cost for the render-lead estimate: CPU submit time or the (async) CUDA chain, whichever is longer.
+    if (outCount_ > 60) frameCost_.Add(std::max(r.renderCpuMs, lastVfxGpuMs_ + 0.3));
     stats_.Add("present.call_ms", Qpc::ToMs(after - presentCall));
+    if (lastPresentCall_) {
+        double iv = Qpc::ToMs(presentCall - lastPresentCall_);
+        stats_.Add("present.interval_ms", iv);
+        presentIntervalEma_ = presentIntervalEma_ <= 0 ? iv : 0.9 * presentIntervalEma_ + 0.1 * std::min(iv, 100.0);
+    }
+    lastPresentCall_ = presentCall;
     stats_.Add("lat.arrival_to_present_ms", Qpc::ToMs(presentCall - newest->arrivalQpc));
     stats_.Add("pace.delay_ms", d.delayMs);
     if (doInterp) stats_.Add("pace.t", d.t);
@@ -344,6 +372,13 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
 void App::FinalizeRecord(OutRecord& r) {
     r.finalized = true;
     finalizedCount_++;
+    if (o_.mode == PaceMode::Vrr || vrrActive_ || (o_.mode == PaceMode::Passthrough && o_.passSync == 0)) {
+        // VRR / immediate: the flip (scan-out start) happens at Present() once the GPU is done;
+        // in VRR mode the present is held until the scheduled time, after the GPU work.
+        stats_.Add("lat.arrival_to_flip_ms", Qpc::ToMs(r.presentCall - r.newestArrival));
+        double cs = Qpc::ToMs(r.presentCall - r.contentSample);
+        if (cs > 0 && cs < 500) stats_.Add("lat.content_to_flip_ms", cs);
+    }
     if (r.actualV) {
         stats_.Add("lat.arrival_to_scanout_ms", Qpc::ToMs(r.actualV - r.newestArrival));
         double cs = Qpc::ToMs(r.actualV - r.contentSample);
@@ -368,9 +403,32 @@ void App::FinalizeRecord(OutRecord& r) {
 
 void App::PollPresentStats() {
     DXGI_FRAME_STATISTICS st{};
-    if (pres_.FrameStats(st) && st.PresentCount) {
-        for (auto& r : records_) {
-            if (r.presentId == st.PresentCount && !r.actualV) r.actualV = st.SyncQPCTime.QuadPart;
+    bool ok = pres_.FrameStats(st);
+    if (o_.statsDebug && outCount_ < 40 && !records_.empty()) {
+        const auto& last = records_.back();
+        LOGI("stats: ok=%d myPresentId=%u presentCall=%.3f | PresentCount=%u PresentRefreshCount=%u SyncRefreshCount=%u SyncQPC=%.3f (rel to my present %+.3f ms)",
+             ok, last.presentId, Qpc::ToMs(last.presentCall - startQpc_), st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount,
+             Qpc::ToMs(st.SyncQPCTime.QuadPart - startQpc_), Qpc::ToMs(st.SyncQPCTime.QuadPart - last.presentCall));
+    }
+    if (ok && st.PresentCount) {
+        // Detect VRR: one refresh per present (instead of refresh/fps refreshes per present).
+        if (lastStatsPresent_ && st.PresentCount > lastStatsPresent_) {
+            double ratio = (double)(st.SyncRefreshCount - lastStatsRefresh_) / (double)(st.PresentCount - lastStatsPresent_);
+            vrrRatio_ = 0.9 * vrrRatio_ + 0.1 * ratio;
+        }
+        lastStatsPresent_ = st.PresentCount; lastStatsRefresh_ = st.SyncRefreshCount;
+        // The ratio only discriminates while we present slower than the refresh rate
+        // (fixed refresh: ~refresh/fps refreshes per present; VRR: exactly 1).
+        const bool slowPresents = presentIntervalEma_ > 1.5 * 1000.0 / pres_.refreshHz();
+        if (slowPresents) {
+            const bool vrrActive = vrrRatio_ < 1.3;
+            if (vrrActive != vrrActive_) { vrrActive_ = vrrActive; LOGI("display VRR %s (refreshes/present %.2f)", vrrActive ? "ACTIVE" : "inactive", vrrRatio_); }
+        }
+        // Fixed refresh: SyncQPCTime is the vblank at which present #PresentCount became visible.
+        // Under VRR it is the start of the (stretched) vblank instead, so it cannot be used per frame.
+        if (!vrrActive_ && o_.mode != PaceMode::Vrr && !(o_.mode == PaceMode::Passthrough && o_.passSync == 0)) {
+            for (auto& r : records_)
+                if (r.presentId == st.PresentCount && !r.actualV && st.SyncQPCTime.QuadPart >= r.presentCall) r.actualV = st.SyncQPCTime.QuadPart;
         }
     }
     while (!records_.empty()) {
@@ -387,7 +445,8 @@ void App::PollPresentStats() {
     } else if (now - lastLeadAdjust_ > Qpc::FromMs(3000)) {
         double p50, p99;
         double floorMs = 1.0;
-        if (stats_.Get("render.cpu_ms", p50, p99)) floorMs = p99 + 0.75;
+        if (frameCost_.Count() > 30) floorMs = frameCost_.Quantile(0.99) + 0.75;
+        (void)p50; (void)p99;
         leadMs_ = std::max(floorMs, leadMs_ - 0.1);
         lastLeadAdjust_ = now;
     }
@@ -395,6 +454,11 @@ void App::PollPresentStats() {
 
 void App::Report(bool final) {
     const int64_t now = Qpc::Now();
+    if (!warmupDone_ && Qpc::ToSec(now - startQpc_) > o_.warmupSec) {
+        warmupDone_ = true;
+        stats_.Clear();
+        LOGI("warm-up (%.0f s) done: statistics reset", o_.warmupSec);
+    }
     if (!final && now - lastReport_ < Qpc::FromMs(o_.reportSec * 1000.0)) return;
     lastReport_ = now;
     char head[512];
@@ -470,16 +534,18 @@ void App::RunVrr() {
         Ingest(s);
         PaceDecision d = pacer_.Decide(s, V);
         if (!d.valid) continue;
-        Render(d, s, V, 0, true);
+        Render(d, s, V, 0, true, V - Qpc::FromMs(0.3));
         PollPresentStats();
         Report(false);
     }
 }
 
-void App::RunPassthrough() {
+void App::RunPassthrough(double untilSec, int sync) {
     int64_t shown = -1;
+    if (sync < 0) sync = o_.passSync;
     while (pres_.PumpMessages() && !g_quitRequested) {
         if (o_.durationSec > 0 && Qpc::ToSec(Qpc::Now() - startQpc_) > o_.durationSec) break;
+        if (untilSec > 0 && Qpc::ToSec(Qpc::Now() - startQpc_) > untilSec) break;
         HandleKeys();
         pres_.WaitReady(100);
         if (o_.synthetic) {
@@ -494,8 +560,8 @@ void App::RunPassthrough() {
         if (n < 0 || n == shown) continue;
         PaceDecision d;
         d.valid = true; d.nA = d.nB = n; d.t = 0; d.delayMs = 0;
-        int64_t V = o_.passSync ? vsync_.NextVblankAfter(s + Qpc::FromMs(1.0)) : s + Qpc::FromMs(1.0);
-        Render(d, s, V, (UINT)o_.passSync, o_.passSync == 0);
+        int64_t V = sync ? vsync_.NextVblankAfter(s + Qpc::FromMs(1.0)) : s + Qpc::FromMs(1.0);
+        Render(d, s, V, (UINT)sync, sync == 0);
         shown = n;
         PollPresentStats();
         Report(false);
@@ -507,6 +573,17 @@ int App::Run() {
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (cap_) cap_->Start();
+    if (o_.autoMode) {
+        // Probe: present each source frame with sync interval 1 for a moment. A VRR display
+        // refreshes once per present; a fixed-refresh display refreshes refresh/fps times.
+        LOGI("auto mode: probing the display for VRR...");
+        o_.mode = PaceMode::Passthrough;
+        RunPassthrough(2.5, 1);
+        o_.mode = (vrrActive_ && pres_.tearingEnabled()) ? PaceMode::Vrr : PaceMode::Fixed;
+        LOGI("auto mode: refreshes/present %.2f -> %s pacing", vrrRatio_, PaceModeName(o_.mode));
+        stats_.Clear();
+        records_.clear();
+    }
     switch (o_.mode) {
     case PaceMode::Fixed: RunFixed(); break;
     case PaceMode::Vrr: RunVrr(); break;
@@ -539,6 +616,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!ParseOptions(argc, argv, o)) { MFShutdown(); return 0; }
         if (!o.logPath.empty()) SetLogFile(o.logPath.c_str());
         if (o.debug) SetLogLevel(LogLevel::Debug);
+        if (o.selftest) { rc = RunSelfTest(o); MFShutdown(); CoUninitialize(); return rc; }
         App app(o);
         if (!app.Init(GetModuleHandleW(nullptr))) { LOGE("init failed"); rc = 1; }
         else rc = app.Run();

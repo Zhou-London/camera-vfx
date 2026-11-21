@@ -13,6 +13,7 @@ set(CAMSS_VFX_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/third_party/nvvfx_runtime" CACHE 
 
 set(CAMSS_SOURCES
   src/app.cpp
+  src/selftest.cpp
   src/util/common.cpp
   src/gfx/device.cpp
   src/gfx/color_convert.cpp

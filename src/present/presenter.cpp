@@ -31,8 +31,10 @@ bool Presenter::Init(Device& dev, const PresenterOptions& opt, HINSTANCE inst) {
     output_->GetDesc1(&od);
     RECT r = od.DesktopCoordinates;
     hdr_ = opt.hdr10;
-    if (hdr_ && od.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-        LOGW("HDR10 requested but Windows HDR is OFF on this display (output colorspace %d); output will look wrong until HDR is enabled", (int)od.ColorSpace);
+    if (hdr_ && od.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+        LOGW("HDR output requested but Windows HDR is OFF on this display: using an SDR swap chain and tone-mapping the HDR10 result for preview. Turn on 'Use HDR' in Windows display settings for real HDR.");
+        hdr_ = false;
+    }
     LOGI("display: %s %ldx%ld, max luminance %.0f nits, HDR %s", WideToUtf8(od.DeviceName).c_str(), r.right - r.left, r.bottom - r.top,
          od.MaxLuminance, od.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? "on" : "off");
 
