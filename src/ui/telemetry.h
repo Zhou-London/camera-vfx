@@ -44,6 +44,7 @@ struct AppStatus {
     std::string srQuality;        // e.g. hb-ultra (vfx) or "-"
     std::string hdr;              // none | rtx | vfx
     bool interpOn = true, srOn = true;
+    bool timecode = false;        // loopback timecode bar drawn on the output (T)
     bool adaptive = false;        // repeat-aware frame generation
     int multiplier = 1;           // VRR output frames per content frame
     double targetFps = 0;         // fg-target-fps (0 = fixed multiplier)

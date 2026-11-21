@@ -931,6 +931,7 @@ void App::PublishStatus(int64_t now) {
     s.srQuality = o_.sr == "vfx" ? SrQualityName(o_.srQuality) : "-";
     s.hdr = o_.hdr;
     s.interpOn = interpOn_; s.srOn = srOn_;
+    s.timecode = o_.timecode;
     s.adaptive = adaptive_;
     s.multiplier = curK_;
     s.targetFps = o_.fgTargetFps;

@@ -1,12 +1,12 @@
-// Terminal dashboard (FTXUI) and the per-setting latency record.
+// Terminal dashboard (FTXUI) and the per-setting latency record (CSV).
 //
 // Runs on its own below-normal-priority thread; reads only from Telemetry (lock-free frame ring +
 // status snapshot) and from the log sink, so it can never stall the render thread.
-//  * TUI mode: full-screen dashboard (settings, live latency with p50/p99, 60 s history graphs,
-//    per-setting comparison table, counters, audio, recent log lines, key hints). Keys typed into
-//    the console are forwarded to the app through Telemetry::PushKey.
+//  * TUI mode: full-screen dashboard (live latency with p50/p99, the switches with their keys and
+//    the read-only setup, 60 s history graphs, recent log lines). Keys typed into the console are
+//    forwarded to the app through Telemetry::PushKey.
 //  * Record: every period with unchanged settings is a "segment"; its latency / GPU / fps statistics
-//    are shown in the comparison table and appended to historyPath (CSV) when the segment ends.
+//    are appended to historyPath (CSV) when the segment ends.
 #pragma once
 #include "telemetry.h"
 #include "../util/common.h"
@@ -46,8 +46,6 @@ public:
     bool TuiActive() const;
     // Log sink: called by the logger's writer thread for every message (any thread; never blocks long).
     void OnLog(LogLevel lvl, double tSec, const char* msg, size_t len);
-    // Plain-text table of the recorded segments (for the console after Stop()).
-    std::string Summary() const;
     DashboardPerf Perf() const;
 
     // ---- offline use (tests, tui_demo --render); do not mix with Start()

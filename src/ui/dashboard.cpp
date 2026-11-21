@@ -1,5 +1,5 @@
-// Terminal dashboard: model (live window, 60 s history, per-setting segments, CSV record), the
-// FTXUI view and the low-priority UI thread. See dashboard.h.
+// Terminal dashboard: model (live window, 60 s history, per-setting segments for the CSV record),
+// the FTXUI view and the low-priority UI thread. See dashboard.h.
 //
 // FTXUI headers come before <windows.h> (pulled in by dashboard.h): wingdi.h defines an RGB()
 // macro that would break ftxui::Color::RGB. Colours below use the Color(r, g, b) constructor.
@@ -43,7 +43,6 @@ constexpr double kBucketSec = 0.25;        // history resolution (4 buckets per 
 constexpr int kHistBuckets = 240;          // 60 s of history
 constexpr double kSettleSec = 2.0;         // ignored at the start of a segment
 constexpr double kMinSegSec = 3.0;         // shorter segments are not kept / written
-constexpr size_t kMaxSegments = 50;
 constexpr size_t kMaxLogLines = 300;
 constexpr double kFpsChange = 0.10;        // content fps change that starts a new segment
 constexpr double kFpsConfirmSec = 1.0;     // ... when it persists this long
@@ -123,12 +122,6 @@ std::string IsoLocal(time_t t) {
     const long a = off < 0 ? -off : off;
     return std::string(b) + Fmt("%c%02ld:%02ld", off < 0 ? '-' : '+', a / 3600, (a % 3600) / 60);
 }
-std::string HmsLocal(time_t t) {
-    tm lt{}; localtime_s(&lt, &t);
-    char b[16]; strftime(b, sizeof(b), "%H:%M:%S", &lt);
-    return b;
-}
-
 // ------------------------------------------------------------------ spans: styled text runs
 enum : uint8_t { kPlain = 0, kBold = 1, kMuted = 2, kColor = 4 };
 struct Span {
@@ -188,11 +181,11 @@ Element Fit(const std::vector<Spans>& variants, int w) {
     for (const auto& v : variants) if (Wid(v) <= w) return Line(v, w);
     return Line(variants.back(), w);
 }
-// Right-aligned tail on the same line: left part truncated first.
+// Right-aligned tail on the same line: left part truncated first (at least one blank between).
 Element LineLR(const Spans& left, const Spans& right, int w) {
     const int rw = Wid(right);
     if (rw + 2 > w) return Line(left, w);
-    Elements els{Line(left, w - rw)};
+    Elements els{Line(left, w - rw - 1), ftxui::text(" ")};
     for (const auto& sp : right) els.push_back(ToEl(sp));
     return ftxui::hbox(std::move(els));
 }
@@ -423,18 +416,15 @@ double TargetFps(const Settings& s) {
 }
 
 struct SegRow {
-    int id = 0;
     Settings s;
     time_t startT = 0, endT = 0;
     double durSec = 0, measSec = 0;
     uint64_t frames = 0, late = 0, hold = 0;
     double outFps = -1, latP50 = -1, latP99 = -1, latMax = -1, contP50 = -1, dP50 = -1, gpuP50 = -1, gpuP99 = -1;
-    bool current = false;
 };
 
 struct SegAcc {
     bool active = false;
-    int id = 0;
     Settings s;
     int64_t startQpc = 0, settleUntil = 0;
     time_t startT = 0;
@@ -506,66 +496,6 @@ bool AppendCsv(const std::string& path, const SegRow& r) {
     return ok;
 }
 
-// ------------------------------------------------------------------ record table columns
-struct Col {
-    const char* title;
-    int w;
-    bool right;
-    int prio;                                   // lower = more important
-};
-enum ColId { cStart, cFg, cSr, cHdr, cCont, cOut, cDur, cP50, cP99, cContLat, cD, cGpu, cLate, cHold, cCount };
-const Col kCols[cCount] = {
-    {"开始", 8, false, 4}, {"补帧", 15, false, 0}, {"超分", 14, false, 1}, {"HDR", 5, false, 7},
-    {"内容fps", 7, true, 2}, {"输出fps", 7, true, 2}, {"时长", 6, true, 5}, {"p50", 6, true, 0},
-    {"p99", 6, true, 0}, {"内容p50", 7, true, 6}, {"D", 5, true, 6}, {"GPU p50/99", 10, true, 3},
-    {"迟到", 5, true, 5}, {"保持", 5, true, 6},
-};
-std::string CellText(const SegRow& r, int c) {
-    switch (c) {
-    case cStart: return HmsLocal(r.startT);
-    case cFg: return FgText(r.s);
-    case cSr: return SrText(r.s);
-    case cHdr: return r.s.hdr.empty() ? "-" : r.s.hdr;
-    case cCont: return Num(r.s.contentFps, 1);
-    case cOut: return Num(r.outFps, 1);
-    case cDur: return Clock(r.durSec);
-    case cP50: return NumA(r.latP50);
-    case cP99: return NumA(r.latP99);
-    case cContLat: return NumA(r.contP50);
-    case cD: return NumA(r.dP50);
-    case cGpu: return r.gpuP50 >= 0 ? NumA(r.gpuP50) + "/" + NumA(r.gpuP99) : "-";
-    case cLate: return std::to_string(r.late);
-    case cHold: return std::to_string(r.hold);
-    }
-    return {};
-}
-// Columns that fit in width w (2 columns for the marker), in display order.
-std::vector<int> PickCols(int w) {
-    std::vector<int> order;
-    for (int c = 0; c < cCount; c++) order.push_back(c);
-    std::stable_sort(order.begin(), order.end(), [](int a, int b) { return kCols[a].prio < kCols[b].prio; });
-    std::vector<bool> on(cCount, false);
-    int used = 2;
-    for (int c : order) {
-        const int need = kCols[c].w + 1;
-        if (used + need <= w) { on[c] = true; used += need; }
-    }
-    std::vector<int> r;
-    for (int c = 0; c < cCount; c++) if (on[c]) r.push_back(c);
-    return r;
-}
-int BestIndex(const std::vector<SegRow>& rows) {
-    int best = -1;
-    for (int i = 0; i < (int)rows.size(); i++) {
-        const SegRow& r = rows[i];
-        if (r.latP50 < 0 || r.measSec < 1) continue;
-        const double t = TargetFps(r.s);
-        if (t > 0 && r.outFps < 0.99 * t) continue;
-        if (best < 0 || r.latP50 < rows[best].latP50) best = i;
-    }
-    return best;
-}
-
 // ------------------------------------------------------------------ the model
 class Model {
 public:
@@ -604,7 +534,6 @@ public:
         ComputeWindow(now);
         ringDropped_ = tel->DroppedFrames();
         now_ = now;
-        PublishRows(now);
         const double ms = Qpc::ToMs(Qpc::Now() - t0);
         refreshes_.fetch_add(1, std::memory_order_relaxed);
         framesSeen_.store(framesSeenLocal_, std::memory_order_relaxed);
@@ -614,17 +543,8 @@ public:
     // Ends the current segment (Stop / test).
     void Finish(int64_t now) {
         if (seg_.active) EndSeg(now);
-        PublishRows(now);
     }
     void ResetWindow() { win_.clear(); winStart_ = now_; }
-
-    // ---- rows for Summary() (any thread)
-    std::vector<SegRow> RowsSnapshot(bool withCurrent) const {
-        std::lock_guard<std::mutex> lk(rowsM_);
-        std::vector<SegRow> r(rows_.begin(), rows_.end());
-        if (withCurrent && haveCur_) r.push_back(cur_);
-        return r;
-    }
 
     // ---- view (UI thread)
     Element Build(int W, int H, const std::vector<LogLine>& logs, bool help, bool quitting) const;
@@ -638,23 +558,15 @@ private:
     void BeginSeg(const AppStatus& st, int64_t at) {
         seg_ = SegAcc{};
         seg_.active = true;
-        seg_.id = ++segCounter_;
         seg_.s = SettingsOf(st);
         seg_.startQpc = at;
         seg_.settleUntil = at + Qpc::FromMs(kSettleSec * 1000);
         seg_.startT = WallAt(at);
     }
     void EndSeg(int64_t at) {
-        SegRow r = RowOf(seg_, at, false);
+        const SegRow r = RowOf(seg_, at);
         seg_.active = false;
-        if (r.durSec >= kMinSegSec && r.frames > 0) {
-            {
-                std::lock_guard<std::mutex> lk(rowsM_);
-                rows_.push_back(r);
-                while (rows_.size() > kMaxSegments) rows_.pop_front();
-            }
-            AppendCsv(opt_.historyPath, r);
-        }
+        if (r.durSec >= kMinSegSec && r.frames > 0) AppendCsv(opt_.historyPath, r);
     }
     void SegmentCheck(int64_t now) {
         const AppStatus& st = st_;
@@ -699,9 +611,9 @@ private:
         s.d.Add(f.delayMs);
         if (f.gpuMs > 0) s.gpu.Add(f.gpuMs);
     }
-    SegRow RowOf(const SegAcc& s, int64_t at, bool current) const {
+    SegRow RowOf(const SegAcc& s, int64_t at) const {
         SegRow r;
-        r.id = s.id; r.s = s.s; r.current = current;
+        r.s = s.s;
         r.startT = s.startT; r.endT = WallAt(at);
         r.durSec = std::max(0.0, Qpc::ToSec(at - s.startQpc));
         r.measSec = Qpc::ToSec(s.activeTicks);
@@ -711,11 +623,6 @@ private:
         r.contP50 = s.cont.Q(0.5); r.dP50 = s.d.Q(0.5);
         r.gpuP50 = s.gpu.Q(0.5); r.gpuP99 = s.gpu.Q(0.99);
         return r;
-    }
-    void PublishRows(int64_t now) {
-        std::lock_guard<std::mutex> lk(rowsM_);
-        haveCur_ = seg_.active;
-        if (haveCur_) cur_ = RowOf(seg_, now, true);
     }
     // Wall clock of a QPC time (QPC times may be simulated: relative to the real "now").
     time_t WallAt(int64_t qpc) const {
@@ -804,13 +711,11 @@ private:
     Elements LatencyRows(int iw, bool compact) const;
     Elements SettingsRows(int iw, bool compact) const;
     Element HistoryPanel(int w, int h) const;
-    Element RecordPanel(int w, int h) const;
     Element LogPanel(int w, int h, const std::vector<LogLine>& logs) const;
     Element Footer(int W, bool quitting) const;
     Element Compact(int W, int h) const;
     Element Help(int W, int H) const;
     Color LatColor(double v) const;
-    Color JitterColor(double p50, double p99) const;
     double ContentPeriodMs() const { return st_.contentFps > 1 ? 1000.0 / st_.contentFps : 1000.0 / 60.0; }
 
     DashboardOptions opt_;
@@ -831,11 +736,6 @@ private:
     std::vector<float> bLat_, bD_, bGpu_;
 
     SegAcc seg_;
-    int segCounter_ = 0;
-    mutable std::mutex rowsM_;
-    std::deque<SegRow> rows_;
-    SegRow cur_;
-    bool haveCur_ = false;
 };
 
 // ------------------------------------------------------------------ view
@@ -859,15 +759,6 @@ Color Model::LatColor(double v) const {
     if (v <= 2 * p + 4) return T.warn;
     return T.bad;
 }
-Color Model::JitterColor(double p50, double p99) const {
-    const Theme& T = Th();
-    if (p50 < 0 || p99 < 0) return T.muted;
-    const double p = ContentPeriodMs(), j = p99 - p50;
-    if (j <= std::max(2.0, 0.25 * p)) return T.good;
-    if (j <= p) return T.warn;
-    return T.bad;
-}
-
 Element Model::Header(int W) const {
     const Theme& T = Th();
     const Health h = HealthOf();
@@ -888,9 +779,6 @@ Element Model::Header(int W) const {
         if (st_.outH && st_.outH != st_.srcH) { res.push_back(M(" → ")); res.push_back(S(Res(st_.outW, st_.outH))); }
         if (!st_.hdr.empty() && st_.hdr != "none") res.push_back(C(" HDR", T.accent));
     }
-    Spans mode;
-    if (!st_.mode.empty()) mode.push_back(S(st_.mode));
-    if (st_.vrrActive && st_.mode.find("vrr") == std::string::npos) mode.push_back(S(" VRR"));
     const Spans right{M("up "), S(Clock(st_.uptimeSec)), S(" ")};
 
     auto join = [&](std::initializer_list<const Spans*> parts) {
@@ -900,7 +788,7 @@ Element Model::Header(int W) const {
     };
     Spans shortRates{M("内容 "), S(st_.contentStatic ? "静止" : Num(st_.contentFps, 1)), M(" → 输出 "), S(Num(out, 1) + " fps")};
     if (rates.size() && rates.back().style & kColor) shortRates.push_back(rates.back());
-    std::vector<Spans> v{join({&mode, &rates, &res}), join({&rates, &res}), join({&rates}), join({&shortRates}), brand};
+    std::vector<Spans> v{join({&rates, &res}), join({&rates}), join({&shortRates}), brand};
     for (auto& x : v) if (Wid(x) + Wid(right) + 2 <= W) return LineLR(x, right, W);
     return Line(brand, W);
 }
@@ -1006,76 +894,77 @@ Elements Model::LatencyRows(int iw, bool compact) const {
     return rows;
 }
 
-// Settings panel rows (hotkeys in grey right after the setting they change); compact = fewer rows.
+// Settings panel. The switches come first, one per row in a fixed grid: key, name, state, what
+// is switched and, on the right, the key that tunes it. Below a rule: the read-only facts.
+// compact = no rule (short terminals).
 Elements Model::SettingsRows(int iw, bool compact) const {
     const Theme& T = Th();
     const Settings s = SettingsOf(st_);
-    auto label = [](const char* l) { return M(PadR(l, 6)); };
-    auto key = [&](const char* k) { return C(std::string(" ") + k, T.muted); };
-    auto onoff = [&](bool on, bool avail) { return !avail ? M("-") : on ? C("● 开", T.good) : M("○ 关"); };
     Elements rows;
-    const bool fgAvail = !s.interp.empty() && s.interp != "none";
-    const bool srAvail = !s.sr.empty() && s.sr != "none";
+    enum { kNa = -1, kOff = 0, kOn = 1 };
+    auto toggle = [&](const char* key, const char* name, int state, Spans what, const char* key2 = nullptr,
+                      const char* what2 = nullptr) {
+        Spans l{CB(PadR(key, 3), T.accent), S(PadR(name, 7))};
+        if (state == kOn) l.push_back(C("● 开   ", T.good));
+        else if (state == kOff) l.push_back(M("○ 关   "));
+        else l.push_back(M("-      "));
+        const int fixed = Wid(l);
+        if (state != kOn) for (auto& sp : what) if (!(sp.style & kColor)) sp.style = kMuted;
+        l += what;
+        Spans r;
+        if (key2) r = {CB(key2, T.accent), M(std::string(" ") + what2)};
+        // the tuning key stays visible; the description is shortened first
+        if (!r.empty() && fixed + 8 + 2 + Wid(r) <= iw) rows.push_back(LineLR(l, r, iw));
+        else rows.push_back(Line(l, iw));
+    };
     {
-        Spans fg{label("补帧"), onoff(s.interpOn, fgAvail), key("i"), M("   "), S(s.interp.empty() ? "-" : s.interp)};
-        if (!Q(s.fgQuality).empty()) { fg.push_back(S(Q(s.fgQuality))); fg.push_back(key("f")); }
-        Spans mul;
-        if (s.targetFps > 0) mul.push_back(S(Fmt("目标 %.0f fps", s.targetFps)));
-        else mul.push_back(S(Fmt("×%d", std::max(1, s.multiplier))));
-        mul.push_back(M(" · 自适应 "));
-        mul.push_back(S(st_.adaptive ? "开" : "关"));
-        Spans one = fg; one.push_back(M("   ")); one += mul;
-        if (compact && Wid(one) <= iw) {
-            rows.push_back(Line(one, iw));
-        } else {
-            rows.push_back(Line(fg, iw));
-            Spans two{label("倍数")}; two += mul;
-            rows.push_back(Line(two, iw));
+        const bool avail = !s.interp.empty() && s.interp != "none";
+        Spans w;
+        if (!avail) w.push_back(S("未配置"));
+        else {
+            w.push_back(S(s.interp + Q(s.fgQuality)));
+            if (s.targetFps > 0) w.push_back(S(Fmt(" · 目标 %.0f fps", s.targetFps)));
+            else w.push_back(S(Fmt(" · ×%d", std::max(1, s.multiplier))));
+            if (s.adaptive) w.push_back(S(" · 自适应"));
         }
+        toggle("i", "补帧", avail ? (s.interpOn ? kOn : kOff) : kNa, w, avail && !Q(s.fgQuality).empty() ? "f" : nullptr, "档位");
     }
     {
-        Spans r{label("超分"), onoff(s.srOn, srAvail), key("s"), M("   "), S(s.sr.empty() ? "-" : s.sr)};
-        if (!Q(s.srQuality).empty()) { r.push_back(S(Q(s.srQuality))); r.push_back(key("q")); }
-        rows.push_back(Line(r, iw));
+        const bool avail = !s.sr.empty() && s.sr != "none";
+        toggle("s", "超分", avail ? (s.srOn ? kOn : kOff) : kNa, {S(avail ? s.sr + Q(s.srQuality) : "未配置")},
+               avail && !Q(s.srQuality).empty() ? "q" : nullptr, "档位");
     }
-    rows.push_back(Line({label("HDR"), S(st_.hdr.empty() ? "-" : st_.hdr)}, iw));
+    if (!st_.audioEnabled) toggle("m", "声音", kNa, {S("未启用")});
+    else if (!st_.audioRunning) toggle("m", "声音", st_.audioMuted ? kOff : kOn, {C("设备未就绪", T.warn)}, "+/-", "音量");
+    else toggle("m", "声音", st_.audioMuted ? kOff : kOn, {S(Fmt("音量 %.0f%%", st_.audioVolume * 100))}, "+/-", "音量");
+    toggle("t", "时间码", st_.timecode ? kOn : kOff, {S("回环测延迟用")});
+
+    if (!compact) rows.push_back(Line({C(Repeat("─", iw), T.line)}, iw));
+    auto info = [&](const char* label, Spans v) {
+        Spans l{S("   "), M(PadR(label, 7))};
+        l += v;
+        rows.push_back(Line(l, iw));
+    };
     {
-        Spans r{label("模式"), S(st_.mode.empty() ? "-" : st_.mode)};
-        if (st_.vrrActive) { r.push_back(M(" · ")); r.push_back(C("VRR 生效", T.good)); }
-        if (st_.dispW) { r.push_back(M(" · 显示 ")); r.push_back(S(Fmt("%ux%u @ %.0f Hz", st_.dispW, st_.dispH, st_.dispHz))); }
-        rows.push_back(Line(r, iw));
+        Spans v{S(st_.mode.empty() ? "-" : st_.mode)};
+        if (st_.vrrActive) { v.push_back(M(" · ")); v.push_back(C("VRR 生效", T.good)); }
+        if (st_.dispW) { v.push_back(M(" · ")); v.push_back(S(Fmt("%ux%u @ %.0f Hz", st_.dispW, st_.dispH, st_.dispHz))); }
+        if (!st_.hdr.empty() && st_.hdr != "none") { v.push_back(M(" · HDR ")); v.push_back(S(st_.hdr)); }
+        info("输出", v);
     }
     {
-        Spans r{label("采集"), S(st_.captureName.empty() ? "-" : st_.captureName)};
-        if (!st_.captureFormat.empty()) { r.push_back(M(" · ")); r.push_back(S(st_.captureFormat)); }
-        rows.push_back(Line(r, iw));
+        Spans v{S(st_.captureName.empty() ? "-" : st_.captureName)};
+        if (!st_.captureFormat.empty()) { v.push_back(M(" · ")); v.push_back(S(st_.captureFormat)); }
+        info("采集", v);
     }
-    if (!st_.audioEnabled) {
-        rows.push_back(Line({label("音频"), M("关")}, iw));
-    } else {
-        Spans dev{label("音频")};
-        if (!st_.audioRunning) dev.push_back(C("● ", T.warn));
-        else if (st_.audioPlaying) dev.push_back(C("● ", T.good));
-        dev.push_back(S(st_.audioIn.empty() ? "-" : st_.audioIn));
-        dev.push_back(M(" → "));
-        dev.push_back(S(st_.audioOut.empty() ? "-" : st_.audioOut));
-        Spans lvl;
-        if (st_.audioMuted) lvl.push_back(C("静音", T.warn));
-        else lvl.push_back(S(Fmt("音量 %.0f%%", st_.audioVolume * 100)));
-        lvl.push_back(key("m +/-"));
-        lvl.push_back(M(" · 延迟 ")); lvl.push_back(S(Num(st_.audioLatencyMs, 0))); lvl.push_back(M(" ms"));
-        lvl.push_back(M(" · 同步 ")); lvl.push_back(S(Fmt("%+.0f", st_.audioSyncMs)));
-        lvl.push_back(M(" · 欠载 ")); lvl.push_back(st_.audioUnderruns ? C(std::to_string(st_.audioUnderruns), T.warn) : S("0"));
-        Spans one = dev; one.push_back(M(" · ")); one += lvl;
-        if (Wid(one) <= iw || compact) {
-            rows.push_back(Line(one, iw));
-        } else {
-            rows.push_back(Line(dev, iw));
-            Spans two{M(PadR("", 6))}; two += lvl;
-            rows.push_back(Line(two, iw));
-        }
+    if (st_.audioEnabled) {
+        Spans v{S(st_.audioIn.empty() ? "-" : st_.audioIn), M(" → "), S(st_.audioOut.empty() ? "-" : st_.audioOut)};
+        v.push_back(M(" · 延迟 ")); v.push_back(S(Num(st_.audioLatencyMs, 0))); v.push_back(M(" ms"));
+        v.push_back(M(" · 同步 ")); v.push_back(S(Fmt("%+.0f", st_.audioSyncMs)));
+        if (st_.audioUnderruns) { v.push_back(M(" · 欠载 ")); v.push_back(C(std::to_string(st_.audioUnderruns), T.warn)); }
+        info("音频", v);
     }
-    rows.push_back(Line({label("配置"), S(st_.configPath.empty() ? "-" : st_.configPath)}, iw));
+    info("配置", {S(st_.configPath.empty() ? "-" : st_.configPath)});
     return rows;
 }
 
@@ -1158,62 +1047,6 @@ Element Model::HistoryPanel(int w, int h) const {
     return Panel({B("历史")}, Rows(std::move(rows), ih), w, h);
 }
 
-Element Model::RecordPanel(int w, int h) const {
-    const Theme& T = Th();
-    const int iw = w - 4, ih = h - 2;
-    std::vector<SegRow> all = RowsSnapshot(true);
-    const int best = BestIndex(all);
-    const std::vector<int> cols = PickCols(iw);
-    // spare width goes to the setting columns (long quality names) as far as their content needs
-    int cw[cCount];
-    int used = 2;
-    for (int c = 0; c < cCount; c++) cw[c] = kCols[c].w;
-    for (int c : cols) used += cw[c] + 1;
-    for (int c : {cSr, cFg}) {
-        if (std::find(cols.begin(), cols.end(), c) == cols.end()) continue;
-        int need = 0;
-        for (const auto& r : all) need = std::max(need, Wid(CellText(r, c)));
-        const int add = std::clamp(need - cw[c], 0, std::max(0, iw - used));
-        cw[c] += add; used += add;
-    }
-    Elements rows;
-    {
-        Spans r{S("  ")};
-        for (int c : cols) r.push_back(M((kCols[c].right ? PadL(kCols[c].title, cw[c]) : PadR(kCols[c].title, cw[c])) + " "));
-        rows.push_back(Line(r, iw));
-    }
-    if (all.empty()) {
-        rows.push_back(Line({M("  设置稳定 " + Num(kMinSegSec, 0) + " s 以上的时段会记录在这里（前 " + Num(kSettleSec, 0) + " s 不计）")}, iw));
-    }
-    // newest rows at the bottom; when the best row has scrolled out of a short table it is kept
-    // as the first visible row (so the ★ in the title always points at a visible row)
-    const int maxRows = std::max(0, ih - 1);
-    std::vector<int> vis;
-    for (int i = std::max(0, (int)all.size() - maxRows); i < (int)all.size(); i++) vis.push_back(i);
-    if (best >= 0 && vis.size() >= 2 && best < vis.front()) vis.front() = best;
-    for (int i : vis) {
-        const SegRow& r = all[i];
-        Spans sp;
-        if (r.current && i == best) sp.push_back(CB("★ ", T.accent));   // current (bold row) and best
-        else if (r.current) sp.push_back(CB("› ", T.accent));
-        else if (i == best) sp.push_back(C("★ ", T.good));
-        else sp.push_back(S("  "));
-        for (int c : cols) {
-            std::string t = CellText(r, c);
-            t = (kCols[c].right ? PadL(t, cw[c]) : PadR(t, cw[c])) + " ";
-            if (i == best && c == cP50) sp.push_back(r.current ? CB(t, T.good) : C(t, T.good));
-            else if (r.current) sp.push_back(B(t));
-            else sp.push_back(S(t));
-        }
-        rows.push_back(Line(sp, iw));
-    }
-    Spans title{B("记录"), M(" 每种设置的延迟")};
-    const int saved = (int)all.size() - (all.empty() ? 0 : (all.back().current ? 1 : 0));
-    if (saved > 0) title.push_back(M(Fmt(" · %d 段", saved)));
-    if (best >= 0) { title.push_back(M(" · ")); title.push_back(C("★", T.good)); title.push_back(M(" 最佳")); }
-    return Panel(title, Rows(std::move(rows), ih), w, h);
-}
-
 Element Model::LogPanel(int w, int h, const std::vector<LogLine>& logs) const {
     const Theme& T = Th();
     const int iw = w - 4, ih = h - 2;
@@ -1233,16 +1066,13 @@ Element Model::LogPanel(int w, int h, const std::vector<LogLine>& logs) const {
 
 Element Model::Footer(int W, bool quitting) const {
     const Theme& T = Th();
-    static const char* const kHints[][2] = {
-        {"esc", "退出"}, {"i", "补帧"}, {"f", "补帧档位"}, {"s", "超分"}, {"q", "超分档位"}, {"m", "静音"},
-        {"+/-", "音量"}, {"l", "统计"}, {"r", "重置"}, {"t", "时间码"}, {"?", "帮助"},
-    };
+    static const char* const kHints[][2] = {{"esc", "退出"}, {"l", "打印统计"}, {"r", "重置统计"}, {"?", "全部按键"}};
     Spans r{S(" ")};
     if (quitting) { r.push_back(C("正在退出…", T.accent)); return Line(r, W); }
     for (size_t i = 0; i < std::size(kHints); i++) {
         Spans item;
         if (i) item.push_back(M(" · "));
-        item.push_back(S(kHints[i][0]));
+        item.push_back(CB(kHints[i][0], T.accent));
         item.push_back(M(std::string(" ") + kHints[i][1]));
         if (Wid(r) + Wid(item) > W) break;
         r += item;
@@ -1251,30 +1081,35 @@ Element Model::Footer(int W, bool quitting) const {
 }
 
 Element Model::Compact(int W, int h) const {
-    const Theme& T = Th();
     Elements rows;
-    const Color c50 = LatColor(ws_.latP50), c99 = JitterColor(ws_.latP50, ws_.latP99);
+    const Color c50 = LatColor(ws_.latP50);
     const bool cont = ws_.contP50 >= 0;
     rows.push_back(Line({S(" "), M("延迟 "), CB(NumA(cont ? ws_.contP50 : ws_.latP50), c50), M("  p99 "),
                          S(NumA(cont ? ws_.contP99 : ws_.latP99)), M(" ms")}, W));
     rows.push_back(Line({S(" "), M("GPU "), S(NumA(ws_.gpuP50)), M(" / "), S(NumA(st_.gpuBudgetMs)), M(" ms")}, W));
     rows.push_back(Line({S(" "), M("补帧 "), S(FgText(SettingsOf(st_))), M("  超分 "), S(SrText(SettingsOf(st_)))}, W));
     rows.push_back(Line({S(" "), M("迟到 "), S(std::to_string(ws_.late)), M("  保持 "), S(std::to_string(ws_.hold)), M("  "), S(Num(ws_.fps, 1)), M(" fps")}, W));
-    (void)T;
     while ((int)rows.size() < h) rows.push_back(Line({}, W));
     return Rows(std::move(rows), h);
 }
 
 Element Model::Help(int W, int H) const {
-    static const char* const kKeys[][2] = {
-        {"esc / ctrl+c", "退出"}, {"i", "补帧 开/关"}, {"f", "补帧档位 low / medium / high"},
-        {"s", "超分 开/关"}, {"q", "超分档位"}, {"m", "静音"}, {"+ / -", "音量"},
-        {"l", "打印详细统计到日志"}, {"r", "重置统计"}, {"t", "时间码 开/关"}, {"? / h", "关闭帮助"},
+    const Theme& T = Th();
+    struct Group { const char* name; std::vector<std::array<const char*, 2>> keys; };
+    static const Group kGroups[] = {
+        {"开关", {{"i", "补帧"}, {"s", "超分"}, {"m", "静音"}, {"t", "时间码"}}},
+        {"调节", {{"f", "补帧档位 low / medium / high"}, {"q", "超分档位"}, {"+ / -", "音量"}}},
+        {"其他", {{"l", "打印详细统计到日志"}, {"r", "重置统计"}, {"? / h", "关闭本帮助"}, {"esc", "退出"}}},
     };
-    const int w = std::min(W, 48), h = std::min(H, (int)std::size(kKeys) + 4);
+    const int w = std::min(W, 46);
     Elements rows;
-    for (const auto& k : kKeys) rows.push_back(Line({S(PadR(k[0], 14)), M(k[1])}, w - 4));
-    return Panel({B("快捷键")}, Rows(std::move(rows), h - 2), w, h) | ftxui::clear_under;
+    for (const auto& g : kGroups) {
+        if (!rows.empty()) rows.push_back(Line({}, w - 4));
+        for (size_t i = 0; i < g.keys.size(); i++)
+            rows.push_back(Line({M(PadR(i ? "" : g.name, 6)), CB(PadR(g.keys[i][0], 7), T.accent), S(g.keys[i][1])}, w - 4));
+    }
+    const int h = std::min(H, (int)rows.size() + 2);
+    return Panel({B("按键")}, Rows(std::move(rows), h - 2), w, h) | ftxui::clear_under;
 }
 
 Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, bool quitting) const {
@@ -1285,7 +1120,7 @@ Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, 
     int avail = H - 1 - 1;
     if (avail < 0) avail = 0;
     // Height budget, by priority: header, footer (always), latency, settings, history, record, log.
-    if (W < 60 || avail < 9) {
+    if (W < 44 || avail < 9) {
         rows.push_back(Compact(W, avail));
     } else {
         int used = 0;
@@ -1305,7 +1140,8 @@ Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, 
             const int latH = std::min(avail, 2 + (int)lat.size());
             rows.push_back(Panel({B("延迟")}, Rows(std::move(lat), latH - 2), W, latH));
             used += latH;
-            Elements set = SettingsRows(W - 4, true);
+            Elements set = SettingsRows(W - 4, false);
+            if (avail - used < 2 + (int)set.size()) set = SettingsRows(W - 4, true);
             const int setH = 2 + (int)set.size();
             if (avail - used >= setH) {
                 rows.push_back(Panel({B("设置")}, Rows(std::move(set), setH - 2), W, setH));
@@ -1341,33 +1177,6 @@ Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, 
     Element root = ftxui::vbox(std::move(rows));
     if (help) root = ftxui::dbox({root, Help(W, H) | ftxui::center});
     return root | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, W) | ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, H);
-}
-
-// ------------------------------------------------------------------ summary (plain text)
-std::string SummaryText(const std::vector<SegRow>& rows) {
-    if (rows.empty()) return "记录：本次没有持续 3 s 以上的稳定设置。\n";
-    const int best = BestIndex(rows);
-    std::vector<int> widths(cCount);
-    for (int c = 0; c < cCount; c++) {
-        int w = Wid(kCols[c].title);
-        for (const auto& r : rows) w = std::max(w, Wid(CellText(r, c)));
-        widths[c] = w;
-    }
-    auto cell = [&](int c, const std::string& t) { return (kCols[c].right ? PadL(t, widths[c]) : PadR(t, widths[c])) + "  "; };
-    std::string out = Fmt("记录：%d 段（延迟单位 ms，每段去掉开头 %.0f s 后统计）", (int)rows.size(), kSettleSec);
-    if (best >= 0) out += Fmt("；* 最佳 = #%d：延迟 p50 最低且输出帧率达到目标的 99%%", best + 1);
-    out += "\n";
-    std::string hdr = "   #  ";
-    for (int c = 0; c < cCount; c++) hdr += cell(c, kCols[c].title);
-    while (!hdr.empty() && hdr.back() == ' ') hdr.pop_back();
-    out += hdr + "\n";
-    for (int i = 0; i < (int)rows.size(); i++) {
-        std::string line = PadL(std::to_string(i + 1), 4) + (i == best ? "* " : "  ");
-        for (int c = 0; c < cCount; c++) line += cell(c, CellText(rows[i], c));
-        while (!line.empty() && line.back() == ' ') line.pop_back();
-        out += line + "\n";
-    }
-    return out;
 }
 
 std::string PlainText(const ftxui::Screen& s) {
@@ -1705,8 +1514,6 @@ void Dashboard::OnLog(LogLevel lvl, double tSec, const char* msg, size_t len) {
     for (auto& t : lines) s.logs.push_back({lvl, tSec, std::move(t)});
     while (s.logs.size() > kMaxLogLines) s.logs.pop_front();
 }
-
-std::string Dashboard::Summary() const { return SummaryText(p_->sh->model.RowsSnapshot(true)); }
 
 DashboardPerf Dashboard::Perf() const {
     const DashShared& s = *p_->sh;

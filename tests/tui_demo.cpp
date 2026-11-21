@@ -1,11 +1,11 @@
 // tui_demo: the terminal dashboard with simulated telemetry (no GPU, no capture card).
 //
-//   tui_demo --render WxH[,WxH...] [--frames N] [--plain|--ansi] [--history file.csv] [--summary]
+//   tui_demo --render WxH[,WxH...] [--frames N] [--plain|--ansi] [--history file.csv] [--help-overlay]
 //       Feeds a simulated session (warm-up, settings changes, a 30 fps content period, holds, late
 //       frames, log lines) into the model and prints one off-screen render per size.
 //   tui_demo --live [--seconds N] [--hz 60|120] [--history file.csv]
 //       Runs the real full-screen dashboard; a simulated app thread produces frames and status and
-//       reacts to the forwarded keys (i/f/s/q/m/+/-/esc).
+//       reacts to the forwarded keys (i/f/s/q/m/t/+/-/esc).
 //   tui_demo --bench [--seconds N] [--out file.txt] [--no-tui]
 //       Producer-side cost of Telemetry::PushFrame / PublishStatus with the dashboard in record-only
 //       mode and with the TUI running, plus the UI thread's cost per refresh.
@@ -89,6 +89,7 @@ struct SimApp {
         s.sr = "vfx"; s.srQuality = kSrQ[srq];
         s.hdr = "vfx";
         s.interpOn = interpOn; s.srOn = srOn;
+        s.timecode = timecode;
         s.adaptive = true;
         s.multiplier = 2;
         s.targetFps = 0;
@@ -152,8 +153,7 @@ std::vector<std::pair<int, int>> ParseSizes(const char* s) {
 
 void Log(Dashboard& d, LogLevel lvl, double t, const std::string& s) { d.OnLog(lvl, t, s.data(), s.size()); }
 
-int RunRender(const std::vector<std::pair<int, int>>& sizes, long frames, int ansiMode, const std::string& history, bool summary,
-              bool help) {
+int RunRender(const std::vector<std::pair<int, int>>& sizes, long frames, int ansiMode, const std::string& history, bool help) {
     const double dt = 0.1;
     // dry run: simulated duration for `frames` output frames (rates follow the script)
     double dur = 0;
@@ -212,12 +212,7 @@ int RunRender(const std::vector<std::pair<int, int>>& sizes, long frames, int an
         const std::string s = dash.RenderText(w, h, ansi, help);
         fwrite(s.data(), 1, s.size(), stdout);
     }
-    if (summary) {
-        dash.Finish(q0 + (int64_t)(t * (double)f));
-        const std::string s = dash.Summary();
-        printf("---- summary\n");
-        fwrite(s.data(), 1, s.size(), stdout);
-    }
+    dash.Finish(q0 + (int64_t)(t * (double)f));   // writes the last segment to --history
     return 0;
 }
 
@@ -327,7 +322,7 @@ int RunLive(double seconds, double hz, const std::string& history, const std::st
     sim.stop = true;
     sim.th.join();
     GetConsoleMode(hin, &inAfter); GetConsoleMode(hout, &outAfter);
-    std::string s = dash.Summary();
+    std::string s;
     {
         char m[256];
         snprintf(m, sizeof(m), "console: in 0x%lX -> (tui 0x%lX) -> 0x%lX, out 0x%lX -> 0x%lX, cp %u -> %u%s\n",
@@ -486,7 +481,7 @@ int main(int argc, char** argv) {
     long frames = 10000;
     int ansi = -1;
     std::string history, out, keys;
-    bool summary = false, live = false, bench = false, noTui = false, help = false;
+    bool live = false, bench = false, noTui = false, help = false;
     double seconds = -1, hz = 120;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -496,7 +491,6 @@ int main(int argc, char** argv) {
         else if (a == "--plain") ansi = 0;
         else if (a == "--ansi") ansi = 1;
         else if (a == "--history") history = next();
-        else if (a == "--summary") summary = true;
         else if (a == "--help-overlay") help = true;
         else if (a == "--live") live = true;
         else if (a == "--bench") bench = true;
@@ -511,9 +505,9 @@ int main(int argc, char** argv) {
     if (live) return RunLive(seconds > 0 ? seconds : 0, hz, history, keys, out);
     if (!sizes.empty()) {
         if (ansi < 0) { DWORD m; ansi = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &m) ? 1 : 0; }
-        return RunRender(sizes, frames, ansi, history, summary, help);
+        return RunRender(sizes, frames, ansi, history, help);
     }
-    fprintf(stderr, "usage: tui_demo --render 120x36[,80x24] [--frames N] [--plain|--ansi] [--history f.csv] [--summary]\n"
+    fprintf(stderr, "usage: tui_demo --render 120x36[,80x24] [--frames N] [--plain|--ansi] [--history f.csv] [--help-overlay]\n"
                     "       tui_demo --live [--seconds N] [--hz 120] [--history f.csv] [--keys 3:f,5:q,9:esc] [--out report.txt]\n"
                     "       tui_demo --bench [--seconds N] [--out report.txt] [--no-tui]\n");
     return 2;
