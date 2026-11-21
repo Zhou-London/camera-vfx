@@ -9,13 +9,16 @@
 //   graphics queue only waits (GPU-side) at the first Interpolate of this pair if the flow is not ready yet.
 //
 // Interpolate(a, b, t)  (any number of times per pair, ~0.11 ms GPU at 1080p with grid 4):
-//   3. "tflow" CS at flow-grid resolution: for every cell x at time t search for the motion u of the
+//   3. once per pair (first Interpolate): "dealias" CS re-selects each NVOF vector among neighbouring NVOF
+//      proposals by 16x16 px block matching + a small-motion prior. NVOF returns arbitrary period aliases
+//      on periodic/flat content (e.g. (54,-64) for a checkerboard moving (-10,0)), which interpolate wrong.
+//   4. "tflow" CS at flow-grid resolution: for every cell x at time t search for the motion u of the
 //      surface visible there. Candidates come from the flows around x and from fixed-point iterations
 //      u <- F01(x - t u), u <- -F10(x + (1-t) u) (reverse projection). Each candidate is scored in three
 //      visibility modes: visible in both frames (geometric consistency with F01 and F10 + photometric patch
 //      match between a(x - t u) and b(x + (1-t) u)), visible only in a (being covered), visible only in b
 //      (being uncovered or entering at the border). Best (u, mode, confidence) is stored per cell.
-//   4. "compose" CS at full resolution: for each pixel take the 3x3 neighbouring cells' (u, mode), backward-
+//   5. "compose" CS at full resolution: for each pixel take the 3x3 neighbouring cells' (u, mode), backward-
 //      warp a and b with each, weight the candidates by a spatial tent * photometric agreement of the two
 //      warps (snaps motion boundaries to pixel accuracy, avoids block halos), blend the two warps with
 //      (1-t)/t * visibility, and fade towards a plain cross-fade where confidence is low (scene cuts,
@@ -23,8 +26,6 @@
 #include "interpolator.h"
 #include "nvOpticalFlowD3D12.h"
 #include <vector>
-#include <map>
-#include <string>
 #include <cmath>
 
 namespace camss {
@@ -33,9 +34,9 @@ namespace camss {
 static const char* kNvofCS = R"(
 cbuffer CB : register(b0) {
     uint W, H, FW, FH;          // source size, flow grid size
-    float G, invG, t, pad0;     // grid cell size in pixels
-    float invW, invH, lambda, beta;         // small-motion prior, alias-equivalence weight
-    float alpha, pOcc, pEdge; uint ringCount;   // tflow scoring
+    float G, invG, t, prior;    // grid cell size in pixels; dealias small-motion prior (luma/px)
+    float invW, invH, keepMargin, pad2;     // dealias: SAD margin an alternative needs to replace NVOF's vector
+    float alpha, pOcc, pEdge, pad3;         // tflow scoring
     float sGood, sBad, invSig2, pwOcc;      // confidence / compose weighting
 };
 
@@ -50,16 +51,81 @@ void LumaCS(uint3 id : SV_DispatchThreadID) {
     LumaDst[id.xy] = Luma(LumaSrc[id.xy].rgb);
 }
 
+SamplerState LS : register(s0);
+
+// ---------------------------------------------------------------- dealias: verify / re-select NVOF vectors
+// NVOF matches blocks by appearance only, so on periodic or flat content it returns any equivalent
+// vector: on the app's 64 px checkerboard panning (-10,0)/frame most blocks get (54,-64) or (118,0).
+// Every such alias interpolates to a wrong intermediate frame. Per cell we re-select among NVOF proposals
+// (own vector, 3x3 neighbours, sparse rings up to 72 px, zero, the negated opposite field) by block
+// matching on a 16x16 px footprint (4x4 bilinear luma samples) plus a small-motion prior, which only
+// decides between near-equal matches (aliases, flat areas).
+Texture2D<int2> DFlow : register(t0);     // NVOF field of this direction (S10.5), on the source-frame grid
+Texture2D<int2> DOpp : register(t1);      // NVOF field of the opposite direction
+Texture2D<float4> DSrc : register(t2);    // frame the field is defined on
+Texture2D<float4> DDst : register(t3);    // frame it points into
+RWTexture2D<float2> DOut : register(u0);
+
+// Mean abs luma difference of the 16x16 px footprint moved by u. Samples whose destination falls outside
+// the image are skipped (content entering/leaving at the border); with fewer than 4 valid samples the
+// candidate cannot be verified and gets `unverifiable`.
+float DMatch(float2 xc, float2 u, float4 ls[4], float unverifiable) {
+    float2 s = float2(invW, invH);
+    float2 q = xc + u;
+    float acc = 0, n = 0;
+    [unroll] for (int j = 0; j < 4; j++) {
+        [unroll] for (int i = 0; i < 4; i++) {
+            float2 qq = q + float2(i * 4 - 6, j * 4 - 6);
+            if (qq.x >= 0 && qq.y >= 0 && qq.x <= W && qq.y <= H) {
+                acc += abs(Luma(DDst.SampleLevel(LS, qq * s, 0).rgb) - ls[j][i]);
+                n += 1;
+            }
+        }
+    }
+    return n >= 4 ? acc / n : unverifiable;
+}
+
+[numthreads(16, 8, 1)]
+void DealiasCS(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= FW || id.y >= FH) return;
+    float2 xc = (float2(id.xy) + 0.5) * G;
+    float2 s = float2(invW, invH);
+    float4 ls[4];
+    [unroll] for (int j = 0; j < 4; j++)
+        [unroll] for (int i = 0; i < 4; i++)
+            ls[j][i] = Luma(DSrc.SampleLevel(LS, (xc + float2(i * 4 - 6, j * 4 - 6)) * s, 0).rgb);
+    const int2 mx = int2(FW - 1, FH - 1);
+    float2 own = float2(DFlow[id.xy]) * (1.0 / 32.0);
+    float2 bestU = own;
+    float best = DMatch(xc, own, ls, 0.0) + prior * length(own) - keepMargin;   // NVOF's own vector is trusted where unverifiable
+    #define TRY(v) { float2 uu = (v); float c = DMatch(xc, uu, ls, 1e9) + prior * length(uu); if (c < best) { best = c; bestU = uu; } }
+    TRY(float2(0, 0));
+    TRY(-float2(DOpp[id.xy]) * (1.0 / 32.0));
+    [unroll] for (int k = 0; k < 8; k++) {
+        const int2 o8[8] = { int2(-1, -1), int2(0, -1), int2(1, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(0, 1), int2(1, 1) };
+        TRY(float2(DFlow[clamp(int2(id.xy) + o8[k], int2(0, 0), mx)]) * (1.0 / 32.0));
+    }
+    [loop] for (int r = 0; r < 3; r++) {
+        float rad = 3.0 * (float)(1 << r);    // cells
+        [unroll] for (int k = 0; k < 8; k++) {
+            float ang = 0.785398 * k + 0.39 * r;
+            int2 c = clamp(int2(id.xy) + int2(round(rad * float2(cos(ang), sin(ang)))), int2(0, 0), mx);
+            TRY(float2(DFlow[c]) * (1.0 / 32.0));
+        }
+    }
+    #undef TRY
+    DOut[id.xy] = bestU;
+}
+
 // ---------------------------------------------------------------- tflow: motion at time t per grid cell
-Texture2D<int2> F01 : register(t0);      // NVOF forward flow a->b on frame-a grid (S10.5)
-Texture2D<int2> F10 : register(t1);      // NVOF backward flow b->a on frame-b grid (S10.5)
+Texture2D<float2> F01 : register(t0);    // de-aliased forward flow a->b on frame-a grid (px)
+Texture2D<float2> F10 : register(t1);    // de-aliased backward flow b->a on frame-b grid (px)
 Texture2D<float4> ImA : register(t2);
 Texture2D<float4> ImB : register(t3);
-SamplerState LS : register(s0);
 RWTexture2D<float4> TOut : register(u0);  // (u.xy, mode m in [-1,1], confidence)
 
-float2 LoadM0(float2 p) { return float2(F01[clamp(int2(floor(p * invG)), int2(0, 0), int2(FW - 1, FH - 1))]) * (1.0 / 32.0); }
-float2 LoadM1(float2 p) { return float2(F10[clamp(int2(floor(p * invG)), int2(0, 0), int2(FW - 1, FH - 1))]) * (1.0 / 32.0); }
+float2 LoadM0(float2 p) { return F01[clamp(int2(floor(p * invG)), int2(0, 0), int2(FW - 1, FH - 1))]; }
+float2 LoadM1(float2 p) { return F10[clamp(int2(floor(p * invG)), int2(0, 0), int2(FW - 1, FH - 1))]; }
 bool Inside(float2 p) { return p.x >= -0.5 && p.y >= -0.5 && p.x <= W + 0.5 && p.y <= H + 0.5; }
 
 float4 PatchA(float2 p) {
@@ -78,33 +144,23 @@ float4 PatchB(float2 p) {
 }
 
 struct Best { float s; float2 u; float m; };
-float Mad(float4 a, float4 b) { float4 d = abs(a - b); return 0.25 * (d.x + d.y + d.z + d.w); }
 
 void Eval(float2 x, float2 u, inout Best b) {
     float2 p0 = x - t * u, p1 = x + (1.0 - t) * u;
     bool in0 = Inside(p0), in1 = Inside(p1);
-    float2 f0 = LoadM0(p0), f1 = LoadM1(p1);
-    float4 pa = PatchA(p0), pb = PatchB(p1);
-    // Geometric consistency with the NVOF fields, alias-tolerant: on periodic or flat content NVOF often
-    // returns a vector that differs from u by a period of the texture ((54,-64) instead of (-10,0) on a
-    // 64 px checkerboard). Such a vector is photometrically equivalent to u: frame-a point p0 lands on the
-    // same-looking content in b whether it moves by f0 or by u. So the disagreement counts only as much as
-    // the appearance difference it implies.
-    float g0 = min(length(f0 - u), beta * Mad(PatchB(p0 + f0), pb));
-    float g1 = min(length(f1 + u), beta * Mad(PatchA(p1 + f1), pa));
-    // Among equivalent explanations prefer the smallest motion (the one that gives the right
-    // intermediate frame for periodic content; costs ~1 px of score for 40 px motion).
-    float prior = lambda * length(u);
+    float g0 = length(LoadM0(p0) - u);
+    float g1 = length(LoadM1(p1) + u);
     if (in0 && in1) {
-        float s = g0 + g1 + alpha * Mad(pa, pb) + prior;
+        float4 d = abs(PatchA(p0) - PatchB(p1));
+        float s = g0 + g1 + alpha * 0.25 * (d.x + d.y + d.z + d.w);
         if (s < b.s) { b.s = s; b.u = u; b.m = 0; }
     }
     if (in0) {
-        float s = g0 + (in1 ? pOcc : pEdge) + prior;
+        float s = g0 + (in1 ? pOcc : pEdge);
         if (s < b.s) { b.s = s; b.u = u; b.m = -1; }
     }
     if (in1) {
-        float s = g1 + (in0 ? pOcc : pEdge) + prior;
+        float s = g1 + (in0 ? pOcc : pEdge);
         if (s < b.s) { b.s = s; b.u = u; b.m = 1; }
     }
 }
@@ -129,17 +185,6 @@ void TFlowCS(uint3 id : SV_DispatchThreadID) {
     [unroll] for (int k = 0; k < 5; k++) {
         EvalChain(x, LoadM0(x + offs[k]), b);
         EvalChain(x, -LoadM1(x + offs[k]), b);
-    }
-    // Sparse wide ring: on periodic content the NVOF field is a patchwork of aliases; the true motion
-    // usually exists somewhere within a few tens of pixels.
-    [loop] for (int r = 0; r < ringCount; r++) {
-        float rad = G * 6.0 * (float)(1 << r);
-        [unroll] for (int k = 0; k < 8; k++) {
-            float ang = 0.785398 * k + 0.4 * r;
-            float2 o = rad * float2(cos(ang), sin(ang));
-            Eval(x, LoadM0(x + o), b);
-            Eval(x, -LoadM1(x + o), b);
-        }
     }
     float conf = saturate((sBad - b.s) / (sBad - sGood));
     TOut[id.xy] = float4(b.u, b.m, conf);
@@ -232,9 +277,9 @@ NvofApi& Api() { static NvofApi a; return a; }
 
 struct CBData {
     UINT W, H, FW, FH;
-    float G, invG, t, pad0;
-    float invW, invH, lambda, beta;
-    float alpha, pOcc, pEdge; UINT ringCount;
+    float G, invG, t, prior;
+    float invW, invH, keepMargin, pad2;
+    float alpha, pOcc, pEdge, pad3;
     float sGood, sBad, invSig2, pwOcc;
 };
 
@@ -295,6 +340,8 @@ public:
             for (auto& l : luma_)
                 if (!CreateShared(w, h, DXGI_FORMAT_R8_UNORM, true, l.tex)) return false;
             for (auto& p : pairs_) {
+                p.cleanF = dev.CreateTex(fw_, fh_, DXGI_FORMAT_R32G32_FLOAT, true, false);
+                p.cleanB = dev.CreateTex(fw_, fh_, DXGI_FORMAT_R32G32_FLOAT, true, false);
                 if (!CreateShared(fw_, fh_, DXGI_FORMAT_R16G16_SINT, false, p.flowF) ||
                     !CreateShared(fw_, fh_, DXGI_FORMAT_R16G16_SINT, false, p.flowB)) return false;
                 if (kUseCost && (!CreateShared(fw_, fh_, DXGI_FORMAT_R8_UINT, false, p.costF) ||
@@ -304,6 +351,7 @@ public:
             tflow_ = dev.CreateTex(fw_, fh_, DXGI_FORMAT_R32G32B32A32_FLOAT, true, false);
             csLuma_ = dev.CompileCS(kNvofCS, "LumaCS", "nvof_luma");
             csTFlow_ = dev.CompileCS(kNvofCS, "TFlowCS", "nvof_tflow");
+            csDealias_ = dev.CompileCS(kNvofCS, "DealiasCS", "nvof_dealias");
             const D3D_SHADER_MACRO nb3[] = {{"NB3", "1"}, {nullptr, nullptr}};   // 3x3: +0.4-0.7 dB at boundaries, +0.015 ms
             csCompose_ = dev.CompileCS(kNvofCS, "ComposeCS", "nvof_compose", nb3);
             cb_ = dev.CreateConstantBuffer(sizeof(CBData));
@@ -333,7 +381,23 @@ public:
             ctx->ClearUnorderedAccessViewFloat(tflow_.uav.Get(), zero);
         } else {
             WaitFlow(p->done);
-            ID3D11ShaderResourceView* srvs[4] = {p->flowF.t11.srv.Get(), p->flowB.t11.srv.Get(), a.rgb.srv.Get(), b.rgb.srv.Get()};
+            if (!p->cleaned) {
+                // t-independent, once per pair (first Interpolate: the OFA result is needed here anyway).
+                ctx->CSSetShader(csDealias_.Get(), nullptr, 0);
+                ctx->CSSetConstantBuffers(0, 1, cb_.GetAddressOf());
+                ctx->CSSetSamplers(0, 1, &ls);
+                ID3D11ShaderResourceView* d0[4] = {p->flowF.t11.srv.Get(), p->flowB.t11.srv.Get(), a.rgb.srv.Get(), b.rgb.srv.Get()};
+                ctx->CSSetShaderResources(0, 4, d0);
+                ctx->CSSetUnorderedAccessViews(0, 1, p->cleanF.uav.GetAddressOf(), nullptr);
+                ctx->Dispatch((fw_ + 15) / 16, (fh_ + 7) / 8, 1);
+                ID3D11ShaderResourceView* d1[4] = {p->flowB.t11.srv.Get(), p->flowF.t11.srv.Get(), b.rgb.srv.Get(), a.rgb.srv.Get()};
+                ctx->CSSetShaderResources(0, 4, d1);
+                ctx->CSSetUnorderedAccessViews(0, 1, p->cleanB.uav.GetAddressOf(), nullptr);
+                ctx->Dispatch((fw_ + 15) / 16, (fh_ + 7) / 8, 1);
+                dev_->ClearCS();
+                p->cleaned = true;
+            }
+            ID3D11ShaderResourceView* srvs[4] = {p->cleanF.srv.Get(), p->cleanB.srv.Get(), a.rgb.srv.Get(), b.rgb.srv.Get()};
             ctx->CSSetShader(csTFlow_.Get(), nullptr, 0);
             ctx->CSSetShaderResources(0, 4, srvs);
             ctx->CSSetUnorderedAccessViews(0, 1, tflow_.uav.GetAddressOf(), nullptr);
@@ -341,7 +405,6 @@ public:
             ctx->CSSetSamplers(0, 1, &ls);
             ctx->Dispatch((fw_ + 15) / 16, (fh_ + 7) / 8, 1);
             dev_->ClearCS();
-            if (getenv("NVOF_HIST") && t == 0.5f) DebugHist(p);
         }
         ID3D11ShaderResourceView* srvs[3] = {tflow_.srv.Get(), a.rgb.srv.Get(), b.rgb.srv.Get()};
         ctx->CSSetShader(csCompose_.Get(), nullptr, 0);
@@ -374,6 +437,8 @@ private:
     };
     struct Pair {
         Shared flowF, flowB, costF, costB;
+        Device::Tex cleanF, cleanB;   // de-aliased fields (float px), computed at the first Interpolate
+        bool cleaned = false;
         FrameKey ka, kb;
         bool valid = false;
         uint64_t lastUse = 0;
@@ -460,37 +525,6 @@ private:
         }
     }
 
-    // DEBUG: histograms of raw NVOF F01.x and chosen u.x over the left 75 % (checker region).
-    void DebugHist(Pair* p) {
-        auto* ctx = dev_->ctx();
-        auto rb = [&](ID3D11Texture2D* src, std::vector<uint8_t>& buf, UINT bpp) {
-            D3D11_TEXTURE2D_DESC d{}; src->GetDesc(&d);
-            d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-            ComPtr<ID3D11Texture2D> st; dev_->dev()->CreateTexture2D(&d, nullptr, &st);
-            ctx->CopyResource(st.Get(), src);
-            D3D11_MAPPED_SUBRESOURCE m{}; ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m);
-            buf.resize((size_t)d.Width * d.Height * bpp);
-            for (UINT y = 0; y < d.Height; y++) memcpy(&buf[(size_t)y * d.Width * bpp], (uint8_t*)m.pData + (size_t)y * m.RowPitch, d.Width * bpp);
-            ctx->Unmap(st.Get(), 0);
-        };
-        std::vector<uint8_t> f, b, tf;
-        rb(p->flowF.t11.tex.Get(), f, 4); rb(p->flowB.t11.tex.Get(), b, 4); rb(tflow_.tex.Get(), tf, 16);
-        std::map<int, int> hf, hb, ht, hy;
-        for (UINT y = 0; y < fh_; y++) for (UINT x = 0; x < fw_ * 3 / 4; x++) {
-            size_t i = (size_t)y * fw_ + x;
-            int16_t fx = *(int16_t*)&f[i * 4], bx = *(int16_t*)&b[i * 4], fy = *(int16_t*)&f[i * 4 + 2];
-            float ux = *(float*)&tf[i * 16];
-            hf[(int)std::lround(fx / 32.0)]++; hb[(int)std::lround(bx / 32.0)]++; ht[(int)std::lround(ux)]++; hy[(int)std::lround(fy / 32.0)]++;
-        }
-        auto pr = [](const char* n, std::map<int, int>& h) {
-            std::vector<std::pair<int, int>> v(h.begin(), h.end());
-            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
-            std::string s; for (size_t i = 0; i < v.size() && i < 10; i++) s += " " + std::to_string(v[i].first) + ":" + std::to_string(v[i].second);
-            LOGI("hist %s%s", n, s.c_str());
-        };
-        pr("F01.x", hf); pr("F01.y", hy); pr("F10.x", hb); pr("u.x", ht);
-    }
-
     void SetCB(float t) {
         CBData cb{};
         cb.W = w_; cb.H = h_; cb.FW = fw_; cb.FH = fh_;
@@ -499,9 +533,10 @@ private:
         // Tuned on the synthetic scenes in tests/nvof_test.cpp (flat optimum, +-0.3 dB around these).
         cb.alpha = 15.0f;      // px of geometric error per unit mean-abs luma difference
         cb.pOcc = 5.0f;        // penalty (px) for a one-sided (occlusion) explanation
-        cb.pEdge = 0.5f;
-        cb.lambda = 0.03f; cb.beta = 30.0f; cb.ringCount = 3;
-        if (getenv("NVOF_A")) { float r = 3; sscanf(getenv("NVOF_A"), "%f,%f,%f", &cb.lambda, &cb.beta, &r); cb.ringCount = (UINT)r; }       // penalty when the other side falls outside the image
+        cb.pEdge = 0.5f;       // penalty when the other side falls outside the image
+        // De-aliasing (tuned on the app's --selftest pattern and the nvof_test scenes):
+        cb.prior = 0.0005f;    // small-motion prior, luma SAD per px: 0.04 per 80 px, decides only near-ties
+        cb.keepMargin = 0.004f;   // NVOF's own vector is kept unless an alternative matches ~1 level better
         cb.sGood = 4.0f; cb.sBad = 16.0f;   // score -> confidence ramp
         cb.invSig2 = 1.0f / 0.01f;          // photometric weight in compose (mean sq RGB diff)
         cb.pwOcc = 0.05f;                   // weight of one-sided candidates in compose
@@ -573,7 +608,7 @@ private:
         haveLast_ = true; lastB_ = kb;
         la->readDone = lb->readDone = outVal_;
         p->done = outVal_;
-        p->ka = ka; p->kb = kb; p->valid = true; p->lastUse = ++useClock_;
+        p->ka = ka; p->kb = kb; p->valid = true; p->cleaned = false; p->lastUse = ++useClock_;
         return p;
     }
 
@@ -591,7 +626,7 @@ private:
     Luma luma_[4];
     Pair pairs_[3];
     Device::Tex tflow_;
-    ComPtr<ID3D11ComputeShader> csLuma_, csTFlow_, csCompose_;
+    ComPtr<ID3D11ComputeShader> csLuma_, csTFlow_, csCompose_, csDealias_;
     ComPtr<ID3D11Buffer> cb_;
     uint64_t useClock_ = 0;
     bool haveLast_ = false;

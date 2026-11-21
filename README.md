@@ -111,6 +111,40 @@ tools         设备枚举、基准脚本、截图、探针
 
 * **测试期间没有真实运动画面**：PS5 一直待机，采集卡输出的是它自己的"无信号"画面。时序数据是真实的；画质只在合成测试图上验证过，实际游戏画面还需要人看一遍（建议依次试 `--vfg-mode 0/1/2`）。
 * **Windows HDR 是关着的**：开了 `--hdr` 也只能看到色调映射后的预览。打开系统 HDR 后需要再确认一次亮度观感，可以调 TrueHDR 的峰值亮度（默认 650 nit）和 `--white`。
+* **NVOF 自研插帧**：作为备选。selftest 上 27–28 dB，高于 blend 的 25.7 dB、低于 Maxine VFG 的 29–34 dB；在它自己的平移、缩放、遮挡测试上是 44–52 dB。NVIDIA 的 D3D11 光流 API 不保证输出与后续 D3D11 工作的先后顺序，所以这条路径改用 D3D12 光流加共享 fence。
+* **HDMI 回环**：用 `--timecode` 在输出顶部画时间码条，把显卡 HDMI 输出接回采集卡，再加 `--decode-timecode` 运行，即可自动得到显示到采集到达的延迟（`loop.scanout_to_arrival_ms`）。
+* **光电二极管 / 手机慢动作**：用 `--marker` 在左下角画一个闪烁方块，作为绝对校准。
+
+## 测试
+
+```powershell
+build\pacing_test.exe
+```
+```powershell
+build\camss.exe --selftest
+```
+
+* `pacing_test`：对出帧节奏做离线仿真。覆盖 120/144/164 Hz 固定刷新（±ppm 漂移）和 VRR k=2/3，源带抖动和尖峰。检查延迟是否收敛到理论值、内容时间不倒退、速度变化 < 3%、VRR 时间步落在网格上。
+* `--selftest`：用解析的地面真值测各插帧器的 PSNR，测 VSR / TrueHDR 的耗时，检查 RGB10A2 通道顺序，并对时间码做编码和解码回环。
+
+## 目录
+
+```
+src/capture   Media Foundation 采集（异步回调、一次拷贝上传、时间码解码）
+src/gfx       D3D11 设备 / 颜色转换 / 最终合成（缩放、SDR↔PQ、时间码条）/ 合成测试源
+src/pacing    源时钟与显示时钟拟合、延迟伺服与时间步决策（核心）
+src/interp    插帧接口；blend 基线；NVOF 光流插帧（自研 warp）
+src/vfx       Maxine VFX 1.3 链：VideoFrameGeneration / TrueHDR / VideoSuperRes（CUDA 常驻）
+src/scale     驱动 RTX VSR / RTX Video HDR（D3D11 video processor 扩展）
+src/present   flip-model 交换链
+tests         节奏仿真测试；NVOF 插帧测试
+tools         设备枚举、基准脚本、截图、探针
+```
+
+## 已知问题与限制
+
+* **测试期间没有真实运动画面**：PS5 一直待机，采集卡输出的是它自己的"无信号"画面。时序数据是真实的；画质只在合成测试图上验证过，实际游戏画面还需要人看一遍（建议依次试 `--vfg-mode 0/1/2`）。
+* **Windows HDR 是关着的**：开了 `--hdr` 也只能看到色调映射后的预览。打开系统 HDR 后需要再确认一次亮度观感，可以调 TrueHDR 的峰值亮度（默认 650 nit）和 `--white`。
 * **NVOF 自研插帧**：在自己的测试集上比 blend 高 12–30 dB，但在 `--selftest` 的合成图上低于 blend（这张图有周期纹理，光流在周期上有歧义），仍在排查。NVIDIA 的 D3D11 光流 API 不保证输出和后续 D3D11 工作的先后顺序，所以这条路径改用 D3D12 光流加共享 fence。
 * **HDMI 回环**：时间码编码和解码已在软件里验证，没有接线实测。
 * **再分发**：VFX 1.3 运行时 DLL 的再分发条款尚未审查（见"构建"一节）。

@@ -769,7 +769,7 @@ int main(int argc, char** argv) {
             const Case& cs = kCases[4];
             for (size_t ii = 0; ii < ips.size(); ii++) {
                 Interpolator* ip = ips[ii].ip.get();
-                std::vector<double> prepCpu, prepLat, prepTs, indepTs, interpCpu, interpTs, interpLat, e2e, e2eP, e2eI, e2eW;
+                std::vector<double> prepCpu, prepLat, prepTs, indepTs, interpCpu, interpTs, interpLat, e2e, e2eP, e2eI, e2eW, interpFirstTs;
                 for (int n = 0; n < 61; n++) {
                     SourceFrame& B = fr[n % 3];
                     Render(c, B.rgb, cs.at(n));
@@ -794,9 +794,16 @@ int main(int argc, char** argv) {
                     // Prepare-only latency (separately, without the independent work)
                     // is measured on the second half of the run below via e2e.
                     (void)t2;
-                    // Interpolate x3 (flow already computed): GPU timestamps. The first Interpolate of a pair
-                    // contains the GPU-side fence wait for the OFA engine, so do one unmeasured call first.
+                    // First Interpolate of a pair (includes the once-per-pair de-alias pass). Sleep first so the
+                    // OFA engine is done and the GPU-side fence wait does not show up in the timestamps.
+                    Sleep(15);
+                    WaitIdle(c);
+                    ctx->Begin(tr.dj.Get()); ctx->End(tr.ts[0].Get());
                     ip->Interpolate(A, B, 0.1f, out);
+                    ctx->End(tr.ts[1].Get()); ctx->End(tr.dj.Get());
+                    WaitIdle(c);
+                    if (tr.Get(ctx, ms, 2)) interpFirstTs.push_back(ms[0]);
+                    // Further Interpolates of the same pair (other t): GPU timestamps.
                     for (int k = 0; k < 3; k++) {
                         WaitIdle(c);
                         int64_t a0 = Qpc::Now();
@@ -844,6 +851,7 @@ int main(int argc, char** argv) {
                        "Interpolate: GPU-ts %.3f/%.3f ms, CPU %.3f ms, submit->done %.3f ms | Prepare+Interpolate submit->done %.3f/%.3f ms\n",
                        ips[ii].name.c_str(), Median(prepCpu), Median(prepTs), Median(prepLat), Pct(prepLat, 0.95), Median(indepTs),
                        Median(interpTs), Pct(interpTs, 0.95), Median(interpCpu), Median(interpLat), Median(e2e), Pct(e2e, 0.95));
+                printf("         first Interpolate of a pair (incl. de-alias pass) GPU-ts %.3f/%.3f ms\n", Median(interpFirstTs), Pct(interpFirstTs, 0.95));
                 printf("         e2e breakdown: Prepare call %.3f, Interpolate call (incl. CPU fence wait) %.3f, GPU drain %.3f ms\n",
                        Median(e2eP), Median(e2eI), Median(e2eW));
             }
