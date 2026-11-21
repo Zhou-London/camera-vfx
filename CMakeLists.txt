@@ -22,6 +22,7 @@ set(CAMSS_SOURCES
   src/capture/mf_capture.cpp
   src/capture/frame_diff.cpp
   src/audio/audio_monitor.cpp
+  src/ui/dashboard.cpp
   src/present/presenter.cpp
   src/pacing/clocks.cpp
   src/pacing/pacer.cpp
@@ -34,10 +35,19 @@ set(CAMSS_SOURCES
   third_party/nvvfx/src/nvCVImageProxy.cpp
 )
 
+# FTXUI (MIT, vendored v6.1.9) for the terminal dashboard.
+set(FTXUI_QUIET ON CACHE BOOL "" FORCE)
+set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/ftxui EXCLUDE_FROM_ALL)
+
 add_executable(camss ${CAMSS_SOURCES})
 target_include_directories(camss PRIVATE src third_party/nvvfx/include third_party/nvof)
 file(TO_CMAKE_PATH "${CAMSS_VFX_RUNTIME_DIR}" _vfxdir)
 target_compile_definitions(camss PRIVATE CAMSS_VFX_RUNTIME_DIR=L"${_vfxdir}")
+target_link_libraries(camss PRIVATE ftxui::component ftxui::dom ftxui::screen)
 target_link_libraries(camss PRIVATE d3d11 dxgi d3dcompiler mfplat mf mfreadwrite mfuuid ole32 shlwapi winmm dwmapi user32 avrt cfgmgr32)
 
 # Small helper tools.
@@ -50,6 +60,11 @@ target_include_directories(pacing_test PRIVATE src)
 # Pacing regression from a real PS5 start-up (cadence retime after an irregular transition).
 add_executable(startup_test tests/startup_test.cpp src/pacing/clocks.cpp src/pacing/pacer.cpp src/pacing/cadence.cpp src/util/common.cpp)
 target_include_directories(startup_test PRIVATE src)
+
+# Dashboard demo / render test with simulated telemetry (no GPU, no capture).
+add_executable(tui_demo tests/tui_demo.cpp src/ui/dashboard.cpp src/util/common.cpp)
+target_include_directories(tui_demo PRIVATE src)
+target_link_libraries(tui_demo PRIVATE ftxui::component ftxui::dom ftxui::screen)
 
 # Repeat-frame detector test + benchmark (CPU only).
 add_executable(repeat_test tests/repeat_test.cpp src/capture/frame_diff.cpp src/util/common.cpp)
