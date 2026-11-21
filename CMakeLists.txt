@@ -54,7 +54,11 @@ target_include_directories(repeat_test PRIVATE src)
 # HDMI audio monitor test against the real devices.
 add_executable(audio_test tests/audio_test.cpp src/audio/audio_monitor.cpp src/util/common.cpp)
 target_include_directories(audio_test PRIVATE src)
-target_link_libraries(audio_test PRIVATE ole32 avrt cfgmgr32 user32)
+target_link_libraries(audio_test PRIVATE ole32 avrt cfgmgr32 user32 mfplat mf mfuuid)
+
+# Async logger / stats test + benchmark.
+add_executable(log_test tests/log_test.cpp src/util/common.cpp)
+target_include_directories(log_test PRIVATE src)
 
 # Optional extra targets (e.g. NVOF interpolator test)
 include(tests/nvof_test.cmake OPTIONAL)
