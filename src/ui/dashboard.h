@@ -21,6 +21,16 @@ struct DashboardOptions {
     double refreshHz = 10;        // UI refresh rate
 };
 
+// Cost of the UI thread (for benchmarks / diagnostics).
+struct DashboardPerf {
+    uint64_t refreshes = 0;       // model updates (drain ring + statistics)
+    uint64_t frames = 0;          // frame samples consumed
+    uint64_t draws = 0;           // TUI frames built
+    double updateMsAvg = 0, updateMsMax = 0;   // model update wall time
+    double buildMsAvg = 0, buildMsMax = 0;     // element tree build wall time (TUI)
+    uint64_t uiCycles = 0;        // QueryThreadCycleTime of the UI thread so far
+};
+
 struct DashboardImpl;
 
 class Dashboard {
@@ -30,10 +40,24 @@ public:
     bool Start(Telemetry* tel, const DashboardOptions& o);
     void Stop();                              // restores the terminal, flushes the history file, joins
     bool Running() const;
+    // True while the full-screen TUI owns the console (false in record-only mode, or when the
+    // console is not interactive and Start() fell back to record-only). While true, nothing else
+    // should write to the console.
+    bool TuiActive() const;
     // Log sink: called by the logger's writer thread for every message (any thread; never blocks long).
     void OnLog(LogLevel lvl, double tSec, const char* msg, size_t len);
     // Plain-text table of the recorded segments (for the console after Stop()).
     std::string Summary() const;
+    DashboardPerf Perf() const;
+
+    // ---- offline use (tests, tui_demo --render); do not mix with Start()
+    // Updates the model once from `tel` on the calling thread; nowQpc = "now" (simulated clocks).
+    void Pump(Telemetry* tel, const DashboardOptions& o, int64_t nowQpc);
+    // Ends the current segment at nowQpc (as Stop() does): written to the history if long enough.
+    void Finish(int64_t nowQpc);
+    // Renders the dashboard off-screen; ansi = with colour escape codes, else plain text;
+    // help = with the key-help overlay.
+    std::string RenderText(int width, int height, bool ansi, bool help = false) const;
 private:
     std::unique_ptr<DashboardImpl> p_;
 };

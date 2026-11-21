@@ -13,6 +13,7 @@ namespace camss {
 App::App(const Options& o) : o_(o) { leadMs_ = o.leadMs; }
 
 App::~App() {
+    StopDashboard();
     audio_.Stop();
     vsync_.Stop();
     if (cap_) { cap_->Stop(); delete cap_; cap_ = nullptr; }
@@ -261,6 +262,7 @@ void App::OnContentRateChanged() {
     pacer_.SetContentPeriod(pc);
     pacer_.SetMultiplier(k);
     curK_ = k;
+    BumpGeneration();
     if (o_.mode == PaceMode::Fixed)
         LOGI("content rate %.2f fps (1 new frame per %.2f source frames) -> interpolated to the %.0f Hz refresh", contentFps, pc, pres_.refreshHz());
     else
@@ -456,6 +458,8 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     r.newestArrival = newest->arrivalQpc; r.newestSample = newest->sampleQpc; r.newestUploaded = newest->uploadedQpc;
     r.contentSample = doInterp ? (int64_t)((double)A->sampleQpc + (double)(B->sampleQpc - A->sampleQpc) * d.t) : A->sampleQpc;
     r.renderCpuMs = Qpc::ToMs(submitDone - renderStart);   // excludes the deliberate present hold
+    r.gpuMs = vfx_ ? (float)lastVfxGpuMs_ : 0.f;
+    r.interp = doInterp;
     records_.push_back(r);
 
     stats_.Add("render.cpu_ms", r.renderCpuMs);
@@ -483,6 +487,23 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
 void App::FinalizeRecord(OutRecord& r) {
     r.finalized = true;
     finalizedCount_++;
+    {
+        // Dashboard / record: one sample per output frame (lock-free, never blocks).
+        FrameSample fs;
+        fs.qpc = r.presentCall;
+        const bool flip = o_.mode == PaceMode::Vrr || vrrActive_ || (o_.mode == PaceMode::Passthrough && o_.passSync == 0);
+        const int64_t shown = flip ? r.presentCall : r.actualV;
+        if (shown) {
+            fs.latencyMs = (float)Qpc::ToMs(shown - r.newestArrival);
+            const double cs = Qpc::ToMs(shown - r.contentSample);
+            if (cs > 0 && cs < 500) fs.contentMs = (float)cs;
+        }
+        fs.delayMs = (float)r.delayMs;
+        fs.gpuMs = r.gpuMs;
+        fs.t = r.t;
+        fs.flags = (uint8_t)((r.late ? FrameSample::kLate : 0) | (r.hold ? FrameSample::kHold : 0) | (r.interp ? FrameSample::kInterp : 0));
+        tel_.PushFrame(fs);
+    }
     // A held picture (static content, stalled source) is old by design: not a pipeline latency.
     if (!r.hold && (o_.mode == PaceMode::Vrr || vrrActive_ || (o_.mode == PaceMode::Passthrough && o_.passSync == 0))) {
         // VRR / immediate: the flip (scan-out start) happens at Present() once the GPU is done;
@@ -599,8 +620,12 @@ void App::Report(bool final) {
         stats_.Clear();
         LOGI("warm-up (%.0f s) done: statistics reset", o_.warmupSec);
     }
-    const double interval = o_.reportSec > 0 ? o_.reportSec : 2.0;
+    if (now - lastStatusPub_ >= Qpc::FromMs(100)) PublishStatus(now);
+    // The status text is refreshed every second (pinned status line / dashboard); it is logged as a
+    // line every `report` seconds only on a non-interactive console (redirected output, log file).
+    const double interval = statusLine_ || tui_ ? 1.0 : (o_.reportSec > 0 ? o_.reportSec : 2.0);
     if (!final && now - lastReport_ < Qpc::FromMs(interval * 1000.0)) return;
+    const bool logLine = final || (!statusLine_ && !tui_ && o_.reportSec > 0);
     const double dt = Qpc::ToSec(now - lastReport_);
     double outFps = dt > 0.25 ? (double)(outCount_ - lastReportOut_) / dt : lastOutFps_;   // final report may follow a periodic one
     lastOutFps_ = outFps;
@@ -616,6 +641,17 @@ void App::Report(bool final) {
     if (!haveContent) haveContent = stats_.Get("lat.content_to_flip_ms", c50, c99);
     // Audio follows the video path (capture timestamp -> display).
     if (audio_.Running() && haveContent) audio_.SetVideoLatencyMs(c50);
+    // Stage breakdown for the dashboard (p50 over the recent window).
+    {
+        double a, b;
+        stCapture_ = stats_.Get("cap.sample_to_arrival_ms", a, b) ? a : -1;
+        stUpload_ = stats_.Get("cap.upload_ms", a, b) ? a : -1;
+        stFg_ = stats_.Get("vfx.fg", a, b) ? a : -1;
+        stSr_ = stats_.Get("vfx.sr", a, b) ? a : -1;
+        stHdr_ = stats_.Get("vfx.hdr", a, b) ? a : -1;
+        stGpu_ = stats_.Get("vfx.gpu_total", a, b) ? a : 0;
+        if (audio_.Running()) audioStats_ = audio_.Stats();
+    }
 
     const double sigHz = pacer_.SourceHz();
     const double contentFps = sigHz > 0 ? sigHz / pacer_.ContentPeriod() : 0;
@@ -637,15 +673,20 @@ void App::Report(bool final) {
         // The processing must fit into one output interval, or frames are skipped.
         const double budget = o_.mode == PaceMode::Vrr && contentFps > 0 ? 1000.0 / (contentFps * curK_)
                             : o_.mode == PaceMode::Fixed ? 1000.0 / std::max(1.0, pres_.refreshHz()) : 0;
-        if (budget > 0 && g50 > 0.9 * budget)
+        if (budget > 0 && g50 > 0.9 * budget) {
             LOG_EVERY_MS(LogLevel::Warn, 10000, "GPU time %.1f ms per output frame exceeds the %.1f ms frame budget: frames are skipped; "
                          "lower fg-quality / sr-quality (keys F / Q) or the multiplier", g50, budget);
+            char nb[160];
+            snprintf(nb, sizeof(nb), "GPU %.1f ms > budget %.1f ms: frames skipped (F / Q lower the quality)", g50, budget);
+            notice_ = nb;
+            noticeUntil_ = now + Qpc::FromMs(3000);
+        }
     }
     n = Append(line, sizeof(line), n, " | late %llu hold %llu drop %llu", (unsigned long long)pacer_.LateCount(),
                   (unsigned long long)pacer_.StallCount(), (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0));
     if (o_.mode == PaceMode::Fixed) n = Append(line, sizeof(line), n, " miss %llu", (unsigned long long)missed_);
     if (audio_.Running()) {
-        AudioStats as = audio_.Stats();
+        const AudioStats& as = audioStats_;
         if (!as.running) n = Append(line, sizeof(line), n, " | audio: reopening device");
         else if (!as.playing) n = Append(line, sizeof(line), n, " | audio: buffering");
         else n = Append(line, sizeof(line), n, " | audio %.0f ms%s buf %.0f ms", as.latencyMs, audio_.Muted() ? " (muted)" : "", as.bufferMs);
@@ -657,8 +698,9 @@ void App::Report(bool final) {
         if (stats_.Get("loop.scanout_to_arrival_ms", l50, l99)) n = Append(line, sizeof(line), n, " | loop %.1f/%.1f ms", l50, l99);
         else n = Append(line, sizeof(line), n, " | loop: no timecode");
     }
-    if (final || o_.reportDetail) PrintDetail();
-    if (o_.reportSec > 0 || final) LOGI("%s", line);
+    if (final || (o_.reportDetail && !tui_)) PrintDetail();
+    if (statusLine_ && !final) SetStatusLine(line);
+    if (logLine && !tui_) LOGI("%s", line);
 
     char title[256];
     char kk[16] = "";
@@ -670,19 +712,21 @@ void App::Report(bool final) {
 
 void App::HandleKeys() {
     int k = pres_.PopKey();
+    if (!k) k = tel_.PopKey();   // keys typed into the dashboard
     switch (k) {
-    case 'I': interpOn_ = !interpOn_; LOGI("frame generation %s", interpOn_ ? "on" : "off"); break;
-    case 'S': srOn_ = !srOn_; LOGI("super resolution %s", srOn_ ? "on" : "off"); break;
+    case VK_ESCAPE: g_quitRequested = true; break;
+    case 'I': interpOn_ = !interpOn_; BumpGeneration(); LOGI("frame generation %s", interpOn_ ? "on" : "off"); break;
+    case 'S': srOn_ = !srOn_; BumpGeneration(); LOGI("super resolution %s", srOn_ ? "on" : "off"); break;
     case 'F':
         if (o_.interp != "vfx") { LOGI("F: frame generation quality applies to --interp vfx"); break; }
-        { const int of = o_.vfgMode; o_.vfgMode = (o_.vfgMode + 1) % 3; RebuildVfx(of, o_.srQuality); }
+        { const int of = o_.vfgMode; o_.vfgMode = (o_.vfgMode + 1) % 3; RebuildVfx(of, o_.srQuality); BumpGeneration(); }
         break;
     case 'Q':
         if (o_.sr != "vfx") { LOGI("Q: super resolution quality applies to --sr vfx"); break; }
         {
             const int nq = NextSrQuality(o_.srQuality);
             if (nq == o_.srQuality) { LOGI("Q: no other level in the %s family", SrQualityName(nq)); break; }
-            const int os = o_.srQuality; o_.srQuality = nq; RebuildVfx(o_.vfgMode, os);
+            const int os = o_.srQuality; o_.srQuality = nq; RebuildVfx(o_.vfgMode, os); BumpGeneration();
         }
         break;
     case 'M':
@@ -786,6 +830,7 @@ void App::RunPassthrough(double untilSec, int sync) {
 
 int App::Run() {
     startQpc_ = lastReport_ = Qpc::Now();
+    StartDashboard();
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (cap_) cap_->Start();
@@ -797,6 +842,7 @@ int App::Run() {
         RunPassthrough(2.5, 1);
         o_.mode = (vrrActive_ && pres_.tearingEnabled()) ? PaceMode::Vrr : PaceMode::Fixed;
         pacer_.SetMode(o_.mode);
+        BumpGeneration();
         LOGI("auto mode: refreshes/present %.2f -> %s pacing", vrrRatio_, PaceModeName(o_.mode));
         stats_.Clear();
         records_.clear();
@@ -810,14 +856,116 @@ int App::Run() {
     case PaceMode::Passthrough: RunPassthrough(); break;
     }
     while (!records_.empty()) { if (!records_.front().finalized) FinalizeRecord(records_.front()); records_.pop_front(); }
+    PublishStatus(Qpc::Now());
+    StopDashboard();   // gives the console back before the final report
     Report(true);
+    const std::string rec = dash_.Summary();
+    if (!rec.empty()) LOGI("settings record (this session%s%s):\n%s", o_.historyPath.empty() ? "" : ", appended to ",
+                           o_.historyPath.c_str(), rec.c_str());
     timeEndPeriod(1);
     return 0;
+}
+
+void App::StartDashboard() {
+    const bool tty = LogConsoleIsTty();
+    const bool wantTui = o_.ui == "tui" || (o_.ui == "auto" && tty);
+    DashboardOptions d;
+    d.tui = wantTui;
+    d.historyPath = o_.historyPath;
+    if (wantTui) {
+        // Route the log to the dashboard before it takes the screen: nothing may write to the console after this.
+        LogFlush();
+        SetLogSink([](void* ctx, LogLevel lvl, double t, const char* msg, size_t len) {
+            static_cast<Dashboard*>(ctx)->OnLog(lvl, t, msg, len);
+        }, &dash_);
+        SetLogConsole(false);
+        g_tuiActive = true;
+    }
+    const bool started = dash_.Start(&tel_, d);
+    tui_ = started && dash_.TuiActive();
+    if (wantTui && !tui_) {
+        SetLogConsole(true);
+        SetLogSink(nullptr, nullptr);
+        g_tuiActive = false;
+        LOGW("terminal dashboard unavailable (ui = %s); plain console output", o_.ui.c_str());
+    }
+    statusLine_ = !tui_ && tty && o_.reportSec > 0;
+}
+
+void App::StopDashboard() {
+    if (statusLine_) { SetStatusLine(""); statusLine_ = false; }
+    dash_.Stop();   // TUI: gives the screen back; record-only: flushes the history file (idempotent)
+    if (tui_) {
+        SetLogConsole(true);
+        SetLogSink(nullptr, nullptr);
+        g_tuiActive = false;
+        tui_ = false;
+    }
+}
+
+void App::PublishStatus(int64_t now) {
+    lastStatusPub_ = now;
+    AppStatus& s = statusPub_;
+    s.generation = generation_;
+    s.uptimeSec = Qpc::ToSec(now - startQpc_);
+    s.warmupDone = warmupDone_;
+    if (s.configPath != o_.configPath) s.configPath = o_.configPath;
+    if (s.captureName.empty()) {
+        if (cap_) {
+            s.captureName = cap_->info().deviceName;
+            char b[96];
+            snprintf(b, sizeof(b), "%s %ux%u@%.2f", PixFmtName(cap_->info().format), cap_->info().width, cap_->info().height, cap_->info().fps);
+            s.captureFormat = b;
+        } else {
+            s.captureName = "synthetic";
+            char b[96];
+            snprintf(b, sizeof(b), "%ux%u@%.2f", srcW_, srcH_, o_.capFps);
+            s.captureFormat = b;
+        }
+    }
+    s.srcW = srcW_; s.srcH = srcH_; s.outW = outW_; s.outH = outH_;
+    s.dispW = pres_.width(); s.dispH = pres_.height(); s.dispHz = pres_.refreshHz();
+    s.vrrActive = vrrActive_;
+    const bool probing = o_.autoMode && o_.mode == PaceMode::Passthrough;
+    s.mode = probing ? "auto (probing)" : o_.mode == PaceMode::Vrr ? "vrr" : o_.mode == PaceMode::Fixed ? "fixed" : "passthrough";
+    s.interp = o_.interp;
+    s.fgQuality = o_.interp == "vfx" ? FgQualityName(o_.vfgMode) : o_.interp == "nvof" ? (o_.nvofQuality == 0 ? "q0" : o_.nvofQuality == 1 ? "q1" : "q2") : "-";
+    s.sr = o_.sr;
+    s.srQuality = o_.sr == "vfx" ? SrQualityName(o_.srQuality) : "-";
+    s.hdr = o_.hdr;
+    s.interpOn = interpOn_; s.srOn = srOn_;
+    s.adaptive = adaptive_;
+    s.multiplier = curK_;
+    s.targetFps = o_.fgTargetFps;
+    s.signalHz = pacer_.SourceHz();
+    s.contentFps = s.signalHz > 0 ? s.signalHz / pacer_.ContentPeriod() : 0;
+    s.outFps = lastOutFps_;
+    s.contentStatic = adaptive_ && cadence_.UniqueFraction() < 0.05;
+    s.delayMs = pacer_.DelayMs(); s.leadMs = leadMs_; s.minSlackMs = pacer_.MinSlackMs();
+    s.gpuBudgetMs = o_.mode == PaceMode::Vrr && s.contentFps > 0 ? 1000.0 / (s.contentFps * curK_)
+                  : o_.mode == PaceMode::Fixed ? 1000.0 / std::max(1.0, pres_.refreshHz()) : 1000.0 / std::max(1.0, s.signalHz);
+    s.latencyMetric = (o_.mode == PaceMode::Vrr || vrrActive_ || (o_.mode == PaceMode::Passthrough && o_.passSync == 0)) ? "arrival->flip" : "arrival->scanout";
+    s.late = pacer_.LateCount(); s.hold = pacer_.StallCount(); s.drops = cap_ ? cap_->DroppedFrames() : 0;
+    s.missed = missed_; s.repeats = repeats_; s.gpuBusy = gpuBusyAtPresent_;
+    s.audioEnabled = o_.audio;
+    s.audioRunning = audio_.Running() && audioStats_.running;
+    s.audioPlaying = audioStats_.playing;
+    s.audioMuted = audio_.Running() && audio_.Muted();
+    s.audioVolume = audio_.Running() ? audio_.Volume() : (float)(o_.audioVolume / 100.0);
+    s.audioLatencyMs = audioStats_.latencyMs; s.audioBufferMs = audioStats_.bufferMs; s.audioSyncMs = audioStats_.syncDelayMs;
+    s.audioUnderruns = audioStats_.underruns;
+    if (s.audioIn != audioStats_.captureName) s.audioIn = audioStats_.captureName;
+    if (s.audioOut != audioStats_.renderName) s.audioOut = audioStats_.renderName;
+    s.captureMs = stCapture_; s.uploadMs = stUpload_; s.fgMs = stFg_; s.srMs = stSr_; s.hdrMs = stHdr_;
+    if (now < noticeUntil_) { if (s.notice != notice_) s.notice = notice_; } else if (!s.notice.empty()) s.notice.clear();
+    tel_.PublishStatus(s);
 }
 
 } // namespace camss
 
 // ------------------------------------------------------------------ entry
+namespace camss { std::atomic<bool> g_tuiActive{false}; }
+
 static BOOL WINAPI CtrlHandler(DWORD ev) {
     camss::g_quitRequested = true;
     // Closing the console / logoff / shutdown ends the process when this returns: write out the log.
@@ -832,6 +980,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     char name[MAX_PATH] = "?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod))
         GetModuleFileNameA(mod, name, MAX_PATH);
+    if (camss::g_tuiActive) { fputs("\x1b[?1049l\x1b[?25h\x1b[0m", stdout); fflush(stdout); }   // leave the dashboard screen
+    else if (camss::LogConsoleIsTty()) { fputs("\r\x1b[2K", stdout); fflush(stdout); }               // erase the status line
     camss::LogFlush(200);
     fprintf(stderr, "FATAL exception 0x%08lX at %p (%s+0x%llX)\n", ep->ExceptionRecord->ExceptionCode, addr, name,
             (unsigned long long)((uintptr_t)addr - (uintptr_t)mod));

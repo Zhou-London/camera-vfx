@@ -257,6 +257,9 @@ static const std::vector<OptDef>& Table() {
         {"windowed", nullptr, "pacing / display", "window instead of borderless fullscreen (VRR usually needs fullscreen)", SW(windowed)},
         {"monitor", "N", "pacing / display", "display output index", INT(monitor, 0, 16)},
 
+        // ---- terminal UI
+        {"ui", "auto|tui|plain", "logging / measurement", "terminal dashboard (auto: when the console is interactive) or plain log lines", ONEOF(ui, "auto", "tui", "plain")},
+        {"history", "FILE", "logging / measurement", "append each setting's measured latency to this CSV (empty = off)", STR(historyPath)},
         // ---- logging / measurement
         {"log-level", "debug|info|warn|error", "logging / measurement", "console / file log level", ONEOF(logLevel, "debug", "info", "warn", "error")},
         {"log", "FILE", "logging / measurement", "also write the log to FILE", STR(logPath)},
@@ -433,28 +436,49 @@ ParseResult LoadOptions(int argc, wchar_t** argv, Options& o) {
     return ParseResult::Run;
 }
 
+// Run-time keys, as listed by --help (two rows).
+static const std::pair<const char*, const char*> kUsageKeys[2][6] = {
+    {{"ESC", "quit"}, {"I", "frame generation on/off"}, {"F", "frame generation quality"}, {"S", "super resolution on/off"}, {nullptr, nullptr}, {nullptr, nullptr}},
+    {{"Q", "super resolution quality"}, {"M", "mute"}, {"+ / -", "volume"}, {"L", "detailed statistics"}, {"R", "reset statistics"}, {"T", "timecode"}},
+};
+
+// --help. On a VT console: accent section headers, bold option names and keys, dim
+// defaults / separators. Redirected (or a console without VT): the same plain text as ever
+// (the style:: helpers return their input unchanged).
 void PrintUsage() {
     const Options def;
-    printf("camss - capture -> frame generation -> super resolution -> HDR -> low-latency display\n\n"
-           "usage: camss [--option value | --switch | --no-switch | --option=value] ...\n"
-           "Options can also be written into camss.ini as 'option = value' (see camss.ini in the source tree);\n"
-           "the command line overrides the file. --print-config shows the effective settings.\n");
+    std::string out;
+    out += style::Bold(style::Accent("camss")) + " - capture -> frame generation -> super resolution -> HDR -> low-latency display\n\n";
+    out += style::Bold("usage:") + " camss [--option value | --switch | --no-switch | --option=value] ...\n";
+    out += style::Dim("Options can also be written into camss.ini as 'option = value' (see camss.ini in the source tree);\n"
+                      "the command line overrides the file. --print-config shows the effective settings.") + "\n";
     const char* group = "";
     for (auto& d : Table()) {
-        if (strcmp(group, d.group)) { group = d.group; printf("\n[%s]\n", group); }
-        char left[96];
-        snprintf(left, sizeof(left), "  --%s%s%s", d.name, d.arg ? " " : "", d.arg ? d.arg : "");
+        if (strcmp(group, d.group)) { group = d.group; out += "\n" + style::Bold(style::Accent(std::string("[") + group + "]")) + "\n"; }
+        // Column layout is computed on the plain text; colours are added around the pieces.
+        const std::string arg = d.arg ? std::string(" ") + d.arg : std::string();
+        const size_t leftLen = 4 + strlen(d.name) + arg.size();   // "  --" name arg
+        std::string left = "  " + style::Bold(std::string("--") + d.name) + arg;
         std::string help = d.help;
         if (d.get && !strstr(d.help, "default:")) {
             std::string v = d.get(def);
-            help += " (default: " + (v.empty() ? std::string("none") : v) + ")";
+            help += style::Dim(" (default: " + (v.empty() ? std::string("none") : v) + ")");
         }
-        if (d.alias) help += std::string(" [alias --") + d.alias + "]";
-        if (strlen(left) > 34) printf("%s\n%-34s %s\n", left, "", help.c_str());
-        else printf("%-34s %s\n", left, help.c_str());
+        if (d.alias) help += style::Dim(std::string(" [alias --") + d.alias + "]");
+        if (leftLen > 34) out += left + "\n" + std::string(35, ' ') + help + "\n";
+        else out += left + std::string(35 - leftLen, ' ') + help + "\n";
     }
-    printf("\nkeys: ESC quit | I frame generation on/off | F frame generation quality | S super resolution on/off\n"
-           "      Q super resolution quality | M mute | + / - volume | L detailed statistics | R reset statistics | T timecode\n");
+    out += "\n";
+    for (int row = 0; row < 2; row++) {
+        out += row == 0 ? style::Bold(style::Accent("keys:")) + " " : std::string(6, ' ');
+        for (int k = 0; k < 6 && kUsageKeys[row][k].first; k++) {
+            if (k) out += style::Dim(" |") + " ";
+            out += style::Bold(kUsageKeys[row][k].first) + " " + kUsageKeys[row][k].second;
+        }
+        out += "\n";
+    }
+    fputs(out.c_str(), stdout);
+    fflush(stdout);
 }
 
 void PrintConfig(const Options& o) {

@@ -14,6 +14,8 @@
 #include "scale/rtx_video.h"
 #include "pacing/cadence.h"
 #include "audio/audio_monitor.h"
+#include "ui/telemetry.h"
+#include "ui/dashboard.h"
 #include <memory>
 #include <deque>
 #include <array>
@@ -21,6 +23,8 @@
 namespace camss {
 
 class VfxChain;
+extern std::atomic<bool> g_tuiActive;
+extern std::atomic<bool> g_quitRequested;   // the dashboard owns the console (crash handler restores it)
 
 int RunSelfTest(const Options& o);
 
@@ -41,6 +45,8 @@ private:
         double delayMs = 0, slackMs = 0; bool late = false, hold = false;
         int64_t newestArrival = 0, newestSample = 0, contentSample = 0, newestUploaded = 0;
         double renderCpuMs = 0;
+        float gpuMs = 0;
+        bool interp = false;
         bool finalized = false;
     };
 
@@ -62,6 +68,11 @@ private:
     void WarmUp(bool initial);
     void PrintDetail();
     void StartAudio();
+    // Terminal UI / recording: status snapshot for the dashboard (cheap, render thread).
+    void PublishStatus(int64_t now);
+    void BumpGeneration() { generation_++; }
+    void StartDashboard();
+    void StopDashboard();
     void RunFixed();
     void RunVrr();
     void RunPassthrough(double untilSec = 0, int sync = -1);
@@ -81,6 +92,17 @@ private:
     std::unique_ptr<VfxChain> vfx_;
     CadenceDetector cadence_;
     AudioMonitor audio_;
+    Telemetry tel_;
+    Dashboard dash_;
+    bool tui_ = false;               // the dashboard owns the console
+    bool statusLine_ = false;        // plain interactive console: pinned status line
+    uint64_t generation_ = 0;        // settings generation (dashboard segments)
+    int64_t lastStatusPub_ = 0, lastHeavyStats_ = 0;
+    double stCapture_ = -1, stUpload_ = -1, stFg_ = -1, stSr_ = -1, stHdr_ = -1, stGpu_ = 0;   // stage p50 (ms)
+    std::string notice_;
+    int64_t noticeUntil_ = 0;
+    AudioStats audioStats_;          // refreshed with the heavy stats (copies strings: not per frame)
+    AppStatus statusPub_;            // reused buffer for PublishStatus (string capacity kept)
     StatBook stats_;
     PreciseSleeper sleeper_;
 
