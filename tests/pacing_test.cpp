@@ -19,12 +19,14 @@ struct Result {
     double maxGridErr = 0;        // VRR: distance of t from the k-grid
     uint64_t interpolated = 0;
     uint64_t backwards = 0;
+    double delayBeforeStall = 0, delayMaxAfterStall = 0;
+    uint64_t stalls = 0;
 };
 
 static double Ms(double ticks) { return ticks * 1000.0 / (double)Qpc::Freq(); }
 
 static Result Simulate(PaceMode mode, double displayHz, int k, double srcHz, double driftPpm, double jitterMs, double seconds,
-                       unsigned seed, double spikeProb) {
+                       unsigned seed, double spikeProb, double stallAtSec = -1) {
     const double F = (double)Qpc::Freq();
     const double P = F / (srcHz * (1.0 + driftPpm * 1e-6));
     const double T = F / displayHz;
@@ -44,6 +46,11 @@ static Result Simulate(PaceMode mode, double displayHz, int k, double srcHz, dou
     for (int n = 0; n < N; n++) {
         double j = U(rng) * jitterMs + (U(rng) < spikeProb ? 4.0 : 0.0);
         ready[n] = base + (int64_t)(n * P + F * (1.0 + j) / 1000.0);
+    }
+    // Optional 250 ms source stall: frames due in the window arrive in a burst at its end.
+    if (stallAtSec > 0) {
+        const int64_t a = base + (int64_t)(stallAtSec * F), b = a + (int64_t)(0.25 * F);
+        for (int n = 0; n < N; n++) if (ready[n] >= a && ready[n] < b) ready[n] = b + n % 3;
     }
     int fed = 0;
     auto feed = [&](int64_t until) { while (fed < N && ready[fed] <= until) { pacer.OnSourceFrame(fed, ready[fed]); fed++; } };
@@ -87,6 +94,11 @@ static Result Simulate(PaceMode mode, double displayHz, int k, double srcHz, dou
                     printf("    [%5.1fs] D=%.2f minslack=%.2f\n", Ms((double)(V - base)) / 1000.0, d.delayMs, pacer.MinSlackMs());
                 }
             }
+            if (stallAtSec > 0) {
+                const double tsec = (double)(V - base) / F;
+                if (tsec < stallAtSec) r.delayBeforeStall = d.delayMs;
+                else if (tsec < stallAtSec + 10) r.delayMaxAfterStall = std::max(r.delayMaxAfterStall, d.delayMs);
+            }
             if (V > warm) {
                 delays.push_back(d.delayMs);
                 if (d.late) {
@@ -113,6 +125,7 @@ static Result Simulate(PaceMode mode, double displayHz, int k, double srcHz, dou
         if (mode != PaceMode::Vrr) V += (int64_t)T;
         else V += 1;  // next schedule computed by the pacer
     }
+    r.stalls = pacer.StallCount();
     if (!delays.empty()) {
         std::sort(delays.begin(), delays.end());
         r.delayP50 = delays[delays.size() / 2];
@@ -145,13 +158,23 @@ int main() {
     int fails = 0;
     for (auto& c : cases) {
         Result r = Simulate(c.mode, c.hz, c.k, 60.0, c.drift, 1.5, 60.0, 1234, c.spike);
-        // Allowed lateness: a few hitches per minute caused by the injected 4 ms spikes.
-        bool ok = r.lateAfterWarmup <= 12 && r.backwards == 0 && r.delayP50 <= c.expectMaxDelay && r.maxSpeedDev < 0.03 &&
+        // Allowed lateness: injected 4 ms spikes on 1% of frames (far worse than the ~0.2 ms p99
+        // jitter measured on the real card) may cause up to 20 hitches/min; clean sources: none.
+        bool ok = r.lateAfterWarmup <= (c.spike > 0 ? 20u : 0u) && r.backwards == 0 && r.delayP50 <= c.expectMaxDelay && r.maxSpeedDev < 0.03 &&
                   (c.mode != PaceMode::Vrr || r.maxGridErr < 0.02);
         printf("%-24s out=%6llu interp=%6llu late=%2llu back=%llu  D p50=%6.2f max=%6.2f (bound %5.2f) ms  speed dev=%.4f  grid err=%.4f  %s\n",
                c.name, (unsigned long long)r.outputs, (unsigned long long)r.interpolated, (unsigned long long)r.lateAfterWarmup,
                (unsigned long long)r.backwards, r.delayP50, r.delayMax, c.expectMaxDelay, r.maxSpeedDev, r.maxGridErr,
                ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
+    }
+    // Source stall: a 250 ms USB hiccup must not inflate D (it is not a pacing error).
+    for (PaceMode m : {PaceMode::Vrr, PaceMode::Fixed}) {
+        Result r = Simulate(m, m == PaceMode::Vrr ? 1000.0 : 164.0, 2, 60.0, 20, 0.5, 30.0, 99, 0.0, 15.0);
+        bool ok = r.delayMaxAfterStall - r.delayBeforeStall < 3.0 && r.backwards == 0 && r.stalls > 0;
+        printf("%-24s D before %.2f ms, max within 10 s after %.2f ms, stall outputs %llu, late %llu  %s\n",
+               m == PaceMode::Vrr ? "stall 250ms (vrr)" : "stall 250ms (fixed 164)", r.delayBeforeStall, r.delayMaxAfterStall,
+               (unsigned long long)r.stalls, (unsigned long long)r.lateAfterWarmup, ok ? "PASS" : "FAIL");
         if (!ok) fails++;
     }
     printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASS");

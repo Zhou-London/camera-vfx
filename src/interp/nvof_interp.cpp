@@ -1,25 +1,27 @@
 // Optical-flow frame interpolator built on the NVIDIA Optical Flow (NVOF) hardware engine.
 //
-// Prepare(a, b)  (once per consecutive pair, all GPU, no readback):
+// Prepare(a, b)  (once per consecutive pair, all GPU, no readback, ~0.13 ms CPU):
 //   1. luma(a), luma(b) -> R8_UNORM (cached per frame, so frame b is reused as the next pair's a)
-//   2. nvOFExecute(input=a, reference=b, PRED_DIRECTION_BOTH, cost) -> block flows F01 (a->b), F10 (b->a)
-//      (D3D12 NVOF API on shared resources, fence-synchronized with the D3D11 queue; see class comment)
-//   Nothing on the D3D11 queue consumes the flow in Prepare, so the OFA engine runs asynchronously
-//   and the graphics queue is not blocked until the first Interpolate of this pair (GPU-side fence wait).
+//   2. NVOF execute(input=a, reference=b, PRED_DIRECTION_BOTH) -> block flows F01 (a->b), F10 (b->a)
+//      through the D3D12 NVOF API on textures shared with our D3D11 device, synchronized with shared
+//      fences (see the class comment for why not the D3D11 NVOF API).
+//   Nothing on the D3D11 queue consumes the flow in Prepare: the OFA engine runs asynchronously and the
+//   graphics queue only waits (GPU-side) at the first Interpolate of this pair if the flow is not ready yet.
 //
-// Interpolate(a, b, t)  (cheap, any number of times per pair):
-//   4. "tflow" CS at flow-grid resolution: for every cell x at time t search for the motion u of the
+// Interpolate(a, b, t)  (any number of times per pair, ~0.11 ms GPU at 1080p with grid 4):
+//   3. "tflow" CS at flow-grid resolution: for every cell x at time t search for the motion u of the
 //      surface visible there. Candidates come from the flows around x and from fixed-point iterations
 //      u <- F01(x - t u), u <- -F10(x + (1-t) u) (reverse projection). Each candidate is scored in three
 //      visibility modes: visible in both frames (geometric consistency with F01 and F10 + photometric patch
 //      match between a(x - t u) and b(x + (1-t) u)), visible only in a (being covered), visible only in b
-//      (being uncovered). Best (u, mode, confidence) is stored per cell.
-//   5. "compose" CS at full resolution: for each pixel take the 2x2 neighbouring cells' (u, mode), backward-warp
-//      a and b with each, weight the candidates by bilinear position * photometric agreement (snaps motion
-//      boundaries to pixel accuracy), blend the two warps with (1-t)/t * visibility, and fade towards a plain
-//      cross-fade where confidence is low.
+//      (being uncovered or entering at the border). Best (u, mode, confidence) is stored per cell.
+//   4. "compose" CS at full resolution: for each pixel take the 3x3 neighbouring cells' (u, mode), backward-
+//      warp a and b with each, weight the candidates by a spatial tent * photometric agreement of the two
+//      warps (snaps motion boundaries to pixel accuracy, avoids block halos), blend the two warps with
+//      (1-t)/t * visibility, and fade towards a plain cross-fade where confidence is low (scene cuts,
+//      motion beyond the search range).
 #include "interpolator.h"
-#include "nvof_d3d12.h"
+#include "nvOpticalFlowD3D12.h"
 #include <vector>
 #include <cmath>
 
@@ -132,19 +134,30 @@ bool InsideImg(float2 p) { return p.x >= -0.5 && p.y >= -0.5 && p.x <= W + 0.5 &
 void ComposeCS(uint3 id : SV_DispatchThreadID) {
     if (id.x >= W || id.y >= H) return;
     float2 xp = float2(id.xy) + 0.5;
-    float2 c = xp * invG - 0.5;
-    int2 i0 = int2(floor(c));
-    float2 f = c - float2(i0);
+    float2 c = xp * invG - 0.5;          // continuous cell coordinates
+#if NB3
+    int2 i0 = int2(floor(c + 0.5)) - 1;  // 3x3 cells around the nearest one, tent weights
+    const int NB = 3;
+#else
+    int2 i0 = int2(floor(c));            // 2x2 bilinear neighbours
+    const int NB = 2;
+#endif
     float2 s = float2(invW, invH);
     float3 cross = lerp(CA[id.xy].rgb, CBt[id.xy].rgb, t);
     float3 acc = 0;
     float wsum = 0;
-    [unroll] for (int j = 0; j < 2; j++) {
-        [unroll] for (int i = 0; i < 2; i++) {
-            int2 ci = clamp(i0 + int2(i, j), int2(0, 0), int2(FW - 1, FH - 1));
+    [unroll] for (int j = 0; j < NB; j++) {
+        [unroll] for (int i = 0; i < NB; i++) {
+            int2 cc = i0 + int2(i, j);
+            int2 ci = clamp(cc, int2(0, 0), int2(FW - 1, FH - 1));
             float4 tv = TIn[ci];
-            float bw = (i ? f.x : 1.0 - f.x) * (j ? f.y : 1.0 - f.y);
-            float2 u = tv; 
+            float2 dd = abs(float2(cc) - c);
+#if NB3
+            float bw = max(0.0, 1.0 - dd.x / 1.5) * max(0.0, 1.0 - dd.y / 1.5);
+#else
+            float bw = max(0.0, 1.0 - dd.x) * max(0.0, 1.0 - dd.y);
+#endif
+            float2 u = tv.xy;
             float2 q0 = xp - t * u, q1 = xp + (1.0 - t) * u;
             float vis0 = saturate(1.0 - tv.z), vis1 = saturate(1.0 + tv.z);
             if (!InsideImg(q0)) vis0 = 0;
@@ -157,7 +170,7 @@ void ComposeCS(uint3 id : SV_DispatchThreadID) {
             float3 d = ca - cb;
             float e = dot(d, d) * (1.0 / 3.0);
             float pw = lerp(pwOcc, exp(-e * invSig2), vis0 * vis1);
-            float w = bw * (pw + 1e-4);
+            float w = bw * (pw + 1e-4) + 1e-12;
             acc += w * lerp(cross, col, tv.w);
             wsum += w;
         }
@@ -213,6 +226,10 @@ struct CBData {
 //   fenceIn_  : D3D11 Signal after writing the luma inputs  -> NVOF waits before reading them
 //   fenceOut_ : NVOF signals when the flow is written        -> D3D11 Wait before the first read
 class NvofInterpolator : public Interpolator {
+    // NVOF cost output: evaluated as an occlusion cue (discounting flow consistency on high-cost blocks)
+    // and gave <0.5 dB on the synthetic tests with thresholds that would not survive camera noise, so it
+    // is not requested (saves OFA work). The plumbing is kept for experiments.
+    static constexpr bool kUseCost = false;
 public:
     explicit NvofInterpolator(int quality) : quality_(std::clamp(quality, 0, 2)) {}
     ~NvofInterpolator() override { Release(); }
@@ -226,9 +243,8 @@ public:
         switch (quality_) {
         case 0: grid_ = 4; perf_ = NV_OF_PERF_LEVEL_FAST; break;
         case 1: grid_ = 4; perf_ = NV_OF_PERF_LEVEL_MEDIUM; break;
-        default: grid_ = 2; perf_ = NV_OF_PERF_LEVEL_FAST; break;
+        default: grid_ = 2; perf_ = NV_OF_PERF_LEVEL_MEDIUM; break;   // best quality, ~6-10 ms OFA latency
         }
-        if (quality_ == 2 && getenv("NVOF_Q2")) { int g = 4, pf = 10; sscanf(getenv("NVOF_Q2"), "%d,%d", &g, &pf); grid_ = (UINT)g; perf_ = (NV_OF_PERF_LEVEL)pf; }
         fw_ = (w + grid_ - 1) / grid_;
         fh_ = (h + grid_ - 1) / grid_;
         try {
@@ -246,7 +262,7 @@ public:
             ip.mode = NV_OF_MODE_OPTICALFLOW;
             ip.perfLevel = perf_;
             ip.enableExternalHints = NV_OF_FALSE;
-            ip.enableOutputCost = NV_OF_TRUE;
+            ip.enableOutputCost = kUseCost ? NV_OF_TRUE : NV_OF_FALSE;
             ip.predDirection = NV_OF_PRED_DIRECTION_BOTH;
             ip.enableGlobalFlow = NV_OF_FALSE;
             ip.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
@@ -257,15 +273,16 @@ public:
                 if (!CreateShared(w, h, DXGI_FORMAT_R8_UNORM, true, l.tex)) return false;
             for (auto& p : pairs_) {
                 if (!CreateShared(fw_, fh_, DXGI_FORMAT_R16G16_SINT, false, p.flowF) ||
-                    !CreateShared(fw_, fh_, DXGI_FORMAT_R16G16_SINT, false, p.flowB) ||
-                    !CreateShared(fw_, fh_, DXGI_FORMAT_R8_UINT, false, p.costF) ||
-                    !CreateShared(fw_, fh_, DXGI_FORMAT_R8_UINT, false, p.costB)) return false;
+                    !CreateShared(fw_, fh_, DXGI_FORMAT_R16G16_SINT, false, p.flowB)) return false;
+                if (kUseCost && (!CreateShared(fw_, fh_, DXGI_FORMAT_R8_UINT, false, p.costF) ||
+                                 !CreateShared(fw_, fh_, DXGI_FORMAT_R8_UINT, false, p.costB))) return false;
             }
             WaitCpu(fenceOut12_.Get(), outVal_);   // registrations complete
             tflow_ = dev.CreateTex(fw_, fh_, DXGI_FORMAT_R32G32B32A32_FLOAT, true, false);
             csLuma_ = dev.CompileCS(kNvofCS, "LumaCS", "nvof_luma");
             csTFlow_ = dev.CompileCS(kNvofCS, "TFlowCS", "nvof_tflow");
-            csCompose_ = dev.CompileCS(kNvofCS, "ComposeCS", "nvof_compose");
+            const D3D_SHADER_MACRO nb3[] = {{"NB3", "1"}, {nullptr, nullptr}};   // 3x3: +0.4-0.7 dB at boundaries, +0.015 ms
+            csCompose_ = dev.CompileCS(kNvofCS, "ComposeCS", "nvof_compose", nb3);
             cb_ = dev.CreateConstantBuffer(sizeof(CBData));
         } catch (const std::exception& e) {
             LOGE("nvof: init failed: %s", e.what());
@@ -424,12 +441,13 @@ private:
         cb.W = w_; cb.H = h_; cb.FW = fw_; cb.FH = fh_;
         cb.G = (float)grid_; cb.invG = 1.0f / (float)grid_; cb.t = t;
         cb.invW = 1.0f / (float)w_; cb.invH = 1.0f / (float)h_;
-        cb.alpha = 30.0f;      // px of geometric error per unit mean-abs luma difference
-        cb.pOcc = 3.0f;        // penalty (px) for a one-sided (occlusion) explanation
+        // Tuned on the synthetic scenes in tests/nvof_test.cpp (flat optimum, +-0.3 dB around these).
+        cb.alpha = 15.0f;      // px of geometric error per unit mean-abs luma difference
+        cb.pOcc = 5.0f;        // penalty (px) for a one-sided (occlusion) explanation
         cb.pEdge = 0.5f;       // penalty when the other side falls outside the image
         cb.sGood = 4.0f; cb.sBad = 16.0f;   // score -> confidence ramp
-        cb.invSig2 = 1.0f / 0.004f;         // photometric weight in compose (mean sq RGB diff)
-        cb.pwOcc = 0.3f;                    // weight of one-sided candidates in compose
+        cb.invSig2 = 1.0f / 0.01f;          // photometric weight in compose (mean sq RGB diff)
+        cb.pwOcc = 0.05f;                   // weight of one-sided candidates in compose
         dev_->UpdateCB(cb_.Get(), &cb, sizeof(cb));
     }
 

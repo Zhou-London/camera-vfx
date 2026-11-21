@@ -124,6 +124,20 @@ App::App(const Options& o) : o_(o) { leadMs_ = o.leadMs; }
 App::~App() {
     vsync_.Stop();
     if (cap_) { cap_->Stop(); delete cap_; cap_ = nullptr; }
+    // Teardown order matters with the NVIDIA driver: drain the GPU, drop the video processor
+    // (it holds views on CUDA-registered textures), then the CUDA chain, then the rest.
+    if (dev_.ctx()) {
+        dev_.ctx()->ClearState();
+        dev_.ctx()->Flush();
+        if (doneQ_) {
+            dev_.ctx()->End(doneQ_.Get());
+            BOOL done = FALSE;
+            for (int i = 0; i < 2000 && (dev_.ctx()->GetData(doneQ_.Get(), &done, sizeof(done), 0) != S_OK || !done); i++) Sleep(1);
+        }
+    }
+    rtx_.reset();
+    vpOut_ = {};
+    interp_.reset();
     vfx_.reset();
     if (csv_) fclose(csv_);
     pres_.Shutdown();
@@ -131,6 +145,10 @@ App::~App() {
 
 bool App::Init(HINSTANCE inst) {
     if (!dev_.Create(o_.debug)) return false;
+    {
+        D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+        dev_.dev()->CreateQuery(&qd, &doneQ_);
+    }
     prof_.Init(dev_.dev());
 
     // ---- source
@@ -187,12 +205,18 @@ bool App::Init(HINSTANCE inst) {
     // ---- RTX video (driver VSR / TrueHDR via D3D11 video processor)
     if (o_.sr == "rtx" || o_.hdr == "rtx") {
         RtxVideoOptions ro; ro.vsr = o_.sr == "rtx"; ro.trueHdr = o_.hdr == "rtx";
-        UINT vw = ro.vsr ? outW_ : srcW_, vh = ro.vsr ? outH_ : srcH_;
+        if (o_.hdr == "vfx" && o_.sr == "rtx") {
+            LOGE("--sr rtx after --hdr vfx is not supported (the driver VSR takes SDR input); use --sr vfx or --hdr rtx");
+            return false;
+        }
+        // Input is whatever reaches this stage: VFX VSR output (output size) or a source-size frame.
+        rtxInW_ = o_.sr == "vfx" ? outW_ : srcW_;
+        rtxInH_ = o_.sr == "vfx" ? outH_ : srcH_;
+        UINT vw = ro.vsr ? outW_ : rtxInW_, vh = ro.vsr ? outH_ : rtxInH_;
         DXGI_FORMAT of = ro.trueHdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
         DXGI_FORMAT inF = DXGI_FORMAT_R8G8B8A8_UNORM;
-        if (vfx_ && vfx_->OutputIsPq()) LOGW("rtx stage after a PQ-encoded VFX output is not supported");
         rtx_ = std::make_unique<RtxVideo>();
-        if (!rtx_->Init(dev_, srcW_, srcH_, inF, vw, vh, of, ro)) { LOGE("RTX video init failed"); rtx_.reset(); }
+        if (!rtx_->Init(dev_, rtxInW_, rtxInH_, inF, vw, vh, of, ro)) { LOGE("RTX video init failed"); rtx_.reset(); }
         else vpOut_ = dev_.CreateTex(vw, vh, of, false, true);
     }
 
@@ -200,10 +224,11 @@ bool App::Init(HINSTANCE inst) {
     // (tens of ms); do it now so the pacer never sees those stalls.
     {
         int64_t t0 = Qpc::Now();
-        store_[0].n = -1000; store_[1].n = -999;
+        // Positive frame numbers mapping to slots 0/1 (n % kStore must never be negative).
+        store_[0].n = (int64_t)kStore * 100000; store_[1].n = store_[0].n + 1;
         for (int i = 0; i < 4; i++) {
             if (vfx_) { vfx_->Ingest(store_[0]); vfx_->Ingest(store_[1]); vfx_->Process(store_[0], &store_[1], 0.5f, true); }
-            if (rtx_) rtx_->Process(store_[0].rgb.tex.Get(), vpOut_.tex.Get());
+            if (rtx_ && rtxInW_ == srcW_ && rtxInH_ == srcH_) rtx_->Process(store_[0].rgb.tex.Get(), vpOut_.tex.Get());
             if (interp_) { interp_->Prepare(store_[0], store_[1]); interp_->Interpolate(store_[0], store_[1], 0.5f, interpOut_); }
             dev_.ctx()->Flush();
         }
@@ -245,6 +270,7 @@ bool App::Init(HINSTANCE inst) {
 }
 
 SourceFrame* App::Frame(int64_t n) {
+    if (n < 0) return nullptr;
     SourceFrame& f = store_[(size_t)(n % kStore)];
     return f.n == n ? &f : nullptr;
 }
@@ -304,7 +330,8 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     SourceFrame* A = Frame(d.nA);
     SourceFrame* B = d.nB != d.nA ? Frame(d.nB) : nullptr;
     if (!A) return false;
-    const bool doInterp = interpOn_ && B && d.t > 0.f && (interp_ || (vfx_ && vfx_->HasFg()));
+    const bool wantInterp = interpOn_ && B && d.t > 0.f;
+    bool doInterp = false;   // what actually ran (drives latency accounting)
 
     prof_.Begin(ctx);
     ID3D11ShaderResourceView* finalSrv = A->rgb.srv.Get();
@@ -312,9 +339,19 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     UINT finalW = srcW_, finalH = srcH_;
     Encoding enc = Encoding::SdrGamma;
 
+    // D3D interpolators (blend / NVOF) run first; with a VFX chain their output feeds VFX HDR/SR.
+    const Device::Tex* external = nullptr;
+    if (wantInterp && interp_ && !(vfx_ && vfx_->HasFg())) {
+        interp_->Interpolate(*A, *B, d.t, interpOut_);
+        finalSrv = interpOut_.srv.Get(); stageTex = interpOut_.tex.Get();
+        external = &interpOut_;
+        doInterp = true;
+        prof_.Mark(ctx, "interp");
+    }
     if (vfx_) {
         int64_t t0 = Qpc::Now();
-        const Device::Tex* out = vfx_->Process(*A, doInterp ? B : nullptr, doInterp ? d.t : 0.f, srOn_);
+        const bool fg = wantInterp && vfx_->HasFg();
+        const Device::Tex* out = vfx_->Process(*A, fg ? B : nullptr, fg ? d.t : 0.f, srOn_, external);
         stats_.Add("vfx.cpu_ms", Qpc::ToMs(Qpc::Now() - t0));
         for (auto& kv : vfx_->PopTimings()) {
             stats_.Add(kv.first, kv.second);
@@ -322,16 +359,16 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
         }
         if (out) {
             finalSrv = out->srv.Get(); stageTex = out->tex.Get(); finalW = out->w; finalH = out->h;
-            if (vfx_->OutputIsPq()) enc = Encoding::Pq;
+            if (vfx_->LastOutputPq()) enc = Encoding::Pq;
+            if (vfx_->LastFgRan()) doInterp = true;
+        } else if (!external) {
+            doInterp = false;   // chain failed: the plain source frame A is shown
         }
         prof_.Mark(ctx, "vfx");
-    } else if (doInterp && interp_) {
-        interp_->Interpolate(*A, *B, d.t, interpOut_);
-        finalSrv = interpOut_.srv.Get(); stageTex = interpOut_.tex.Get();
-        prof_.Mark(ctx, "interp");
     }
-    if (rtx_ && (srOn_ || o_.hdr == "rtx") && finalW == srcW_ && enc == Encoding::SdrGamma) {
+    if (rtx_ && (srOn_ || o_.hdr == "rtx") && finalW == rtxInW_ && finalH == rtxInH_ && enc == Encoding::SdrGamma) {
         int64_t t0 = Qpc::Now();
+        rtx_->SetVsr(srOn_);
         if (rtx_->Process(stageTex, vpOut_.tex.Get())) {
             finalSrv = vpOut_.srv.Get(); finalW = vpOut_.w; finalH = vpOut_.h;
             if (vpOut_.fmt == DXGI_FORMAT_R10G10B10A2_UNORM) enc = Encoding::Pq;
@@ -351,16 +388,27 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     blit_.Draw(finalSrv, finalW, finalH, pres_.BackbufferRtv(), pres_.width(), pres_.height(), bp);
     prof_.Mark(ctx, "blit");
     prof_.End(ctx);
+    if (doneQ_) ctx->End(doneQ_.Get());     // signals when this frame's GPU work (incl. CUDA) is done
 
     const int64_t submitDone = Qpc::Now();
     if (presentAt) {
         dev_.ctx()->Flush();                       // get the GPU going while we wait
         if (Qpc::Now() > presentAt) stats_.Add("present.late_ms", Qpc::ToMs(Qpc::Now() - presentAt));
         sleeper_.SleepUntil(presentAt, 0.25);
+        // Under VRR the flip happens when the GPU finishes: if it is still busy at the scheduled
+        // time, the frame will be shown late -> the render lead is too small.
+        BOOL done = FALSE;
+        if (doneQ_ && (ctx->GetData(doneQ_.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || !done)) {
+            gpuBusyAtPresent_++;
+            stats_.Add("present.gpu_busy", 1.0);
+            leadMs_ = std::min(leadMs_ + 0.25, 0.75 * 1000.0 / o_.capFps);
+            lastLeadAdjust_ = Qpc::Now();
+        }
     }
     const int64_t presentCall = Qpc::Now();
     HRESULT hr = pres_.Present(sync, tearing);
     const int64_t after = Qpc::Now();
+    haveSlot_ = false;
     if (FAILED(hr)) return false;
 
     OutRecord r;
@@ -487,18 +535,19 @@ void App::Report(bool final) {
     char head[512];
     snprintf(head, sizeof(head),
              "---- %.1fs  mode=%s interp=%s%s sr=%s%s hdr=%s | src %.3f Hz (jit %.2f ms) disp %.3f Hz (jit %.2f ms) | "
-             "D=%.2f ms minslack=%.2f lead=%.2f late=%llu missed=%llu drops=%llu%s",
+             "D=%.2f ms minslack=%.2f lead=%.2f late=%llu stall=%llu missed=%llu gpubusy=%llu drops=%llu%s",
              Qpc::ToSec(now - startQpc_), PaceModeName(o_.mode), o_.interp.c_str(), interpOn_ ? "" : "(off)", o_.sr.c_str(),
              srOn_ ? "" : "(off)", o_.hdr.c_str(), pacer_.SourceHz(), pacer_.SourceJitterMs(), vsync_.MeasuredHz(),
              vsync_.JitterMs(), pacer_.DelayMs(), pacer_.MinSlackMs(), leadMs_, (unsigned long long)pacer_.LateCount(),
-             (unsigned long long)missed_, (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0),
+             (unsigned long long)pacer_.StallCount(), (unsigned long long)missed_, (unsigned long long)gpuBusyAtPresent_, (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0),
              o_.decodeTimecode ? (timecodeHits_ ? " tc=ok" : " tc=none") : "");
     LOGI("%s\n%s", head, stats_.Report().c_str());
     char title[256];
     double p50 = 0, p99 = 0;
-    stats_.Get("lat.arrival_to_scanout_ms", p50, p99);
-    snprintf(title, sizeof(title), "camss | %s | D %.1f ms | arrival->scanout p50 %.1f p99 %.1f ms", PaceModeName(o_.mode),
-             pacer_.DelayMs(), p50, p99);
+    const char* metric = "arrival->scanout";
+    if (!stats_.Get("lat.arrival_to_scanout_ms", p50, p99)) { stats_.Get("lat.arrival_to_flip_ms", p50, p99); metric = "arrival->flip"; }
+    snprintf(title, sizeof(title), "camss | %s | D %.1f ms | %s p50 %.1f p99 %.1f ms", PaceModeName(o_.mode),
+             pacer_.DelayMs(), metric, p50, p99);
     pres_.SetTitle(title);
 }
 
@@ -519,7 +568,7 @@ void App::RunFixed() {
     while (pres_.PumpMessages() && !g_quitRequested) {
         if (o_.durationSec > 0 && Qpc::ToSec(Qpc::Now() - startQpc_) > o_.durationSec) break;
         HandleKeys();
-        pres_.WaitReady(100);
+        if (!haveSlot_) haveSlot_ = pres_.WaitReady(100);   // keep the slot if we did not present last time
         int64_t wake = Qpc::Now();
         const int64_t lead = Qpc::FromMs(leadMs_);
         int64_t V = vsync_.NextVblankAfter(wake + lead);
@@ -530,7 +579,7 @@ void App::RunFixed() {
         if (!d.valid) {
             // No timing yet: show the newest frame if we have one.
             int64_t n = pacer_.NewestIndex();
-            if (n < 0) { pres_.Present(1, false); continue; }
+            if (n < 0) { pres_.Present(1, false); haveSlot_ = false; continue; }
             d.valid = true; d.nA = d.nB = n; d.t = 0;
         }
         Render(d, s, V, 1, false);
@@ -543,7 +592,7 @@ void App::RunVrr() {
     while (pres_.PumpMessages() && !g_quitRequested) {
         if (o_.durationSec > 0 && Qpc::ToSec(Qpc::Now() - startQpc_) > o_.durationSec) break;
         HandleKeys();
-        pres_.WaitReady(100);
+        if (!haveSlot_) haveSlot_ = pres_.WaitReady(100);   // keep the slot if we did not present last time
         int64_t now = Qpc::Now();
         Ingest(now);
         int64_t V = pacer_.NextVrrDisplayTime(now, leadMs_);
@@ -570,7 +619,7 @@ void App::RunPassthrough(double untilSec, int sync) {
         if (o_.durationSec > 0 && Qpc::ToSec(Qpc::Now() - startQpc_) > o_.durationSec) break;
         if (untilSec > 0 && Qpc::ToSec(Qpc::Now() - startQpc_) > untilSec) break;
         HandleKeys();
-        pres_.WaitReady(100);
+        if (!haveSlot_) haveSlot_ = pres_.WaitReady(100);   // keep the slot if we did not present last time
         if (o_.synthetic) {
             int64_t next = synthNext_ ? synthNext_ : Qpc::Now();
             sleeper_.SleepUntil(next);
@@ -603,6 +652,7 @@ int App::Run() {
         o_.mode = PaceMode::Passthrough;
         RunPassthrough(2.5, 1);
         o_.mode = (vrrActive_ && pres_.tearingEnabled()) ? PaceMode::Vrr : PaceMode::Fixed;
+        pacer_.SetMode(o_.mode);
         LOGI("auto mode: refreshes/present %.2f -> %s pacing", vrrRatio_, PaceModeName(o_.mode));
         stats_.Clear();
         records_.clear();
@@ -623,10 +673,24 @@ int App::Run() {
 // ------------------------------------------------------------------ entry
 static BOOL WINAPI CtrlHandler(DWORD) { camss::g_quitRequested = true; return TRUE; }
 
+// Log the faulting module + offset on a crash (no dump files, no system settings touched).
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    void* addr = ep->ExceptionRecord->ExceptionAddress;
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod))
+        GetModuleFileNameA(mod, name, MAX_PATH);
+    fprintf(stderr, "FATAL exception 0x%08lX at %p (%s+0x%llX)\n", ep->ExceptionRecord->ExceptionCode, addr, name,
+            (unsigned long long)((uintptr_t)addr - (uintptr_t)mod));
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int wmain(int argc, wchar_t** argv) {
     using namespace camss;
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
+    SetUnhandledExceptionFilter(CrashFilter);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HR_CHECK(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     HR_CHECK(MFStartup(MF_VERSION));

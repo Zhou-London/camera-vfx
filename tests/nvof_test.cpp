@@ -2,7 +2,9 @@
 // interpolated frame vs the analytically correct intermediate frame (flow interpolator vs blend),
 // GPU/CPU timings, and a cross-engine (D3D11 queue <-> OFA engine) ordering check.
 //
-// Usage: nvof_test [--dump <dir>] [--frames N] [--quick]
+// Usage: nvof_test [--dump <dir>] [--frames N] [--quick] [--probe]
+//   --quick  PSNR table only;  --probe  raw NVOF D3D11-API ordering probe only;
+//   --dump   writes [ground truth | output | |error|x4] crops for t=0.5 of the last pair of each case.
 #include "interp/interpolator.h"
 #include "gfx/device.h"
 #include "nvOpticalFlowD3D11.h"
@@ -182,10 +184,10 @@ static uint32_t Crc(const uint8_t* d, size_t n, uint32_t c = 0xffffffffu) {
     for (size_t i = 0; i < n; i++) c = tab[(c ^ d[i]) & 0xff] ^ (c >> 8);
     return c;
 }
-static void WritePng(const std::string& path, const std::vector<uint8_t>& rgba) {
+static void WritePng(const std::string& path, const std::vector<uint8_t>& rgba, UINT pw = W, UINT ph = H) {
     std::vector<uint8_t> raw;
-    raw.reserve((size_t)(W * 3 + 1) * H);
-    for (UINT y = 0; y < H; y++) { raw.push_back(0); for (UINT x = 0; x < W; x++) for (int k = 0; k < 3; k++) raw.push_back(rgba[((size_t)y * W + x) * 4 + k]); }
+    raw.reserve((size_t)(pw * 3 + 1) * ph);
+    for (UINT y = 0; y < ph; y++) { raw.push_back(0); for (UINT x = 0; x < pw; x++) for (int k = 0; k < 3; k++) raw.push_back(rgba[((size_t)y * pw + x) * 4 + k]); }
     std::vector<uint8_t> z = {0x78, 0x01};
     uint32_t s1 = 1, s2 = 0;
     for (uint8_t v : raw) { s1 = (s1 + v) % 65521; s2 = (s2 + s1) % 65521; }
@@ -209,10 +211,28 @@ static void WritePng(const std::string& path, const std::vector<uint8_t>& rgba) 
     };
     const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
     fwrite(sig, 1, 8, f);
-    std::vector<uint8_t> ihdr = {(uint8_t)(W >> 24), (uint8_t)(W >> 16), (uint8_t)(W >> 8), (uint8_t)W,
-                                 (uint8_t)(H >> 24), (uint8_t)(H >> 16), (uint8_t)(H >> 8), (uint8_t)H, 8, 2, 0, 0, 0};
+    std::vector<uint8_t> ihdr = {(uint8_t)(pw >> 24), (uint8_t)(pw >> 16), (uint8_t)(pw >> 8), (uint8_t)pw,
+                                 (uint8_t)(ph >> 24), (uint8_t)(ph >> 16), (uint8_t)(ph >> 8), (uint8_t)ph, 8, 2, 0, 0, 0};
     chunk("IHDR", ihdr); chunk("IDAT", z); chunk("IEND", {});
     fclose(f);
+}
+
+// Side-by-side crop [ground truth | output | |error| x4], 2x nearest upscale, for visual inspection.
+static void WriteCompare(const std::string& path, const std::vector<uint8_t>& gt, const std::vector<uint8_t>& out, int cx, int cy) {
+    const int cw = 320, ch = 240, sc = 2;
+    const int x0 = std::clamp(cx - cw / 2, 0, (int)W - cw), y0 = std::clamp(cy - ch / 2, 0, (int)H - ch);
+    const UINT pw = cw * sc * 3, ph = ch * sc;
+    std::vector<uint8_t> img((size_t)pw * ph * 4);
+    for (UINT y = 0; y < ph; y++)
+        for (UINT x = 0; x < pw; x++) {
+            int panel = (int)x / (cw * sc), sx = x0 + ((int)x % (cw * sc)) / sc, sy = y0 + (int)y / sc;
+            size_t si = ((size_t)sy * W + sx) * 4, di = ((size_t)y * pw + x) * 4;
+            for (int k = 0; k < 3; k++) {
+                int v = panel == 0 ? gt[si + k] : panel == 1 ? out[si + k] : std::min(255, 4 * std::abs((int)gt[si + k] - (int)out[si + k]));
+                img[di + k] = (uint8_t)v;
+            }
+        }
+    WritePng(path, img, pw, ph);
 }
 
 // GPU timestamp range helper.
@@ -553,8 +573,7 @@ int main(int argc, char** argv) {
                     if (n == 0) continue;
                     SourceFrame& A = fr[(n - 1) % 3];
                     ip->Prepare(A, B);
-                    for (int kk = 0; kk < 3; kk++) {
-                        const int k = getenv("REV") ? 2 - kk : kk;
+                    for (int k = 0; k < 3; k++) {
                         ip->Interpolate(A, B, ts[k], out);
                         Render(c, gt, LerpScene(cs.at(n - 1), cs.at(n), ts[k]));
                         Readback(c, out, outPix);
@@ -562,8 +581,9 @@ int main(int argc, char** argv) {
                         AddSse(sse[ii][k], outPix, gtPix);
                         if (!dumpDir.empty() && n == frames - 1 && k == 1) {
                             std::string base = dumpDir + "/" + std::to_string(&cs - kCases) + "_";
-                            WritePng(base + ips[ii].name.substr(0, 4) + ips[ii].name.substr(ips[ii].name.size() - 1) + ".png", outPix);
-                            if (ii == 0) WritePng(base + "gt.png", gtPix);
+                            Scene sc = LerpScene(cs.at(n - 1), cs.at(n), ts[k]);
+                            int cx = sc.obj ? (int)(sc.objX + sc.objR * 0.7f) : (int)W / 2, cy = sc.obj ? (int)sc.objY : (int)H / 2;
+                            WriteCompare(base + ips[ii].name.substr(0, 4) + ips[ii].name.substr(ips[ii].name.size() - 1) + ".png", gtPix, outPix, cx, cy);
                         }
                     }
                 }

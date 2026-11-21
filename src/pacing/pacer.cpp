@@ -44,84 +44,99 @@ bool Pacer::ReadyTime(int64_t n, int64_t& t) const {
     return true;
 }
 
+// Frame needed to show content position x: frame floor(x), plus its successor unless t
+// snaps to 0. (Gaps from dropped frames are handled when the pair is resolved.)
+static int64_t NeedFor(double x, double eps) {
+    double fl = std::floor(x);
+    return (int64_t)fl + ((x - fl > eps) ? 1 : 0);
+}
+
+double Pacer::TrialMinSlack(double trialDelay) const {
+    // Re-evaluate the window as if D had been `trialDelay`: in fixed-refresh mode V is set by
+    // vblanks, so slack only changes when the needed frame changes (piecewise, not 1:1 with D).
+    double m = 1e300;
+    for (const auto& w : slack_) {
+        int64_t need = NeedFor(src_.IndexAt((double)w.V - trialDelay), cfg_.snapEps);
+        auto it = ready_.find(need);
+        if (it == ready_.end() || it->second > w.s) return -1e300;   // would have been late
+        m = std::min(m, (double)(w.s - it->second));
+    }
+    return m;
+}
+
 PaceDecision Pacer::Decide(int64_t s, int64_t V) {
     PaceDecision d;
     if (!src_.Valid() || newestN_ < 0 || ready_.empty()) return d;
     const double P = src_.Period();
     const double eps = cfg_.snapEps;
     const double margin = (double)Qpc::FromMs(cfg_.marginMs);
+    const bool gridMode = cfg_.mode == PaceMode::Vrr;   // V follows D (k-grid): slack moves 1:1 with D
 
     double x = src_.IndexAt((double)(V - (int64_t)delay_));
     if (lastX_ >= 0 && x < lastX_) x = lastX_; // never run time backwards
-
-    // Which real frame do we need for this x?
-    double fl = std::floor(x);
-    double t = x - fl;
-    int64_t need = (int64_t)fl + ((t > eps) ? 1 : 0);
+    const int64_t need = NeedFor(x, eps);
 
     if (need > newestN_) {
-        // Late: the frame we need has not arrived. Clamp to the newest frame and raise D.
+        // The frame we need has not arrived: show the newest one (never stepping back in time).
         d.late = true;
-        lateCount_++;
-        lastLateT_ = s;
-        double predReady = src_.TimeOf((double)need) + std::max(0.0, src_.ResidualQuantile(0.99));
-        double deficit = std::max(0.0, predReady - (double)s);
-        // Bounded attack: one late frame raises D by at most half a source period (a one-off
-        // stall must not inflate D for seconds; repeated lateness still ramps it up quickly).
-        delay_ += std::min(deficit, 0.5 * P) + margin;
-        // Show the newest frame we have, but never step content time backwards.
         x = std::max(std::min(x, (double)newestN_), lastX_);
+        const double resid = std::max(0.0, src_.ResidualQuantile(0.99));
+        const double overdue = (double)s - (src_.TimeOf((double)(newestN_ + 1)) + resid);
+        if (overdue > 0.5 * P) {
+            // The source itself is stalled / dropping (USB hiccup, re-sync): raising D cannot help.
+            stallCount_++;
+        } else if (need != lastLateNeed_) {
+            // Genuinely too little delay. Penalise each needed frame once, bounded attack.
+            lateCount_++;
+            lastLateT_ = s;
+            lastLateNeed_ = need;
+            const double deficit = std::max(0.0, src_.TimeOf((double)need) + resid - (double)s);
+            delay_ += std::min(deficit, 0.5 * P) + margin;
+        }
     } else {
         int64_t rt = 0;
-        // Store slack minus the delay in force: larger D shifts content earlier, i.e. more slack 1:1.
-        if (ReadyTime(need, rt)) slack_.push_back({s, (double)(s - rt) - delay_});
+        if (ReadyTime(need, rt)) slack_.push_back({s, V, (double)(s - rt) - delay_, (double)(s - rt)});
     }
 
-    // Slack window: slack_i re-evaluated at the current D = (slack_i - D_i) + D_now. Keep min over window.
     const int64_t win = Qpc::FromMs(cfg_.windowSec * 1000.0);
-    while (!slack_.empty() && slack_.front().first < s - win) slack_.pop_front();
+    while (!slack_.empty() && slack_.front().s < s - win) slack_.pop_front();
     if (!slack_.empty() && !d.late) {
-        double minNorm = slack_.front().second;
-        for (auto& p : slack_) minNorm = std::min(minNorm, p.second);
-        double minSlack = minNorm + delay_;
+        double minNorm = 1e300, minRaw = 1e300;
+        for (auto& w : slack_) { minNorm = std::min(minNorm, w.slackMinusD); minRaw = std::min(minRaw, w.raw); }
+        // VRR grid: stored slack shifts 1:1 with D. Fixed refresh: re-evaluate every window
+        // sample at the current D (which frame each would need now, and when it was ready).
+        (void)minRaw;
+        const double minSlack = gridMode ? minNorm + delay_ : TrialMinSlack(delay_);
         minSlackMs_ = Qpc::ToMs((int64_t)minSlack);
-        double dt = lastDecideT_ ? (double)(s - lastDecideT_) : 0.0;
-        bool fullWindow = (s - slack_.front().first) > win * 3 / 4;
-        double err = minSlack - margin;
-        bool holding = lastLateT_ && (s - lastLateT_) < Qpc::FromMs(cfg_.holdAfterLateSec * 1000.0);
+        const double dt = lastDecideT_ ? (double)(s - lastDecideT_) : 0.0;
+        const double maxRelease = (double)Qpc::FromMs(cfg_.releasePerSec) * dt / (double)Qpc::Freq();
+        const bool fullWindow = (s - slack_.front().s) > win * 3 / 4;
+        const bool holding = lastLateT_ && (s - lastLateT_) < Qpc::FromMs(cfg_.holdAfterLateSec * 1000.0);
+        const double err = minSlack - margin;
         if (err > 0 && fullWindow && !holding) {
-            // Release slowly: bounded playback-speed change.
-            double maxStep = (double)Qpc::FromMs(cfg_.releasePerSec) * dt / (double)Qpc::Freq();
-            delay_ -= std::min(err * 0.05, maxStep);
+            // Release slowly (bounded playback-speed change).
+            const double step = std::min(gridMode ? err * 0.05 : maxRelease, maxRelease);
+            if (gridMode || TrialMinSlack(delay_ - step) >= margin) delay_ -= step;
         } else if (err < 0) {
             // Slack eroding (e.g. phase drift): approach the margin smoothly (4x faster than release).
-            double maxStep = 4.0 * (double)Qpc::FromMs(cfg_.releasePerSec) * dt / (double)Qpc::Freq();
-            delay_ += std::min(-err * 0.25, maxStep);
+            delay_ += std::min(-err * 0.25, 4.0 * maxRelease);
         }
     }
     lastDecideT_ = s;
     delay_ = std::clamp(delay_, (double)Qpc::FromMs(cfg_.minDelayMs), (double)Qpc::FromMs(cfg_.maxDelayMs));
 
-    // Resolve the pair among frames that actually exist (dropped frames leave gaps).
-    fl = std::floor(x);
-    t = x - fl;
-    if (t <= eps) t = 0;
-    else if (t >= 1.0 - eps && (int64_t)fl + 1 <= newestN_) { fl += 1; t = 0; }
-    int64_t nA = (int64_t)fl;
-    auto itA = ready_.upper_bound(nA);
+    // Resolve the real pair among frames that exist (dropped frames leave gaps), then snap.
+    auto itA = ready_.upper_bound((int64_t)std::floor(x));
     if (itA == ready_.begin()) return d;
-    --itA;                                  // largest n <= nA
-    nA = itA->first;
-    int64_t nB = nA;
+    --itA;                                   // largest existing n <= x
+    int64_t nA = itA->first, nB = nA;
     double tt = 0;
-    if (t > 0) {
-        auto itB = std::next(itA);
-        if (itB != ready_.end()) {
-            nB = itB->first;
-            tt = (x - (double)nA) / (double)(nB - nA);
-            tt = std::clamp(tt, 0.0, 1.0);
-            if (tt <= eps) { tt = 0; nB = nA; }
-        }
+    auto itB = std::next(itA);
+    if (itB != ready_.end()) {
+        tt = std::clamp((x - (double)nA) / (double)(itB->first - nA), 0.0, 1.0);
+        if (tt <= eps) tt = 0;                                     // show A alone
+        else if (tt >= 1.0 - eps) { nA = itB->first; tt = 0; }    // show B alone
+        else nB = itB->first;
     }
     lastX_ = x;
     d.valid = true;
@@ -129,7 +144,6 @@ PaceDecision Pacer::Decide(int64_t s, int64_t V) {
     d.nA = nA; d.nB = nB; d.t = (float)tt;
     d.delayMs = Qpc::ToMs((int64_t)delay_);
     d.displayQpc = V;
-    (void)P;
     return d;
 }
 

@@ -78,8 +78,15 @@ void MfCapture::ListDevices() {
     }
 }
 
-MfCapture::MfCapture() { frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
-MfCapture::~MfCapture() { Stop(); if (frameEvent_) CloseHandle(frameEvent_); }
+MfCapture::MfCapture() {
+    frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    flushEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
+MfCapture::~MfCapture() {
+    Stop();
+    if (frameEvent_) CloseHandle(frameEvent_);
+    if (flushEvent_) CloseHandle(flushEvent_);
+}
 
 STDMETHODIMP MfCapture::QueryInterface(REFIID iid, void** ppv) {
     static const QITAB qit[] = {QITABENT(MfCapture, IMFSourceReaderCallback), {0}};
@@ -176,10 +183,16 @@ void MfCapture::Start() {
 
 void MfCapture::Stop() {
     if (!running_.exchange(false)) return;
-    if (reader_) reader_->Flush((DWORD)MF_SOURCE_READER_ALL_STREAMS);
-    Sleep(50);
+    // Flush completes asynchronously (OnFlush); then wait for any OnReadSample still running
+    // so the callback object is never used after the app deletes it.
+    if (reader_) {
+        ResetEvent(flushEvent_);
+        if (SUCCEEDED(reader_->Flush((DWORD)MF_SOURCE_READER_ALL_STREAMS))) WaitForSingleObject(flushEvent_, 1000);
+    }
+    for (int i = 0; i < 200 && inCallback_.load() > 0; i++) Sleep(5);
     reader_.Reset();
     if (source_) { source_->Shutdown(); source_.Reset(); }
+    for (int i = 0; i < 200 && inCallback_.load() > 0; i++) Sleep(5);
 }
 
 void MfCapture::RequestNext() {
@@ -190,6 +203,7 @@ void MfCapture::RequestNext() {
 
 STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGLONG timestamp, IMFSample* sample) {
     const int64_t arrival = Qpc::Now();
+    struct InFlight { std::atomic<int>& c; InFlight(std::atomic<int>& x) : c(x) { c++; } ~InFlight() { c--; } } guard(inCallback_);
     if (!running_) return S_OK;
     // Issue the next read immediately so the source never starves.
     RequestNext();
@@ -244,7 +258,10 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
     Slot& s = slots_[f.slot];
     {
         std::lock_guard<std::mutex> lk(s.lock);
-        Upload(sample, s, f);
+        if (!Upload(sample, s, f)) {
+            s.seq = 0;   // slot content is undefined now; never publish it
+            return S_OK;
+        }
         s.seq = f.seq;
     }
     f.uploadedQpc = Qpc::Now();
@@ -259,9 +276,9 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
     return S_OK;
 }
 
-void MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
+bool MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
     ComPtr<IMFMediaBuffer> buf;
-    if (FAILED(sample->GetBufferByIndex(0, &buf))) { errors_++; return; }
+    if (FAILED(sample->GetBufferByIndex(0, &buf))) { errors_++; return false; }
     BYTE* base = nullptr;
     LONG pitch = 0;
     ComPtr<IMF2DBuffer> b2d;
@@ -271,17 +288,18 @@ void MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
         locked2d = true;
     } else {
         DWORD maxLen = 0;
-        if (FAILED(buf->Lock(&base, &maxLen, &curLen))) { errors_++; return; }
+        if (FAILED(buf->Lock(&base, &maxLen, &curLen))) { errors_++; return false; }
         pitch = info_.stride ? info_.stride : (LONG)s.planes[0].rowBytes;
         if (pitch < 0) base += (size_t)(-pitch) * (info_.height - 1); // bottom-up contiguous buffer
     }
     // `base` points at scanline 0 (top row); `pitch` may be negative for bottom-up RGB.
     const BYTE* src = base;
+    bool ok = true;
     if (decodeTimecode) DecodeTimecode(base, pitch, f);
     for (int p = 0; p < planeCount_; p++) {
         Plane& pl = s.planes[p];
         D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(dev_->ctx()->Map(pl.tex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { errors_++; break; }
+        if (FAILED(dev_->ctx()->Map(pl.tex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { errors_++; ok = false; break; }
         BYTE* dst = (BYTE*)m.pData;
         if ((LONG)m.RowPitch == pitch && pitch == (LONG)pl.rowBytes) {
             memcpy(dst, src, (size_t)pl.rowBytes * pl.rows);
@@ -293,6 +311,7 @@ void MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
         src = src + (ptrdiff_t)pitch * pl.rows;
     }
     if (locked2d) b2d->Unlock2D(); else buf->Unlock();
+    return ok;
 }
 
 bool DecodeTimecodeFrame(const uint8_t* top, ptrdiff_t pitch, PixFmt fmt, int W, int H, uint32_t* value) {

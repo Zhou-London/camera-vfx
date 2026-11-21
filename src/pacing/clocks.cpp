@@ -82,11 +82,15 @@ void VsyncClock::Run() {
         if (FAILED(output_->WaitForVBlank())) { Sleep(1); continue; }
         int64_t t = Qpc::Now();
         std::lock_guard<std::mutex> lk(m_);
-        // Assign an integer vblank index, robust against missed wakeups.
+        // Assign an integer vblank index. Once the fit is valid, index from the fitted line
+        // (not from the jittery previous wake) so one late wake cannot shift all later indices;
+        // a wake that rounds onto an already-used index is a duplicate and is dropped.
         if (lastT_ != 0) {
-            double per = clock_.Valid() ? clock_.Period() : nominalTicks_;
-            int64_t steps = std::max<int64_t>(1, (int64_t)std::llround((double)(t - lastT_) / per));
-            n += steps;
+            int64_t idx;
+            if (clock_.Valid()) idx = (int64_t)std::llround(clock_.IndexAt((double)t));
+            else idx = n + std::max<int64_t>(1, (int64_t)std::llround((double)(t - lastT_) / nominalTicks_));
+            if (idx <= n) { lastT_ = t; continue; }
+            n = idx;
         }
         lastT_ = t;
         clock_.Add(n, t);

@@ -64,11 +64,11 @@ int RunSelfTest(const Options& o) {
         for (auto& f : *st) f.rgb = dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
         return st;
     };
-    struct Gen { std::string name; std::unique_ptr<Interpolator> interp; std::unique_ptr<VfxChain> vfx; std::unique_ptr<Store> store; };
+    struct Gen { std::string name; std::unique_ptr<Store> store; std::unique_ptr<Interpolator> interp; std::unique_ptr<VfxChain> vfx; };  // store first: destroyed last
     std::vector<Gen> gens;
-    gens.push_back({"blend", CreateBlendInterpolator(), nullptr, makeStore()});
+    gens.push_back({"blend", makeStore(), CreateBlendInterpolator(), nullptr});
     for (int q = 0; q <= 2; q++)
-        if (auto f = CreateFlowInterpolator(q)) gens.push_back({"nvof-q" + std::to_string(q), std::move(f), nullptr, makeStore()});
+        if (auto f = CreateFlowInterpolator(q)) gens.push_back({"nvof-q" + std::to_string(q), makeStore(), std::move(f), nullptr});
     for (int mode = 0; mode <= 2; mode++) {
         Gen g; g.name = "vfx-fg-mode" + std::to_string(mode);
         g.vfx = std::make_unique<VfxChain>();

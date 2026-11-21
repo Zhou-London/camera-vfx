@@ -122,6 +122,10 @@ private:
     Device::Tex interpOut_;          // src res, RGBA8
     Device::Tex vpOut_;              // out res, BGRA8 or R10G10B10A2
     UINT srcW_ = 0, srcH_ = 0, outW_ = 0, outH_ = 0;
+    UINT rtxInW_ = 0, rtxInH_ = 0;   // input size of the RTX video processor stage
+    bool haveSlot_ = false;
+    ComPtr<ID3D11Query> doneQ_;      // GPU completion of the last submitted frame
+    uint64_t gpuBusyAtPresent_ = 0;          // swap-chain waitable consumed but not yet presented
     bool interpOn_ = true, srOn_ = true;
     bool hdrOut_ = false;
 

@@ -74,6 +74,8 @@ public:
 
     double DelayMs() const { return Qpc::ToMs((int64_t)delay_); }
     uint64_t LateCount() const { return lateCount_; }
+    uint64_t StallCount() const { return stallCount_; }
+    void SetMode(PaceMode m) { cfg_.mode = m; }
     double MinSlackMs() const { return minSlackMs_; }
 
 private:
@@ -83,12 +85,16 @@ private:
     std::map<int64_t, int64_t> ready_;   // n -> ready QPC (recent)
     int64_t newestN_ = -1;
     double delay_ = 0;                   // QPC ticks
-    std::deque<std::pair<int64_t, double>> slack_; // (render time, slack ticks)
+    struct SlackSample { int64_t s; int64_t V; double slackMinusD; double raw; };
+    std::deque<SlackSample> slack_;   // window of measured slack (ticks)
+    double TrialMinSlack(double trialDelay) const;
     int64_t lastDecideT_ = 0;
     double lastX_ = -1;
     double vrrX_ = -1;
     uint64_t lateCount_ = 0;
     int64_t lastLateT_ = 0;
+    int64_t lastLateNeed_ = -1;
+    uint64_t stallCount_ = 0;
     double minSlackMs_ = 0;
 };
 

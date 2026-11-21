@@ -45,6 +45,7 @@ bool RtxVideo::Init(Device& dev, UINT inW, UINT inH, DXGI_FORMAT inFmt, UINT out
         struct { UINT version; UINT method; UINT enable; } ext = {0x1, 0x2, 1};
         HRESULT hr = vctx_->VideoProcessorSetStreamExtension(vp_.Get(), 0, &kNvidiaPPEInterfaceGUID, sizeof(ext), &ext);
         vsrOk_ = SUCCEEDED(hr);
+        vsrWanted_ = vsrOn_ = vsrOk_;
         if (vsrOk_) LOGI("RTX Video Super Resolution: enabled (%ux%u -> %ux%u)", inW, inH, outW, outH);
         else LOGW("RTX VSR extension rejected: %s", HrToString(hr).c_str());
     }
@@ -59,6 +60,12 @@ bool RtxVideo::Init(Device& dev, UINT inW, UINT inH, DXGI_FORMAT inFmt, UINT out
         }
     }
     return true;
+}
+
+void RtxVideo::SetVsr(bool on) {
+    if (!vsrWanted_ || on == vsrOn_) return;
+    struct { UINT version; UINT method; UINT enable; } ext = {0x1, 0x2, on ? 1u : 0u};
+    if (SUCCEEDED(vctx_->VideoProcessorSetStreamExtension(vp_.Get(), 0, &kNvidiaPPEInterfaceGUID, sizeof(ext), &ext))) vsrOn_ = on;
 }
 
 ID3D11VideoProcessorInputView* RtxVideo::InView(ID3D11Texture2D* t) {

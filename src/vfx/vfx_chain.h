@@ -34,7 +34,12 @@ public:
     // Copies a freshly converted source frame (D3D) into its CUDA slot.
     void Ingest(const SourceFrame& f);
     // Runs the chain for frame A (and B,t if B != null) and returns the D3D output texture.
-    const Device::Tex* Process(const SourceFrame& A, const SourceFrame* B, float t, bool srOn);
+    // `external` (optional): an already interpolated D3D frame (source size, RGBA8) to run
+    // HDR/SR on instead of A (used when a D3D interpolator is combined with VFX SR/HDR).
+    const Device::Tex* Process(const SourceFrame& A, const SourceFrame* B, float t, bool srOn,
+                               const Device::Tex* external = nullptr);
+    bool LastFgRan() const;       // did the last Process() actually generate a frame?
+    bool LastOutputPq() const;    // is the last output HDR10 (PQ) or SDR?
     // Stage GPU times (ms) of completed frames since the last call.
     std::vector<std::pair<const char*, double>> PopTimings();
 private:

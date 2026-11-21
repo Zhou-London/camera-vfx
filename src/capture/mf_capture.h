@@ -83,7 +83,7 @@ public:
     STDMETHODIMP_(ULONG) Release() override { ULONG r = --ref_; return r; } // owned by app, not deleted via COM
     // IMFSourceReaderCallback
     STDMETHODIMP OnReadSample(HRESULT hrStatus, DWORD streamIndex, DWORD flags, LONGLONG timestamp, IMFSample* sample) override;
-    STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
+    STDMETHODIMP OnFlush(DWORD) override { SetEvent(flushEvent_); return S_OK; }
     STDMETHODIMP OnEvent(DWORD, IMFMediaEvent*) override { return S_OK; }
 
     ~MfCapture();
@@ -97,7 +97,7 @@ private:
         uint64_t seq = 0;
     };
     bool CreateSlots();
-    void Upload(IMFSample* sample, Slot& s, RawFrame& f);
+    bool Upload(IMFSample* sample, Slot& s, RawFrame& f);
     void DecodeTimecode(const BYTE* top, LONG pitch, RawFrame& f) const;
     void RequestNext();
 
@@ -111,6 +111,8 @@ private:
     RawFrame latest_;
     std::vector<RawFrame> pending_;
     HANDLE frameEvent_ = nullptr;
+    HANDLE flushEvent_ = nullptr;
+    std::atomic<int> inCallback_{0};
     int64_t firstSampleTime_ = -1;
     int64_t lastIndex_ = -1;
     double periodHns_ = 0;        // measured frame period (100 ns units)

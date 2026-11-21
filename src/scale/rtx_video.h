@@ -23,6 +23,8 @@ public:
     // Process `in` (full frame) into `out` (any texture with RENDER_TARGET bind, outW x outH).
     bool Process(ID3D11Texture2D* in, ID3D11Texture2D* out);
     bool vsrActive() const { return vsrOk_; }
+    // Follow a runtime SR toggle (re-sends the stream extension only on change).
+    void SetVsr(bool on);
     bool hdrActive() const { return hdrOk_; }
 private:
     ID3D11VideoProcessorInputView* InView(ID3D11Texture2D* t);
@@ -35,7 +37,7 @@ private:
     std::unordered_map<ID3D11Texture2D*, ComPtr<ID3D11VideoProcessorInputView>> inViews_;
     std::unordered_map<ID3D11Texture2D*, ComPtr<ID3D11VideoProcessorOutputView>> outViews_;
     UINT inW_ = 0, inH_ = 0, outW_ = 0, outH_ = 0;
-    bool vsrOk_ = false, hdrOk_ = false;
+    bool vsrOk_ = false, hdrOk_ = false, vsrWanted_ = false, vsrOn_ = false;
 };
 
 } // namespace camss

@@ -4,6 +4,7 @@
 #include "nvTransferD3D11.h"
 #include <array>
 #include <filesystem>
+#include <unordered_map>
 
 // Used by NVVideoEffectsProxy.cpp to locate the runtime.
 char* g_nvVFXSDKPath = nullptr;
@@ -78,7 +79,12 @@ struct VfxImpl {
     // Output D3D textures (one per possible final format/size) + interop images.
     Device::Tex outTex[2];              // [0] = out res, [1] = src res (SR toggled off)
     NvCVImage outD3d[2];
+    bool outIsPq[2] = {false, false};   // per output texture: HDR10 (PQ) or SDR content
     Device::Tex packedTex[2];           // R32_UINT interop targets for RGB10A2 output
+    // External D3D inputs (e.g. an NVOF/blend interpolated frame) for SR/HDR-only chains.
+    std::unordered_map<ID3D11Texture2D*, std::unique_ptr<NvCVImage>> extD3d;
+    NvCVImage extGpu;
+    bool lastFgRan = false, lastPq = false;
     ComPtr<ID3D11ComputeShader> unpackCS;
     ComPtr<ID3D11Buffer> unpackCB;
     bool outPq = false;
@@ -93,6 +99,12 @@ struct VfxImpl {
 
     ~VfxImpl() {
         for (Effect* e : {&fg, &hdr, &sr}) if (e->h) { NvVFX_DestroyEffect(e->h); e->h = nullptr; }
+        // Unregister every CUDA-registered D3D texture while the textures still exist
+        // (members would otherwise be destroyed in an order that frees textures first).
+        for (auto& im : d3dSrc) NvCVImage_Dealloc(&im);
+        for (auto& im : outD3d) NvCVImage_Dealloc(&im);
+        for (auto& kv : extD3d) NvCVImage_Dealloc(kv.second.get());
+        if (rt.destroy) for (auto& f : ev) for (auto& e : f) if (e) rt.destroy(e);
         if (stream) NvVFX_CudaStreamDestroy(stream);
     }
 
@@ -291,9 +303,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         p.unpackCS = dev.CompileCS(kUnpackCS, "main", "unpack_rgb10a2_cs");
         p.unpackCB = dev.CreateConstantBuffer(16);
     }
-    auto makeOut = [&](int i, UINT w, UINT h) -> bool {
-        p.outTex[i] = dev.CreateTex(w, h, of, true, true);
-        if (!p.outPq) { VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.outTex[i].tex.Get())); return true; }
+    auto makeOut = [&](int i, UINT w, UINT h, bool pq) -> bool {
+        p.outIsPq[i] = pq;
+        p.outTex[i] = dev.CreateTex(w, h, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+        if (!pq) { VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.outTex[i].tex.Get())); return true; }
         p.packedTex[i] = dev.CreateTex(w, h, DXGI_FORMAT_R32_UINT, true, false);
         VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.packedTex[i].tex.Get()));
         p.outD3d[i].pixelFormat = ref10.pixelFormat;
@@ -303,8 +316,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         p.outD3d[i].numComponents = ref10.numComponents;
         return true;
     };
-    if (!makeOut(0, ow, oh)) return false;
-    if (cfg.sr && !makeOut(1, sw, sh)) return false;
+    // [0]: normal output. [1]: SR toggled off at runtime (source size); with TrueHDR placed
+    // after SR that path carries SDR content, so it gets an SDR texture.
+    if (!makeOut(0, ow, oh, cfg.hdr)) return false;
+    if (cfg.sr && !makeOut(1, sw, sh, cfg.hdr && hdrAtSrc)) return false;
+    (void)of;
     VFX_CHECK(NvCVImage_Alloc(&p.tmp, ow, oh, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32));
 
     if (p.cfg.profile)
@@ -314,6 +330,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 void VfxChain::Ingest(const SourceFrame& f) {
     VfxImpl& p = *p_;
+    if (f.n < 0) return;
     int k = (int)(f.n % p.storeCount);
     p.dev->ctx()->Flush();                       // make the colour conversion visible to CUDA
     if (NvCVImage_MapResource(&p.d3dSrc[k], p.stream) != NVCV_SUCCESS) { LOGE("VFX map src failed"); return; }
@@ -323,24 +340,43 @@ void VfxChain::Ingest(const SourceFrame& f) {
     p.gpuN[k] = f.n;
 }
 
-const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B, float t, bool srOn) {
+bool VfxChain::LastFgRan() const { return p_->lastFgRan; }
+bool VfxChain::LastOutputPq() const { return p_->lastPq; }
+
+const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B, float t, bool srOn, const Device::Tex* external) {
     VfxImpl& p = *p_;
+    p.lastFgRan = false;
+    p.lastPq = false;
     if (p.cfg.profile) p.CollectTimings();
+    if (A.n < 0 || (B && B->n < 0)) return nullptr;
     int ka = (int)(A.n % p.storeCount);
-    if (p.gpuN[ka] != A.n) return nullptr;
-    NvCVImage* cur = &p.gpuSrc[ka];
-    bool started = false;
-    auto startEv = [&] {
-        if (!started && p.cfg.profile) {
-            if (p.evPending[p.evFrame]) { started = false; return; }
-            p.Record(0);
-            started = true;
+    NvCVImage* cur = nullptr;
+    if (external) {
+        // An already generated frame from a D3D interpolator: bring it into CUDA once.
+        auto& img = p.extD3d[external->tex.Get()];
+        if (!img) {
+            img = std::make_unique<NvCVImage>();
+            if (NvCVImage_InitFromD3D11Texture(img.get(), external->tex.Get()) != NVCV_SUCCESS ||
+                NvCVImage_Alloc(&p.extGpu, external->w, external->h, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32) != NVCV_SUCCESS) {
+                LOGE("VFX: cannot register external input texture");
+                return nullptr;
+            }
         }
-    };
-    startEv();
+        p.dev->ctx()->Flush();
+        if (NvCVImage_MapResource(img.get(), p.stream) != NVCV_SUCCESS) return nullptr;
+        NvCV_Status s = NvCVImage_Transfer(img.get(), &p.extGpu, 1.f, p.stream, nullptr);
+        NvCVImage_UnmapResource(img.get(), p.stream);
+        if (s != NVCV_SUCCESS) return nullptr;
+        cur = &p.extGpu;
+    } else {
+        if (p.gpuN[ka] != A.n) return nullptr;
+        cur = &p.gpuSrc[ka];
+    }
+    bool started = false;
+    if (p.cfg.profile && !p.evPending[p.evFrame]) { p.Record(0); started = true; }
 
     // 1) frame generation at source resolution
-    if (p.fg.h && B && t > 0.f) {
+    if (!external && p.fg.h && B && t > 0.f) {
         int kb = (int)(B->n % p.storeCount);
         if (p.gpuN[kb] == B->n) {
             if (A.n != p.lastPairA || B->n != p.lastPairB) {
@@ -352,36 +388,41 @@ const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B,
             }
             NvVFX_SetF32(p.fg.h, kFgTimestep, std::clamp(t, 0.001f, 0.999f));
             NvCV_Status s = NvVFX_Run(p.fg.h, 0);
-            if (s == NVCV_SUCCESS) cur = &p.fgOut;
+            if (s == NVCV_SUCCESS) { cur = &p.fgOut; p.lastFgRan = true; }
             else LOGW("VideoFrameGeneration run failed: %d (%s)", (int)s, NvCV_GetErrorStringFromCode(s));
         }
     }
     if (started) p.Record(1);
 
     const bool hdrAtSrc = p.cfg.hdr && (p.cfg.hdrBeforeSr || !p.cfg.sr);
+    bool pq = false;
     // 2) TrueHDR at source resolution
     if (p.hdr.h && hdrAtSrc) {
         NvVFX_SetImage(p.hdr.h, NVVFX_INPUT_IMAGE, cur);
-        if (NvVFX_Run(p.hdr.h, 0) == NVCV_SUCCESS) cur = &p.hdrOut;
+        if (NvVFX_Run(p.hdr.h, 0) == NVCV_SUCCESS) { cur = &p.hdrOut; pq = true; }
     }
     if (started) p.Record(2);
 
-    // 3) super resolution
+    // 3) super resolution (+ TrueHDR at output resolution when configured after SR)
     bool scaled = false;
     if (p.sr.h && srOn) {
         if (cur != p.lastSrIn) { NvVFX_SetImage(p.sr.h, NVVFX_INPUT_IMAGE, cur); p.lastSrIn = cur; }
         if (NvVFX_Run(p.sr.h, 0) == NVCV_SUCCESS) { cur = &p.srOut; scaled = true; }
-        // TrueHDR after SR (at output resolution)
-        if (p.hdr.h && !hdrAtSrc) {
+        if (p.hdr.h && !hdrAtSrc && scaled) {
             NvVFX_SetImage(p.hdr.h, NVVFX_INPUT_IMAGE, cur);
-            if (NvVFX_Run(p.hdr.h, 0) == NVCV_SUCCESS) cur = &p.hdrOut;
+            if (NvVFX_Run(p.hdr.h, 0) == NVCV_SUCCESS) { cur = &p.hdrOut; pq = true; }
         }
     }
     if (started) p.Record(3);
 
-    // 4) hand the result to D3D
-    int oi = (p.cfg.sr && !scaled) ? 1 : 0;
-    // HDR enabled but SR toggled off with HDR-after-SR: output isn't PQ; keep it simple and require consistency.
+    // 4) hand the result to D3D: [0] = configured output, [1] = SR toggled off (source size)
+    const int oi = (p.cfg.sr && !scaled) ? 1 : 0;
+    if (pq != p.outIsPq[oi]) {
+        static int warned = 0;
+        if (warned++ < 3) LOGE("VFX: output encoding mismatch (HDR stage failed?)");
+        if (started) { p.Record(4); p.Record(5); p.evPending[p.evFrame] = true; p.evFrame = (p.evFrame + 1) % VfxImpl::kRing; }
+        return nullptr;
+    }
     NvCVImage& dst = p.outD3d[oi];
     if (NvCVImage_MapResource(&dst, p.stream) != NVCV_SUCCESS) { LOGE("VFX map out failed"); return nullptr; }
     NvCV_Status s = NvCVImage_Transfer(cur, &dst, 1.f, p.stream, &p.tmp);
@@ -393,8 +434,8 @@ const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B,
         if (warned++ < 3) LOGE("VFX output transfer failed: %d (%s)", (int)s, NvCV_GetErrorStringFromCode(s));
         return nullptr;
     }
-    if (p.outPq) {
-        // Unpack the R32_UINT staging texture into R10G10B10A2_UNORM (D3D side, after unmap).
+    if (pq) {
+        // Unpack the R32_UINT interop texture into R10G10B10A2_UNORM (D3D side, after unmap).
         auto* ctx = p.dev->ctx();
         const Device::Tex& o = p.outTex[oi];
         struct { UINT w, h, pad[2]; } cb{o.w, o.h, {0, 0}};
@@ -406,6 +447,7 @@ const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B,
         ctx->Dispatch((o.w + 15) / 16, (o.h + 7) / 8, 1);
         p.dev->ClearCS();
     }
+    p.lastPq = pq;
     return &p.outTex[oi];
 }
 
