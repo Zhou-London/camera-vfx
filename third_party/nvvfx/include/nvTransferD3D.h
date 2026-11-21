@@ -14,7 +14,9 @@
 #define __NVTRANSFER_D3D_H__
 
 #ifndef _WINDOWS_
-  #define WIN32_LEAN_AND_MEAN
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif // WIN32_LEAN_AND_MEAN
   #include <Windows.h>
 #endif // _WINDOWS_
 #include <dxgitype.h>
@@ -33,7 +35,7 @@ extern "C" {
 //! \param[out] d3dFormat a place to store the corresponding D3D format.
 //! \return     NVCV_SUCCESS if successful.
 //! \note       This is an experimental API. If you find it useful, please respond to XXX@YYY.com, otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_ToD3DFormat(NvCVImage_PixelFormat format, NvCVImage_ComponentType type, unsigned layout, DXGI_FORMAT *d3dFormat);
+NvCV_Status NvCV_API NvCVImage_ToD3DFormat(NvCVImage_PixelFormat format, NvCVImage_ComponentType type, unsigned layout, DXGI_FORMAT *d3dFormat);
 
 
 //! Utility to determine the NvCVImage format, component type and layout from a D3D format.
@@ -43,7 +45,7 @@ extern "C" {
 //! \param[out] layout    a place to store the NvCVImage layout.
 //! \return     NVCV_SUCCESS if successful.
 //! \note       This is an experimental API. If you find it useful, please respond to XXX@YYY.com, otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_FromD3DFormat(DXGI_FORMAT d3dFormat, NvCVImage_PixelFormat *format, NvCVImage_ComponentType *type, unsigned char *layout);
+NvCV_Status NvCV_API NvCVImage_FromD3DFormat(DXGI_FORMAT d3dFormat, NvCVImage_PixelFormat *format, NvCVImage_ComponentType *type, unsigned char *layout);
 
 
 #ifdef __dxgicommon_h__
@@ -54,7 +56,7 @@ extern "C" {
 //! \return     NVCV_SUCCESS          if successful.
 //! \return     NVCV_ERR_PIXELFORMAT  if there is no equivalent color space.
 //! \note       This is an experimental API. If you find it useful, please respond to XXX@YYY.com, otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_ToD3DColorSpace(unsigned char nvcvColorSpace, DXGI_COLOR_SPACE_TYPE *pD3dColorSpace);
+NvCV_Status NvCV_API NvCVImage_ToD3DColorSpace(unsigned char nvcvColorSpace, DXGI_COLOR_SPACE_TYPE *pD3dColorSpace);
 
 
 //! Utility to determine the NvCVImage color space from the D3D color space.
@@ -63,7 +65,7 @@ extern "C" {
 //! \return     NVCV_SUCCESS          if successful.
 //! \return     NVCV_ERR_PIXELFORMAT  if there is no equivalent color space.
 //! \note       This is an experimental API. If you find it useful, please respond to XXX@YYY.com, otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_FromD3DColorSpace(DXGI_COLOR_SPACE_TYPE d3dColorSpace, unsigned char *pNvcvColorSpace);
+NvCV_Status NvCV_API NvCVImage_FromD3DColorSpace(DXGI_COLOR_SPACE_TYPE d3dColorSpace, unsigned char *pNvcvColorSpace);
 
 #endif // __dxgicommon_h__
 

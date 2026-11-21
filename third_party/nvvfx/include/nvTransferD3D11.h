@@ -33,7 +33,7 @@ extern "C" {
 //! \return         NVCV_SUCCESS if successful.
 //! \note           This is an experimental API. If you find it useful, please respond to XXX@YYY.com,
 //!                 otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_InitFromD3D11Texture(NvCVImage *im, struct ID3D11Texture2D *tx);
+NvCV_Status NvCV_API NvCVImage_InitFromD3D11Texture(NvCVImage *im, struct ID3D11Texture2D *tx);
 
 
 

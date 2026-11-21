@@ -41,7 +41,7 @@ cmd /c "tools\vcenv.cmd cmake --build build"
 
 ### NVIDIA Video Effects 1.3 运行时
 
-补帧、超分和 TrueHDR 要用 VFX SDK **1.3** 的运行时。本机 Program Files 里装的是 0.7.6，没有这三个特效。1.3 运行时取自 NVIDIA 官方 pip 源的 `nvidia-vfx` wheel（`https://pypi.nvidia.com/nvidia-vfx/`，免登录，所有 DLL 都有 NVIDIA 签名）。解出的 `nvvfx/libs/*` 放在 `third_party/nvvfx_runtime/`，该目录已在 `.gitignore` 中，不入库。
+补帧、超分和 TrueHDR 要用 VFX SDK **1.3** 的运行时。本机 Program Files 里装的是 0.7.6，没有这三个特效。1.3 运行时取自 NVIDIA 官方 pip 源的 `nvidia-vfx` wheel（`https://pypi.nvidia.com/nvidia-vfx/`，免登录，所有 DLL 都有 NVIDIA 签名）。解出的 `nvvfx/libs/*` 放在 `third_party/nvvfx_runtime/`，该目录已在 `.gitignore` 中，不入库。它的核心 DLL 与 SDK 1.3.0 包 `bin/` 里的版本、大小、签名者都相同；三个特效的 DLL 在 SDK 包里没有（要用 SDK 的 `features/install_feature.ps1` 配 NGC API 密钥下载），所以运行时仍取自 pip 包。启动日志会打印运行时版本和编译用的头文件版本，不一致时警告。
 
 程序按以下顺序查找运行时：
 1. 环境变量 `CAMSS_VFX_RUNTIME`
@@ -49,7 +49,7 @@ cmd /c "tools\vcenv.cmd cmake --build build"
 3. 构建时的 `third_party/nvvfx_runtime`
 
 许可：
-* 头文件（`third_party/nvvfx/include` 为 0.7.6，MIT；`third_party/nvof` 为 MIT）可以随源码分发。
+* 头文件和 proxy（`third_party/nvvfx`，取自 VFX SDK 1.3.0 Windows 包，MIT；`third_party/nvof`，MIT）可以随源码分发。特效专用的参数名（如补帧的 `Timestep`）在各特效插件自带的头文件里，SDK 核心包不含，代码里按 1.3 插件的取值定义。
 * 运行时 DLL 受 NVIDIA Software License Agreement 和 AI 产品附加条款约束（PDF 见 `third_party/nvvfx_runtime/licenses/`）。**要对外分发时需要另行确认再分发条款。**
 
 ## 运行

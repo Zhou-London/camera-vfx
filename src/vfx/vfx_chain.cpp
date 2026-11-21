@@ -2,31 +2,34 @@
 #include "nvVideoEffects.h"
 #include "nvCVImage.h"
 #include "nvTransferD3D11.h"
+#include "videofx_version.h"
 #include <array>
 #include <filesystem>
 #include <unordered_map>
 
-// Used by NVVideoEffectsProxy.cpp to locate the runtime.
+// Used by nvVideoEffectsProxy.cpp to locate the runtime.
 char* g_nvVFXSDKPath = nullptr;
 
 namespace camss {
 
-// ---- selectors / parameters of VFX SDK 1.x effects (headers for these ship only in
-// the login-gated SDK core; values taken from the SDK samples and the runtime itself).
+// ---- VFX SDK 1.3 core headers (third_party/nvvfx/include) provide the generic parameters and
+// the RGB10A2 / P32 image formats. The effect selectors and effect-specific parameters are
+// declared in the per-feature headers that come with each feature plugin (installed from NGC);
+// the values below match the 1.3 feature plugins and the SDK samples.
 static const char* kFxFrameGen = "VideoFrameGeneration";
 static const char* kFxVideoSuperRes = "VideoSuperRes";
 static const char* kFxTrueHdr = "TrueHDR";
-static const char* kInputWidth = "InputWidth";
-static const char* kInputHeight = "InputHeight";
+static const char* kInputWidth = NVVFX_INPUT_WIDTH;
+static const char* kInputHeight = NVVFX_INPUT_HEIGHT;
 static const char* kQualityLevel = "QualityLevel";
 static const char* kImageEncodingMode = "ImageEncodingMode";
-static const char* kFgMode = "Mode";
+static const char* kFgMode = NVVFX_MODE;
 static const char* kFgFrameMultiplier = "FrameMultiplier";
 static const char* kFgTimestep = "Timestep";
 static const char* kFgShotChange = "ShotChange";
 static const char* kFgAutoShotChange = "AutomaticShotChangeDetectionEnabled";
-static const NvCVImage_PixelFormat kNVCV_RGB10A2 = (NvCVImage_PixelFormat)13;
-static const NvCVImage_ComponentType kNVCV_P32 = (NvCVImage_ComponentType)11;
+static const NvCVImage_PixelFormat kNVCV_RGB10A2 = NVCV_RGB10A2;
+static const NvCVImage_ComponentType kNVCV_P32 = NVCV_P32;
 static const unsigned kEncRGB8 = 0, kEncRGB10A2 = 1;
 
 #define VFX_CHECK(expr) do { NvCV_Status _s = (expr); if (_s != NVCV_SUCCESS) { \
@@ -185,7 +188,18 @@ static bool LoadVfxRuntime() {
     }
     unsigned ver = 0;
     NvVFX_GetVersion(&ver);
-    LOGI("VFX runtime %u.%u.%u.%u from %s", ver >> 24, (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff, dirA.c_str());
+    LOGI("VFX runtime %u.%u.%u.%u from %s (built with SDK headers %s)", ver >> 24, (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff,
+         dirA.c_str(), NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING);
+    if ((ver >> 24) != NVIDIA_VIDEOEFFECTS_SDK_VERSION_MAJOR || ((ver >> 16) & 0xff) != NVIDIA_VIDEOEFFECTS_SDK_VERSION_MINOR)
+        LOGW("VFX runtime %u.%u does not match the SDK headers %s; effects may fail to load", ver >> 24, (ver >> 16) & 0xff,
+             NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING_MAJOR_MINOR);
+    // Route the SDK's own warnings and errors into the camss log (thread-safe, any thread).
+    NvVFX_ConfigureLogger(NVCV_LOG_WARNING, nullptr, [](void*, const char* msg) {
+        if (!msg) return;
+        std::string m(msg);
+        while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.pop_back();
+        LOGW("VFX SDK: %s", m.c_str());
+    }, nullptr);
     state = 1;
     return true;
 }

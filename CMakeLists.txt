@@ -30,7 +30,7 @@ set(CAMSS_SOURCES
   src/interp/nvof_interp.cpp
   src/scale/rtx_video.cpp
   src/vfx/vfx_chain.cpp
-  third_party/nvvfx/src/NVVideoEffectsProxy.cpp
+  third_party/nvvfx/src/nvVideoEffectsProxy.cpp
   third_party/nvvfx/src/nvCVImageProxy.cpp
 )
 

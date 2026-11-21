@@ -30,19 +30,11 @@
 #ifdef _WIN32
   #define _WINSOCKAPI_
   #include <windows.h>
-  #include <tchar.h>
 #else // !_WIN32
   #include <dlfcn.h>
   typedef void* HMODULE;
   typedef void* HANDLE;
   typedef void* HINSTANCE;
-#endif // _WIN32
-
-// Parameter string does not include the file extension
-#ifdef _WIN32
-  #define nvLoadLibrary(library) LoadLibrary(TEXT(library ".dll"))
-#else // !_WIN32
-  #define nvLoadLibrary(library) dlopen("lib" library ".so", RTLD_LAZY)
 #endif // _WIN32
 
 
@@ -63,40 +55,54 @@ inline int nvFreeLibrary(HINSTANCE handle) {
 #endif // _WIN32
 }
 
-HINSTANCE getNvVfxLib() {
+static std::wstring Utf8ToWide(const char* utf8_str) {
+  if (!utf8_str || !utf8_str[0]) return std::wstring();
+  int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_str, -1, nullptr, 0);
+  if (wide_len <= 0) return std::wstring();
+  std::wstring wide(wide_len, L'\0');
+  int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_str, -1, &wide[0], wide_len);
+  if (n <= 0 || n != wide_len) return std::wstring();
+  wide.resize(static_cast<size_t>(wide_len - 1));
+  return wide;
+}
 
-  TCHAR path[MAX_PATH], fullPath[MAX_PATH];
-  bool bSDKPathSet = false;
+HINSTANCE getNvVfxLib() {
+  bool sdk_path_set = false;
 
   extern char* g_nvVFXSDKPath;
   if (g_nvVFXSDKPath && g_nvVFXSDKPath[0]) {
-#ifndef UNICODE
-    strncpy_s(fullPath, MAX_PATH, g_nvVFXSDKPath, MAX_PATH);
-    
-#else // !UNICODE
-    size_t res = 0;
-    mbstowcs_s(&res, fullPath, MAX_PATH, g_nvVFXSDKPath, MAX_PATH);
-#endif // UNICODE
-    SetDllDirectory(fullPath);
-    bSDKPathSet = true;
+    std::wstring wide_path = Utf8ToWide(g_nvVFXSDKPath);
+    if (!wide_path.empty()) {
+      SetDllDirectoryW(wide_path.c_str());
+      sdk_path_set = true;
+    }
   }
 
-  if (!bSDKPathSet) {
+  if (!sdk_path_set) {
     // There can be multiple apps on the system,
     // some might include the SDK in the app package and
     // others might expect the SDK to be installed in Program Files
-    GetEnvironmentVariable(TEXT("NV_VIDEO_EFFECTS_PATH"), path, MAX_PATH);
-    if (_tcscmp(path, TEXT("USE_APP_PATH"))) {
-      // App has not set environment variable to "USE_APP_PATH"
-      // So pick up the SDK dll and dependencies from Program Files
-      GetEnvironmentVariable(TEXT("ProgramFiles"), path, MAX_PATH);
-      size_t max_len = sizeof(fullPath) / sizeof(TCHAR);
-      _stprintf_s(fullPath, max_len, TEXT("%s\\NVIDIA Corporation\\NVIDIA Video Effects\\"), path);
-      SetDllDirectory(fullPath);
+    DWORD len = GetEnvironmentVariableW(L"NV_VIDEO_EFFECTS_PATH", nullptr, 0);
+    std::wstring env_path;
+    if (len > 0) {
+      env_path.resize(len);
+      GetEnvironmentVariableW(L"NV_VIDEO_EFFECTS_PATH", &env_path[0], len);
+      env_path.resize(len - 1);
+    }
+    if (env_path != L"USE_APP_PATH") {
+      len = GetEnvironmentVariableW(L"ProgramFiles", nullptr, 0);
+      std::wstring prog_files;
+      if (len > 0) {
+        prog_files.resize(len);
+        GetEnvironmentVariableW(L"ProgramFiles", &prog_files[0], len);
+        prog_files.resize(len - 1);
+      }
+      std::wstring full_path = prog_files + L"\\NVIDIA Corporation\\NVIDIA Video Effects\\";
+      SetDllDirectoryW(full_path.c_str());
     }
   }
-  
-  static const HINSTANCE NvVfxLib = nvLoadLibrary("NVVideoEffects");
+
+  static const HINSTANCE NvVfxLib = LoadLibraryW(L"NVVideoEffects.dll");
   return NvVfxLib;
 }
 
@@ -281,6 +287,22 @@ NvCV_Status NvVFX_API NvVFX_CudaStreamDestroy(CUstream stream) {
 
   if (nullptr == funcPtr) return NVCV_ERR_LIBRARY;
   return funcPtr(stream);
+}
+
+NvCV_Status NvVFX_API NvVFX_CudaStreamSynchronize(CUstream stream) {
+  static const auto funcPtr =
+      (decltype(NvVFX_CudaStreamSynchronize)*)nvGetProcAddress(getNvVfxLib(), "NvVFX_CudaStreamSynchronize");
+
+  if (nullptr == funcPtr) return NVCV_ERR_LIBRARY;
+  return funcPtr(stream);
+}
+
+NvCV_Status NvVFX_API NvVFX_ConfigureLogger(int verbosity, const char* file, void (*cb)(void*, const char*), void* cb_data) {
+  static const auto funcPtr =
+      (decltype(NvVFX_ConfigureLogger)*)nvGetProcAddress(getNvVfxLib(), "NvVFX_ConfigureLogger");
+
+  if (nullptr == funcPtr) return NVCV_ERR_LIBRARY;
+  return funcPtr(verbosity, file, cb, cb_data);
 }
 
 NvCV_Status NvVFX_API NvVFX_AllocateState(NvVFX_Handle obj, NvVFX_StateObjectHandle* handle) {

@@ -58,6 +58,7 @@ typedef enum NvCVImage_PixelFormat {
   NVCV_YUV422          = 11,   //!< Luminance and subsampled Chrominance { Y, Cb, Cr }
 #endif // !RTX_CAMERA_IMAGE
   NVCV_YUV444          = 12,   //!< Luminance and full bandwidth Chrominance { Y, Cb, Cr }
+  NVCV_RGB10A2         = 13,   //!< Packed R10G10B10A2 unsigned normalized. Used with NVCV_P32.
 } NvCVImage_PixelFormat;
 
 
@@ -74,6 +75,7 @@ typedef enum NvCVImage_ComponentType {
   NVCV_U64           = 8,      //!< Unsigned 64-bit integer.
   NVCV_S64           = 9,      //!< Signed 64-bit integer.
   NVCV_F64           = 10,     //!< 64-bit floating-point (double).
+  NVCV_P32           = 11,     //!< Packed 32-bit pixel.
 } NvCVImage_ComponentType;
 
 
@@ -371,12 +373,12 @@ void NvCV_API NvCVImage_ComponentOffsets(NvCVImage_PixelFormat format, int *rOff
 //!    +-------------------+-------------+-------------+-------------+-------------+
 //!    |                   |  u8 --> u8  |  u8 --> f32 | f32 --> u8  | f32 --> f32 |
 //!    +-------------------+-------------+-------------+-------------+-------------+
-//!    | Y      --> Y      |      X      |             |      X      |      X      |
-//!    | Y      --> A      |      X      |             |      X      |      X      |
+//!    | Y      --> Y      |      X      |      X      |      X      |      X      |
+//!    | Y      --> A      |      X      |      X      |      X      |      X      |
 //!    | Y      --> RGB    |      X      |      X      |      X      |      X      |
 //!    | Y      --> RGBA   |      X      |      X      |      X      |      X      |
-//!    | A      --> Y      |      X      |             |      X      |      X      |
-//!    | A      --> A      |      X      |             |      X      |      X      |
+//!    | A      --> Y      |      X      |      X      |      X      |      X      |
+//!    | A      --> A      |      X      |      X      |      X      |      X      |
 //!    | A      --> RGB    |      X      |      X      |      X      |      X      |
 //!    | A      --> RGBA   |      X      |             |             |             |
 //!    | RGB    --> Y      |      X      |      X      |             |             |
@@ -404,15 +406,15 @@ void NvCV_API NvCVImage_ComponentOffsets(NvCVImage_PixelFormat format, int *rOff
 //! * Either source or destination can be CHUNKY or PLANAR.
 //! * Either source or destination can reside on the CPU or the GPU.
 //! * The RGB components are in any order (i.e. RGB or BGR; RGBA or BGRA).
-//! * For RGBA (or BGRA) destinations, most implementations do not change the alpha channel, so it is recommended to
-//!   set it at initialization time with [cuda]memset(im.pixels, -1, im.pitch * im.height) or
-//!   [cuda]memset(im.pixels, -1, im.pitch * im.height * im.numComponents) for chunky and planar images respectively.
+//! * The destination alpha is set to opaque for RGBA (or BGRA) destinations from sources without alpha.
 //! * YUV requires that the colorspace field be set manually prior to Transfer, e.g. typical for layout=NVCV_NV12:
-//!   image.colorspace = NVCV_709 | NVCV_VIDEO_RANGE | NVCV_CHROMA_INTSTITIAL;
+//!   image.colorspace = NVCV_709 | NVCV_VIDEO_RANGE | NVCV_CHROMA_COSITED;
 //! * There are also RGBf16-->RGBf32 and RGBf32-->RGBf16 transfers.
 //! * Additionally, when the src and dst formats are the same, all formats are accommodated on CPU and GPU,
 //!   and this can be used as a replacement for cudaMemcpy2DAsync() (which it utilizes). This is also true for YUV,
 //!   whose src and dst must share the same format, layout and colorspace.
+//! * All supported RGBAY transfers between u8 and f32 are also supported between u16 and f32
+//! * All supported RGBAY transfers between u8 and u8 are also supported between u16 and u16
 //!
 //! When there is some kind of conversion AND the src and dst reside on different processors (CPU, GPU),
 //! it is necessary to have a temporary GPU buffer, which is reshaped as needed to match the characteristics
@@ -422,6 +424,42 @@ void NvCV_API NvCVImage_ComponentOffsets(NvCVImage_PixelFormat format, int *rOff
 //! as the temporary; if it is not needed, no buffer is allocated. NULL can be supplied as the tmp
 //! image, in which case an ephemeral buffer is allocated if needed, with resultant
 //! performance degradation for image sequences.
+//! 
+//! There is limited support for transfer to/from CUDA arrays. These are typically accessed by mapping DirectX
+//! (and eventually OpenGL and Vulkan) textures to CUDA. We have provided NvCVImage wrappers for the mapping and
+//! unmapping of these textures. There is full capability to copy to and from textures for all basic texture types.
+//! In addition, we have implemented several conversions.
+//!   +----------+---------------------------------------------------------------+
+//!   | texture  | conversions from texture to CUDA buffer                       |
+//!   +----------+---------------------------------------------------------------+
+//!   | RGBA  u8 | RGBA, BGRA, RGB, BGR u8 and f32 chunky and planar conversions |
+//!   +----------+---------------------------------------------------------------+
+//!   | texture  | copy: texture <--> CPU or CUDA buffer                         |
+//!   +----------+---------------------------------------------------------------+
+//!   | RGBA  u8 | RGBA  u8 chunky                                               |
+//!   | BGRA  u8 | BGRA  u8 chunky                                               |
+//!   | RGBA u16 | RGBA u16 chunky                                               |
+//!   | RGBA s16 | RGBA s16 chunky                                               |
+//!   | RGBA f16 | RGBA f16 chunky                                               |
+//!   | RGBA u32 | RGBA u32 chunky                                               |
+//!   | RGBA s32 | RGBA s32 chunky                                               |
+//!   | RGBA f32 | RGBA f32 chunky                                               |
+//!   |   YA  u8 |   YA  u8 chunky                                               |
+//!   |   YA u16 |   YA u16 chunky                                               |
+//!   |   YA s16 |   YA s16 chunky                                               |
+//!   |   YA f16 |   YA f16 chunky                                               |
+//!   |   YA u32 |   YA u32 chunky                                               |
+//!   |   YA s32 |   YA s32 chunky                                               |
+//!   |   YA f32 |   YA f32 chunky                                               |
+//!   |    Y  u8 |    Y  u8 chunky                                               |
+//!   |    Y u16 |    Y u16 chunky                                               |
+//!   |    Y s16 |    Y s16 chunky                                               |
+//!   |    Y f16 |    Y f16 chunky                                               |
+//!   |    Y u32 |    Y u32 chunky                                               |
+//!   |    Y s32 |    Y s32 chunky                                               |
+//!   |    Y f32 |    Y f32 chunky                                               |
+//!   |    A  u8 |    A  u8 chunky                                               |
+//!   +----------+---------------------------------------------------------------+
 //!
 //! \param[in]      src     the source image.
 //! \param[out]     dst     the destination image.
@@ -522,7 +560,7 @@ NvCV_Status NvCV_API NvCVImage_TransferToYUV(
 //! \return         NVCV_SUCCESS is the operation was completed successfully.
 //! \note           This is an experimental API. If you find it useful, please respond to XXX@YYY.com,
 //!                 otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_MapResource(NvCVImage *im, struct CUstream_st *stream);
+NvCV_Status NvCV_API NvCVImage_MapResource(NvCVImage *im, struct CUstream_st *stream);
 
 
 //! After transfer by CUDA, the texture resource must be unmapped in order to be used by the graphics system again.
@@ -533,7 +571,7 @@ NvCV_Status NvCV_API NvCVImage_TransferToYUV(
 //! \return         NVCV_SUCCESS is the operation was completed successfully.
 //! \note           This is an experimental API. If you find it useful, please respond to XXX@YYY.com,
 //!                 otherwise we may drop support.
-/* EXPERIMENTAL */ NvCV_Status NvCV_API NvCVImage_UnmapResource(NvCVImage *im, struct CUstream_st *stream);
+NvCV_Status NvCV_API NvCVImage_UnmapResource(NvCVImage *im, struct CUstream_st *stream);
 
 
 //! Composite one source image over another using the given matte.

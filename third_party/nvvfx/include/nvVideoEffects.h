@@ -33,9 +33,13 @@
     #else
       #define NvVFX_API
     #endif
-  #else //if linux
-    #define NvVFX_API   // TODO: Linux code goes here
-  #endif // _WIN32 or linux
+   #else //if linux
+    #ifdef NVVFX_API_EXPORT
+      #define NvVFX_API __attribute__((visibility("default")))
+    #else
+      #define NvVFX_API
+    #endif
+  #endif // _WIN32
 #endif //NvVFX_API
 
 #ifdef __cplusplus
@@ -52,14 +56,18 @@ typedef const char* NvVFX_EffectSelector;
 typedef const char* NvVFX_ParameterSelector;
 
 //! Each effect instantiation is associated with an opaque handle.
-struct NvVFX_Object;
-typedef struct NvVFX_Object NvVFX_Object, *NvVFX_Handle;
+typedef struct NvVFX_Object NvVFX_Object;
+typedef struct NvVFX_Object* NvVFX_Handle;
 
 ///! 
 ///! Effect may use this handle to manage state objects.
 ///! 
 struct NvVFX_StateObjectHandleBase;
 typedef struct NvVFX_StateObjectHandleBase* NvVFX_StateObjectHandle;
+#ifdef NV_ENABLE_TRITON
+typedef struct NvVFX_TritonServerImp NvVFX_TritonServerImp;
+typedef struct NvVFX_TritonServerImp *NvVFX_TritonServer;
+#endif  // NV_ENABLE_TRITON
 
 //! Get the SDK version
 //! \param[in,out]  version    Pointer to an unsigned int set to 
@@ -196,6 +204,12 @@ NvCV_Status NvVFX_API NvVFX_CudaStreamCreate(CUstream *stream);
 //!             NVCV_ERR_CUDA_VALUE  if not.
 NvCV_Status NvVFX_API NvVFX_CudaStreamDestroy(CUstream stream);
 
+//! Wrapper for cudaStreamSynchronize(), if it is desired to avoid linking with the cuda lib.
+//! \param[in]  stream  The stream to synchronize.
+//! \return     NVCV_SUCCESS         if the operation was successful,
+//!             NVCV_ERR_CUDA_VALUE  if not.
+NvCV_Status NvVFX_API NvVFX_CudaStreamSynchronize(CUstream stream);
+
 //! Allocate the state object handle for a feature.
 //! \param[in]  effect   the effect object handle.
 //! \param[in]  handle   handle to the state object
@@ -219,28 +233,96 @@ NvCV_Status NvVFX_API NvVFX_DeallocateState(NvVFX_Handle effect, NvVFX_StateObje
 NvCV_Status NvVFX_API NvVFX_ResetState(NvVFX_Handle effect, NvVFX_StateObjectHandle handle);
 
 
-// Filter selectors
-#define NVVFX_FX_TRANSFER               "Transfer"
-#define NVVFX_FX_GREEN_SCREEN           "GreenScreen"         // Green Screen 
-#define NVVFX_FX_BGBLUR                 "BackgroundBlur"     // Background blur
-#define NVVFX_FX_ARTIFACT_REDUCTION     "ArtifactReduction"   // Artifact Reduction  
-#define NVVFX_FX_SUPER_RES              "SuperRes"            // Super Res 
-#define NVVFX_FX_SR_UPSCALE             "Upscale"             // Super Res Upscale 
-#define NVVFX_FX_DENOISING              "Denoising"           // Denoising 
+// Logging Support
+
+#ifndef   NVCV_LOG_FATAL
+  #define NVCV_LOG_FATAL    0   //!< Message to be printed right before aborting due to an unrecoverable error.
+  #define NVCV_LOG_ERROR    1   //!< An operation has failed, but it is not fatal.
+  #define NVCV_LOG_WARNING  2   //!< Something was not quite right, but we fixed it up, perhaps at a loss in performance.
+  #define NVCV_LOG_INFO     3   //!< Nothing is wrong, but this information might be of interest.
+#endif // NVCV_LOG_FATAL
+
+//! Configure the logger. Not all fields are used.
+//! There are several ways to use this API:
+//! (1) log to stderr:      (verbosity, "stderr",  NULL, NULL).
+//! (2) log to a new file:  (verbosity, file_name, NULL, NULL) or (verbosity, file_name, NULL, "w").
+//! (3) append to a file:   (verbosity, file_name, NULL, "a").
+//! (4) log to a  function: (verbosity, NULL,      func, func_data)
+//! (5) stop logging        (verbosity, NULL,      NULL, NULL)
+//! 
+//! \param[in]  verbosity the highest level of verbosity desired in the log.
+//! \param[in]  file      the file name, for logging to a file; NULL otherwise.
+//!                       The special file "stderr" will cause logging to go to stderr.
+//!                       The special file "same" will allow you to change the verbosity level without changing the logger,
+//!                       in which case the current verbosity is returned to the int at cb_data, if not NULL.
+//! \param[in]  cb        the callback function, if file == NULL, of type
+//!                       typedef void (*NvCVCallbackProc)(void *user_data, const char *msg);
+//! \param[in]  cb_data   pointer to data used by the callback function. This can also used to alter the mode used
+//!                       when opening a file (e.g. "a"), which is "w" by default.
+NvCV_Status NvVFX_API NvVFX_ConfigureLogger(int verbosity, const char *file, void (*cb)(void*, const char*), void *cb_data);
+
+
+#ifdef NV_ENABLE_TRITON
+//! Get the Triton SDK version
+//! \param[in,out]  version    Pointer to an unsigned int set to
+//!                            (major << 24) | (minor << 16) | (build << 8) | 0
+//! \return         NVCV_SUCCESS  if the version was set
+//! \return         NVCV_ERR_PARAMETER  if version was NULL
+NvCV_Status NvVFX_API NvVFX_GetVersionTriton(unsigned int *version);
+
+//! Query whether Triton server is in use instead of native machine for the specified video effect
+//! To create an effect using Triton, use the NvVFX_CreateEffectTriton API below
+//! \param[in]   using_triton          1 - Using Triton server, 0 - using native machine (default)
+NvCV_Status NvVFX_API NvVFX_IsUsingTriton(NvVFX_Handle effect, unsigned int *using_triton);
+
+//! Create a new effect instantiation using Triton.
+//! \param[in]  code    the selector code for the desired video effect.
+//! \param[out] effect  a handle to the Video Effect instantiation.
+//! \return     NVCV_SUCCESS   if the operation was successful.
+NvCV_Status NvVFX_API NvVFX_CreateEffectTriton(NvVFX_EffectSelector code, NvVFX_Handle *effect);
+
+//! Create a connection to a Triton server.
+//! \param[in] url    URL to the Triton server.
+//! \param[in] handle Handle to the Triton server object.
+NvCV_Status NvVFX_API NvVFX_ConnectTritonServer(const char *url, NvVFX_TritonServer *handle);
+
+//! Disconnect from a Triton server.
+//! \param[in] handle Handle to the Triton server object.
+NvCV_Status NvVFX_API NvVFX_DisconnectTritonServer(NvVFX_TritonServer handle);
+
+//! Assign an effect instance to run on a particular Triton server.
+//! Multiple effects may be assigned to the same Triton server for inference.
+//! \param[in] effect         the effect object handle.
+//! \param[in] server_handle  Handle to the Triton server object.
+NvCV_Status NvVFX_API NvVFX_SetTritonServer(NvVFX_Handle effect, NvVFX_TritonServer server_handle);
+
+//! Block and wait until the Triton server completes the inference request and the results are available.
+//! \param[in] effect   Handle to the effect object that sent the inference request.
+NvCV_Status NvVFX_API NvVFX_SynchronizeTriton(NvVFX_Handle effect);
+
+#endif  // NV_ENABLE_TRITON
+
 
 // Parameter selectors
 #define NVVFX_INPUT_IMAGE_0             "SrcImage0"           //!< There may be multiple input images
 #define NVVFX_INPUT_IMAGE               NVVFX_INPUT_IMAGE_0   //!< but there is usually only one input image
 #define NVVFX_INPUT_IMAGE_1             "SrcImage1"           //!< Source Image 1
-#define NVVFX_OUTPUT_IMAGE_0            "DstImage0"           //!< There may be multiple output images
-#define NVVFX_OUTPUT_IMAGE              NVVFX_OUTPUT_IMAGE_0  //!< but there is usually only one output image
+#define NVVFX_INPUT_IMAGE_2             "SrcImage2"           //!< Source Image 2
+#define NVVFX_INPUT_IMAGE_3             "SrcImage3"           //!< Source Image 3
+#define NVVFX_OUTPUT_IMAGE_0            "DstImage0"           //!< Destination Image 0
+#define NVVFX_OUTPUT_IMAGE              NVVFX_OUTPUT_IMAGE_0  //!< There is usually only one output image
+#define NVVFX_OUTPUT_IMAGE_1            "DstImage1"           //!< Destination Image 1
 #define NVVFX_MODEL_DIRECTORY           "ModelDir"            //!< The directory where the model may be found
+#define NVVFX_MODEL_CACHE_DIRECTORY     "ModelCacheDir"       //!< TRT-RTX cache directory (optional; default: ModelDir/cache)
+#define NVVFX_MODEL_CACHE_MODE          "ModelCacheMode"      //!< TRT-RTX cache mode: 0=Auto, 1=Disabled, 2=ForceRegenerate (default 0)
 #define NVVFX_CUDA_STREAM               "CudaStream"          //!< The CUDA stream to use
 #define NVVFX_CUDA_GRAPH                "CudaGraph"           //!< Enable CUDA graph to use
 #define NVVFX_INFO                      "Info"                //!< Get info about the effects
 #define NVVFX_MAX_INPUT_WIDTH           "MaxInputWidth"       //!< Maximum width of the input supported
 #define NVVFX_MAX_INPUT_HEIGHT          "MaxInputHeight"      //!< Maximum height of the input supported
-#define NVVFX_MAX_NUMBER_STREAMS        "MaxNumberStreams"  //!< Maximum number of concurrent input streams
+#define NVVFX_INPUT_WIDTH               "InputWidth"          //!< Exact width  of input frames in pixels
+#define NVVFX_INPUT_HEIGHT              "InputHeight"         //!< Exact height of input frames in pixels
+#define NVVFX_MAX_NUMBER_STREAMS        "MaxNumberStreams"    //!< Maximum number of concurrent input streams
 #define NVVFX_SCALE                     "Scale"               //!< Scale factor
 #define NVVFX_STRENGTH                  "Strength"            //!< Strength for different filters
 #define NVVFX_STRENGTH_LEVELS           "StrengthLevels"      //!< Number of strength levels
@@ -252,7 +334,9 @@ NvCV_Status NvVFX_API NvVFX_ResetState(NvVFX_Handle effect, NvVFX_StateObjectHan
 #define NVVFX_STATE                     "State"               //!< State variable  
 #define NVVFX_STATE_SIZE                "StateSize"           //!< Number of bytes needed to store state  
 #define NVVFX_STATE_COUNT               "NumStateObjects"     //!< Number of active state object handles
-
+#define NVVFX_ANGLE_PAN                 "AnglePan"            //!< Pan angle in radians
+#define NVVFX_ANGLE_VFOV                "AngleVFOV"           //!< Vertical field of view in radians
+#define NVVFX_BLUR_STRENGTH             "BlurStrength"        //!< blur strengh used in the combined relighting effect
 
 #ifdef __cplusplus
 }
