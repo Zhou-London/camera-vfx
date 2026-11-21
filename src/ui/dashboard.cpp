@@ -453,7 +453,7 @@ struct WinStats {
     size_t n = 0;
     double fps = 0;               // over the window
     double fpsNow = 0;            // over the last second
-    float latP50 = -1, latP99 = -1, latMax = -1, contP50 = -1, dP50 = -1, gpuP50 = -1, gpuP99 = -1;
+    float latP50 = -1, latP99 = -1, latMax = -1, contP50 = -1, contP99 = -1, dP50 = -1, gpuP50 = -1, gpuP99 = -1;
     uint64_t late = 0, hold = 0;
 };
 
@@ -783,7 +783,7 @@ private:
         w.n = win_.size();
         if (!sLat_.empty()) w.latMax = *std::max_element(sLat_.begin(), sLat_.end());
         w.latP50 = QuantileOf(sLat_, 0.5); w.latP99 = QuantileOf(sLat_, 0.99);
-        w.contP50 = QuantileOf(sCont_, 0.5); w.dP50 = QuantileOf(sD_, 0.5);
+        w.contP50 = QuantileOf(sCont_, 0.5); w.contP99 = QuantileOf(sCont_, 0.99); w.dP50 = QuantileOf(sD_, 0.5);
         w.gpuP50 = QuantileOf(sGpu_, 0.5); w.gpuP99 = QuantileOf(sGpu_, 0.99);
         if (firstQpc_) {
             const double span = std::min(kWindowSec, Qpc::ToSec(now - std::max(firstQpc_, winStart_)));
@@ -905,91 +905,103 @@ Element Model::Header(int W) const {
     return Line(brand, W);
 }
 
-// Latency panel rows; compact = window and total counters on one row.
+// Latency panel. The big number is capture card -> screen (content latency, p50); the bar under it
+// shows what it is made of, the second bar the GPU time per output frame against its budget.
+// Counters appear only when something went wrong.
+namespace {
+struct BarSeg { std::string name; double v; Color c; };
+
+// One proportional bar (`scale` ms = bw columns) and, under it, each segment's name and value
+// starting at the segment (skipped when it would collide with the previous label).
+void SegBar(const std::vector<BarSeg>& segs, double scale, int bw, const Spans& lead, const Spans& tail, const Theme& T,
+            Elements& rows, int iw) {
+    Spans bar = lead, lab{S(std::string((size_t)Wid(lead), ' '))};
+    int col = 0, labEnd = 0;
+    double acc = 0;
+    for (const auto& g : segs) {
+        if (g.v <= 0) continue;
+        const int x0 = (int)std::lround(acc / scale * bw);
+        acc += g.v;
+        const int x1 = std::min(bw, (int)std::lround(acc / scale * bw));
+        if (x1 > x0) bar.push_back(C(Repeat("█", x1 - x0), g.c));
+        col = std::max(col, x1);
+        const std::string t = g.name + " " + NumA(g.v);
+        // under the segment; a short segment near the end gets its label right-aligned to the bar
+        int at = x0;
+        if (at + Wid(t) + 1 > bw + Wid(tail)) at = bw + Wid(tail) - Wid(t) - 1;
+        if (x1 > x0 && at >= labEnd) {
+            if (at > labEnd) lab.push_back(S(std::string((size_t)(at - labEnd), ' ')));
+            const int x0 = at;
+            lab.push_back(C(g.name + " ", T.muted));
+            lab.push_back(S(NumA(g.v)));
+            labEnd = x0 + Wid(t) + 1;
+            lab.push_back(S(" "));
+        }
+    }
+    if (col < bw) bar.push_back(C(Repeat("░", bw - col), T.line));
+    bar += tail;
+    rows.push_back(Line(bar, iw));
+    rows.push_back(Line(lab, iw));
+}
+} // namespace
+
 Elements Model::LatencyRows(int iw, bool compact) const {
     const Theme& T = Th();
     Elements rows;
-    const Color c50 = LatColor(ws_.latP50), c99 = JitterColor(ws_.latP50, ws_.latP99);
-    const std::string s50 = NumA(ws_.latP50), s99 = NumA(ws_.latP99);
-    const std::string jit = ws_.latP50 >= 0 && ws_.latP99 >= 0 ? NumA(ws_.latP99 - ws_.latP50) : "-";
-    {
-        auto b50 = BigText(s50), b99 = BigText(s99);
-        const int w50 = Wid(b50[0]), w99 = Wid(b99[0]);
-        const bool both = w50 + 8 + w99 + 8 + 14 <= iw;
-        static const char* const l50[3] = {"", "p50", "ms"};
-        static const char* const l99[3] = {"", "p99", "ms"};
+    const double cap = (st_.captureMs > 0 ? st_.captureMs : 0) + (st_.uploadMs > 0 ? st_.uploadMs : 0);
+    const double total = ws_.contP50 >= 0 ? ws_.contP50 : ws_.latP50;
+    const double p99 = ws_.contP50 >= 0 ? ws_.contP99 : ws_.latP99;
+    const Color ct = total < 0 ? T.muted : LatColor(total - cap);
+    {   // big p50 + small p99
+        auto big = BigText(NumA(total));
         for (int k = 0; k < 3; k++) {
-            Spans r{CB(b50[k], c50), M(PadR(std::string("  ") + l50[k], 7))};
-            if (both) { r.push_back(S("  ")); r.push_back(CB(b99[k], c99)); r.push_back(M(PadR(std::string("  ") + l99[k], 7))); }
-            r.push_back(S("  "));
-            if (both) {
-                if (k == 0) { r.push_back(M("max ")); r.push_back(S(NumA(ws_.latMax))); }
-                if (k == 1) { r.push_back(M("抖动 ")); r.push_back(S(jit)); }
-            } else {
-                if (k == 0) { r.push_back(M("p99 ")); r.push_back(CB(s99, c99)); }
-                if (k == 1) { r.push_back(M("max ")); r.push_back(S(NumA(ws_.latMax))); }
-            }
-            if (k == 2) r.push_back(M(st_.latencyMetric));
-            rows.push_back(Line(r, iw));
+            Spans l{CB(big[k], ct)};
+            if (k == 2) l.push_back(M(" ms"));
+            Spans r;
+            if (k == 1 && p99 >= 0) { r.push_back(M("p99 ")); r.push_back(CB(NumA(p99), LatColor(p99 - cap))); }
+            rows.push_back(LineLR(l, r, iw));
         }
     }
-    // pacing
-    rows.push_back(Fit({
-        {M("内容 "), S(NumA(ws_.contP50)), M("   D "), S(NumA(ws_.dP50)), M("   lead "), S(NumA(st_.leadMs)), M("   余量 "), S(NumA(st_.minSlackMs)), M(" ms")},
-        {M("内容 "), S(NumA(ws_.contP50)), M("  D "), S(NumA(ws_.dP50)), M("  lead "), S(NumA(st_.leadMs)), M(" ms")},
-    }, iw));
-    // GPU gauge against the budget
-    {
-        Spans r{M("GPU  "), S(NumA(ws_.gpuP50)), M(" / "), S(NumA(ws_.gpuP99)), M(" ms  ")};
-        Spans tail;
-        if (st_.gpuBudgetMs > 0) tail = {M("  预算 "), S(NumA(st_.gpuBudgetMs))};
-        const int bw = std::max(0, iw - Wid(r) - Wid(tail));
-        if (ws_.gpuP50 < 0) {
-            r = {M("GPU  "), M("- (无 VFX)")};
-        } else if (st_.gpuBudgetMs > 0 && bw >= 4) {
-            const double ratio = std::max(0.0, (double)ws_.gpuP99) / st_.gpuBudgetMs;
-            const int fill = std::clamp((int)std::lround(ratio * bw), 0, bw);
-            const Color gc = ratio < 0.75 ? T.good : ratio < 1.0 ? T.warn : T.bad;
-            r.push_back(C(Repeat("━", fill), gc));
-            r.push_back(C(Repeat("─", bw - fill), T.line));
-            r += tail;
-        }
-        rows.push_back(Line(r, iw));
+    if (!compact) rows.push_back(Line({}, iw));
+    if (total > 0) {   // composition: capture card | waiting for the next frame | GPU | margin
+        const double lead = std::max(0.0, st_.leadMs);
+        const double gpu = ws_.gpuP50 > 0 ? std::min((double)ws_.gpuP50, lead) : 0;
+        const double wait = std::max(0.0, total - cap - lead);
+        std::vector<BarSeg> segs{{"采集", cap, T.muted}, {"等待", wait, T.band}};
+        if (gpu > 0) { segs.push_back({"GPU", gpu, T.good}); segs.push_back({"余量", std::max(0.0, lead - gpu), T.line}); }
+        else segs.push_back({"渲染", lead, T.good});
+        double sum = 0;
+        for (auto& g : segs) sum += g.v;
+        SegBar(segs, std::max(sum, total), iw, {}, {}, T, rows, iw);
     }
-    // pipeline stages
-    {   // tighter separators before truncating a number
-        auto stages = [&](const char* sep) {
-            Spans r{M("阶段 ")};
-            auto add = [&](const char* name, double v) {
-                if (v < 0) return;
-                if (r.size() > 1) r.push_back(M(sep));
-                r.push_back(M(std::string(name) + " "));
-                r.push_back(S(NumA(v)));
-            };
-            add("采集", st_.captureMs); add("上传", st_.uploadMs); add("补帧", st_.fgMs); add("超分", st_.srMs); add("HDR", st_.hdrMs);
-            if (r.size() == 1) r.push_back(M("-"));
-            return r;
+    if (!compact) rows.push_back(Line({}, iw));
+    if (ws_.gpuP50 > 0) {   // GPU per output frame, split by stage, against the frame budget
+        const double g50 = ws_.gpuP50, budget = st_.gpuBudgetMs;
+        const bool over = budget > 0 && g50 > budget;
+        std::vector<BarSeg> segs;
+        double known = 0;
+        auto add = [&](const char* n, double v, Color c) { if (v > 0) { segs.push_back({n, v, c}); known += v; } };
+        add("补帧", st_.fgMs, T.accent);
+        add("超分", st_.srMs, T.good);
+        add("HDR", st_.hdrMs, T.warn);
+        if (g50 - known > 0.05) segs.push_back({"其他", g50 - known, T.muted});
+        Spans lead{M("GPU ")};
+        Spans tail{S(" "), over ? CB(NumA(g50), T.bad) : S(NumA(g50))};
+        if (budget > 0) { tail.push_back(M(" / ")); tail.push_back(S(NumA(budget))); }
+        tail.push_back(M(" ms"));
+        const int bw = std::max(4, iw - Wid(lead) - Wid(tail));
+        SegBar(segs, budget > 0 ? std::max(budget, g50) : g50, bw, lead, tail, T, rows, iw);
+    }
+    {   // only what went wrong
+        Spans r;
+        auto add = [&](const char* n, uint64_t v) {
+            if (!v) return;
+            if (!r.empty()) r.push_back(M(" · "));
+            r.push_back(M(std::string(n) + " "));
+            r.push_back(C(std::to_string(v), T.warn));
         };
-        rows.push_back(Fit({stages(" · "), stages("  "), stages(" ")}, iw));
-    }
-    // counters
-    auto cnt = [&](uint64_t v) { return v ? C(std::to_string(v), T.warn) : S("0"); };
-    Spans extra;
-    if (st_.gpuBusy) { extra.push_back(M(" · GPU忙 ")); extra.push_back(cnt(st_.gpuBusy)); }
-    if (ringDropped_) { extra.push_back(M(" · ui丢 ")); extra.push_back(S(std::to_string(ringDropped_))); }
-    if (compact) {
-        Spans r{M("迟到 "), cnt(ws_.late), M("/"), S(std::to_string(st_.late)), M(" · 保持 "), S(std::to_string(ws_.hold)), M("/"),
-                S(std::to_string(st_.hold)), M(" · 丢帧 "), cnt(st_.drops), M(" · 错过 "), cnt(st_.missed)};
-        r += extra;
-        r.push_back(M("  (10s/累计)"));
-        rows.push_back(Line(r, iw));
-    } else {
-        rows.push_back(Line({M("10s  迟到 "), cnt(ws_.late), M(" · 保持 "), S(std::to_string(ws_.hold)), M(" · "),
-                             S(std::to_string(ws_.n)), M(" 帧 · "), S(Num(ws_.fps, 1)), M(" fps")}, iw));
-        Spans t{M("累计 迟到 "), cnt(st_.late), M(" · 保持 "), S(std::to_string(st_.hold)), M(" · 丢帧 "), cnt(st_.drops),
-                M(" · 错过 "), cnt(st_.missed), M(" · 重复 "), S(std::to_string(st_.repeats))};
-        t += extra;
-        rows.push_back(Line(t, iw));
+        add("迟到", st_.late); add("丢帧", st_.drops); add("错过", st_.missed);
+        if (!r.empty()) rows.push_back(Line(r, iw));
     }
     return rows;
 }
@@ -1125,7 +1137,7 @@ Element Model::HistoryPanel(int w, int h) const {
             float mn, mx;
             const bool ok = range(d, {}, mn, mx);
             const float hi = ok ? mx * 1.15f + 0.1f : 1;
-            Spans t{B("D"), M(" ms  伺服延迟")};
+            Spans t{B("D"), M(" ms")};
             Spans rt;
             if (ok) rt = {M("min "), S(NumA(mn)), M("  max "), S(NumA(mx))};
             rows.push_back(LineLR(t, rt, iw));
@@ -1143,7 +1155,7 @@ Element Model::HistoryPanel(int w, int h) const {
         line += std::string((size_t)std::max(1, gw - Wid(line) - Wid(r)), ' ') + r;
         rows.push_back(Line({M(ax + line)}, iw));
     }
-    return Panel({B("历史"), M(" 60 s")}, Rows(std::move(rows), ih), w, h);
+    return Panel({B("历史")}, Rows(std::move(rows), ih), w, h);
 }
 
 Element Model::RecordPanel(int w, int h) const {
@@ -1216,8 +1228,7 @@ Element Model::LogPanel(int w, int h, const std::vector<LogLine>& logs) const {
         else r.push_back(S(l.text));
         rows.push_back(Line(r, iw));
     }
-    if (logs.empty()) rows.push_back(Line({M("暂无日志")}, iw));
-    return Panel({B("日志"), M(" log")}, Rows(std::move(rows), ih), w, h);
+    return Panel({B("日志")}, Rows(std::move(rows), ih), w, h);
 }
 
 Element Model::Footer(int W, bool quitting) const {
@@ -1243,8 +1254,10 @@ Element Model::Compact(int W, int h) const {
     const Theme& T = Th();
     Elements rows;
     const Color c50 = LatColor(ws_.latP50), c99 = JitterColor(ws_.latP50, ws_.latP99);
-    rows.push_back(Line({S(" "), M("p50 "), CB(NumA(ws_.latP50), c50), M("  p99 "), CB(NumA(ws_.latP99), c99), M(" ms")}, W));
-    rows.push_back(Line({S(" "), M("GPU "), S(NumA(ws_.gpuP50)), M("/"), S(NumA(ws_.gpuP99)), M("  D "), S(NumA(ws_.dP50))}, W));
+    const bool cont = ws_.contP50 >= 0;
+    rows.push_back(Line({S(" "), M("延迟 "), CB(NumA(cont ? ws_.contP50 : ws_.latP50), c50), M("  p99 "),
+                         S(NumA(cont ? ws_.contP99 : ws_.latP99)), M(" ms")}, W));
+    rows.push_back(Line({S(" "), M("GPU "), S(NumA(ws_.gpuP50)), M(" / "), S(NumA(st_.gpuBudgetMs)), M(" ms")}, W));
     rows.push_back(Line({S(" "), M("补帧 "), S(FgText(SettingsOf(st_))), M("  超分 "), S(SrText(SettingsOf(st_)))}, W));
     rows.push_back(Line({S(" "), M("迟到 "), S(std::to_string(ws_.late)), M("  保持 "), S(std::to_string(ws_.hold)), M("  "), S(Num(ws_.fps, 1)), M(" fps")}, W));
     (void)T;
@@ -1261,9 +1274,7 @@ Element Model::Help(int W, int H) const {
     const int w = std::min(W, 48), h = std::min(H, (int)std::size(kKeys) + 4);
     Elements rows;
     for (const auto& k : kKeys) rows.push_back(Line({S(PadR(k[0], 14)), M(k[1])}, w - 4));
-    rows.push_back(Line({}, w - 4));
-    rows.push_back(Line({M("记录写入 "), S(opt_.historyPath.empty() ? "（未设置）" : opt_.historyPath)}, w - 4));
-    return Panel({B("快捷键"), M(" keys")}, Rows(std::move(rows), h - 2), w, h) | ftxui::clear_under;
+    return Panel({B("快捷键")}, Rows(std::move(rows), h - 2), w, h) | ftxui::clear_under;
 }
 
 Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, bool quitting) const {
@@ -1271,8 +1282,7 @@ Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, 
     const Theme& T = Th();
     Elements rows;
     rows.push_back(Header(W));
-    const bool notice = !st_.notice.empty() && H >= 12;
-    int avail = H - 1 - 1 - (notice ? 1 : 0);
+    int avail = H - 1 - 1;
     if (avail < 0) avail = 0;
     // Height budget, by priority: header, footer (always), latency, settings, history, record, log.
     if (W < 60 || avail < 9) {
@@ -1286,45 +1296,33 @@ Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, 
             Elements lat = LatencyRows(lw - 4, compact), set = SettingsRows(rw - 4, compact);
             const int topH = std::min(avail, 2 + (int)std::max(lat.size(), set.size()));
             rows.push_back(ftxui::hbox({
-                Panel({B("延迟"), M(" latency")}, Rows(std::move(lat), topH - 2), lw, topH),
-                Panel({B("设置"), M(" settings")}, Rows(std::move(set), topH - 2), rw, topH),
+                Panel({B("延迟")}, Rows(std::move(lat), topH - 2), lw, topH),
+                Panel({B("设置")}, Rows(std::move(set), topH - 2), rw, topH),
             }));
             used += topH;
         } else {
             Elements lat = LatencyRows(W - 4, compact);
             const int latH = std::min(avail, 2 + (int)lat.size());
-            rows.push_back(Panel({B("延迟"), M(" latency")}, Rows(std::move(lat), latH - 2), W, latH));
+            rows.push_back(Panel({B("延迟")}, Rows(std::move(lat), latH - 2), W, latH));
             used += latH;
             Elements set = SettingsRows(W - 4, true);
             const int setH = 2 + (int)set.size();
             if (avail - used >= setH) {
-                rows.push_back(Panel({B("设置"), M(" settings")}, Rows(std::move(set), setH - 2), W, setH));
+                rows.push_back(Panel({B("设置")}, Rows(std::move(set), setH - 2), W, setH));
                 used += setH;
             }
         }
         int rem = avail - used;
-        const int nseg = (int)RowsSnapshot(true).size();
-        const int histMin = 7, histMax = 2 + 2 + 2 * 8 + 1, recMin = 4, logMin = 4;
-        const int recIdeal = 3 + std::max(1, nseg);
-        int histH = 0, recH = 0, logH = 0;
-        if (rem >= histMin) { histH = histMin; rem -= histMin; }
-        if (histH && rem >= recMin) { recH = std::min(recIdeal, rem); rem -= recH; }
-        if (histH) {
-            // leftover: the wide layout grows the graphs (and the log beside them) up to 8 rows per
-            // graph, then the record table; the narrow one gives the graphs up to 4 more rows and
-            // the rest to a log panel
-            if (wide) {
-                // graphs (and the log beside them) up to histMax, then the table up to the rows it
-                // has, then the graphs take the rest (no blank table rows on tall terminals)
-                const int g = std::min(rem, histMax - histH);
-                histH += g; rem -= g;
-                if (recH) { const int r = std::min(rem, std::max(0, recIdeal - recH)); recH += r; rem -= r; }
-                histH += rem; rem = 0;
-            } else {
-                const int g = std::min(rem, 4);
-                histH += g; rem -= g;
-                if (recH && rem >= logMin) { logH = rem; rem = 0; }
-                else if (recH) { recH += rem; rem = 0; }
+        // history graphs (with the log beside them when wide), else history then log stacked
+        const int histMin = 7, histMax = 2 + 2 + 2 * 8 + 1, logMin = 4;
+        int histH = 0, logH = 0;
+        if (rem >= histMin) {
+            if (wide) { histH = rem; rem = 0; }
+            else {
+                histH = std::min(rem, histMax);
+                rem -= histH;
+                if (rem >= logMin) { logH = rem; rem = 0; }
+                else { histH += rem; rem = 0; }
             }
         }
         if (histH) {
@@ -1335,12 +1333,10 @@ Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, 
                 rows.push_back(HistoryPanel(W, histH));
             }
         }
-        if (recH) rows.push_back(RecordPanel(W, recH));
         if (logH) rows.push_back(LogPanel(W, logH, logs));
-        const int left = avail - used - histH - recH - logH;
+        const int left = avail - used - histH - logH;
         if (left > 0) rows.push_back(Blank(W, left));
     }
-    if (notice) rows.push_back(Line({S(" "), CB("! ", T.warn), S(st_.notice)}, W));
     rows.push_back(Footer(W, quitting));
     Element root = ftxui::vbox(std::move(rows));
     if (help) root = ftxui::dbox({root, Help(W, H) | ftxui::center});

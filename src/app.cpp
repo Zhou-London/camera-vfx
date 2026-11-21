@@ -859,9 +859,6 @@ int App::Run() {
     PublishStatus(Qpc::Now());
     StopDashboard();   // gives the console back before the final report
     Report(true);
-    const std::string rec = dash_.Summary();
-    if (!rec.empty()) LOGI("settings record (this session%s%s):\n%s", o_.historyPath.empty() ? "" : ", appended to ",
-                           o_.historyPath.c_str(), rec.c_str());
     timeEndPeriod(1);
     return 0;
 }

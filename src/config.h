@@ -65,7 +65,7 @@ struct Options {
     int monitor = 0;
     // terminal UI
     std::string ui = "auto";         // auto | tui | plain (auto: dashboard when the console is interactive)
-    std::string historyPath = "out/history.csv";   // per-setting latency record (CSV, appended; empty = off)
+    std::string historyPath;          // per-setting latency record (CSV, appended; empty = off)
     // logging / measurement
     std::string logLevel = "info";
     std::string logPath;
