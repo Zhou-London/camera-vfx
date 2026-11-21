@@ -15,6 +15,8 @@ namespace camss {
 
 enum class PixFmt { Unknown, YUY2, NV12, P010, RGB24, RGB32 };
 const char* PixFmtName(PixFmt f);
+// Decodes the loopback timecode band (see gfx/blit.h) from a frame; top = scanline 0.
+bool DecodeTimecodeFrame(const uint8_t* top, ptrdiff_t pitch, PixFmt fmt, int W, int H, uint32_t* value);
 
 struct CaptureRequest {
     std::wstring deviceSubstring;  // match friendly name (empty = first device)
@@ -111,6 +113,7 @@ private:
     HANDLE frameEvent_ = nullptr;
     int64_t firstSampleTime_ = -1;
     int64_t lastIndex_ = -1;
+    double periodHns_ = 0;        // measured frame period (100 ns units)
     uint64_t seq_ = 0;
     int64_t lastSampleTime_ = -1;
     int64_t lastArrival_ = 0;

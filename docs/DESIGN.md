@@ -1,0 +1,117 @@
+# camss 设计说明
+
+本文说明管线结构、出帧节奏（pacing）算法、延迟的定义和测法，以及几个实现时踩过、需要知道的坑。实测数字见 [RESULTS.md](RESULTS.md)。
+
+## 1. 管线
+
+```
+ UVC 采集卡 ──USB──> Media Foundation SourceReader (异步回调, MF_LOW_LATENCY, 禁用转换器 = 只取原生无压缩格式)
+                         │  capture 线程: Lock2D → memcpy 进 D3D11 DYNAMIC 纹理 (唯一一次 CPU→GPU 拷贝, ~0.2 ms)
+                         ▼
+               ┌─────────────────── render 线程 ───────────────────┐
+               │ ColorConverter (PS): YUY2/NV12/P010/RGB24 → RGBA8 │  源分辨率, BT.709 limited 默认
+               │ Pacer.Decide(V) → (帧 i, 帧 i+1, t)               │  核心自研, 见 §2
+               │ 插帧  : Maxine VFX VideoFrameGeneration (显式 t)  │  源分辨率, CUDA
+               │         | NVOF 硬件光流 + 自研 warp | blend        │  D3D11 compute
+               │ HDR   : Maxine TrueHDR (默认在源分辨率, 10-bit)   │  CUDA
+               │ 超分  : Maxine VideoSuperRes (1080p → 4K)         │  CUDA
+               │         | 驱动 RTX VSR / RTX HDR (D3D11 VP 扩展)  │  D3D11 video processor
+               │ Blit  : 等比缩放, SDR↔PQ, 回环时间码条           │  PS
+               │ Present: flip-discard, waitable, 最大帧延迟 1,    │
+               │          VRR 时 tearing + 按排程时刻提交          │
+               └────────────────────────────────────────────────────┘
+```
+
+* **全程 GPU**：采集只有一次 CPU memcpy（MF 缓冲 → D3D11 动态纹理）。VFX 链与 D3D11 的互操作只发生两次：每个**源帧**进入时一次（D3D→CUDA，1080p），每个**输出帧**一次（CUDA→D3D）。插帧、HDR、超分在 CUDA 流上串行，中间不回 D3D。
+* **线程**：MF 回调线程负责上传；render 线程负责颜色转换、节奏、推理和呈现；`VsyncClock` 线程阻塞在 `IDXGIOutput::WaitForVBlank` 上给固定刷新模式提供显示时钟。D3D11 immediate context 开了 multithread protection；采集写入的槽位由 `LockSlot` 防止在转换途中被覆盖（6 个槽位）。
+
+## 2. 出帧节奏（核心自研部分）
+
+### 2.1 两个时钟
+
+两个时钟各自独立，彼此会漂移：
+
+| 时钟 | 观测量 | 模型 |
+|---|---|---|
+| 源（采集卡） | 帧 *n* 上传完成、GPU 可用的 QPC 时刻 | `S(n) = a + n·P` |
+| 显示 | vblank 时刻（`WaitForVBlank` 线程） | `V(m) = b + m·T` |
+
+两者都用 `LinearClock` 拟合：在滑动窗口（源 240 帧、显示 600 次 vblank）上对整数序号做最小二乘，再剔除残差超过 4×MAD 的点重拟合一次。这样能去掉 USB/驱动的抖动，同时跟踪 ppm 级的时钟漂移。帧序号 *n* 由 MF 采样时间戳除以名义周期得到，所以丢帧会在序号上留下空洞，不会把时间轴拉歪。
+
+### 2.2 从显示时刻到插帧时间步
+
+每个输出帧都有一个显示时刻 V：固定刷新模式下是预测的 vblank，VRR 模式下是我们自己排定的提交时刻。把它映射到源时间轴：
+
+```
+x = S⁻¹(V − D)        i = ⌊x⌋,  t = x − i
+```
+
+于是这一帧要显示的是帧 *i* 与帧 *i+1* 之间位置 *t* 的内容，*t* 作为显式时间步交给插帧模块。
+
+* 时钟漂移被自动吸收。两条拟合直线各自跟踪真实频率，漂移只表现为 *t* 的相位缓慢滑动；不需要丢帧或重复帧，也没有 judder。
+* 吸附：*t* ≤ ε 时直接显示帧 *i*，*t* ≥ 1−ε 时显示帧 *i+1*（ε 默认 0.06）。这一步免掉一次推理，也减少对下一帧的依赖。
+* 丢帧：*i*/*i+1* 取实际存在的相邻帧，*t* 按它们的真实间隔重新归一化。
+* 内容时间永不倒退。
+
+### 2.3 延迟 D 的伺服（slack servo）
+
+D 不是常数。每个输出帧测量一个 **slack**：渲染开始时刻减去所需最新帧（*t>ε* 时是 *i+1*，否则是 *i*）的就绪时刻。控制器把一个窗口（2 s）内的最小 slack 稳定在安全余量（1 ms）附近：
+
+* **快攻**：所需帧还没到（late）时，立刻把 D 加上欠缺量再加余量，并在 5 s 内不做释放。
+* **慢放**：最小 slack 超过余量时，D 以不超过 2 ms/s 的速度减小，相当于 ≤0.2% 的播放速度变化，肉眼看不出。
+* slack 是用"当时的 D"测的，窗口里按 `slack − D_then + D_now` 归一化到当前的 D 再取最小值。最初这里的符号写反了，造成过正反馈；`tests/pacing_test.cpp` 的仿真抓到了这个 bug。
+
+稳态时：
+
+```
+D ≈ (1 − t_min)·P + lead + 就绪抖动 + 余量
+```
+
+其中 *t_min* 是需要下一帧的最小时间步。在 **VRR、按 k 倍网格输出**时 *t_min* = 1/k，额外延迟 = (k−1)/k·P + 推理（lead），和项目简介里给的公式一致。在固定刷新、显示频率与源频率不成整数比时（比如 165 Hz 对 60 Hz），各种相位都会出现，*t_min* → ε，额外延迟接近一整个源周期。所以有 VRR 时应当用 VRR 模式。
+
+### 2.4 三种运行模式与 auto 探测
+
+| 模式 | 行为 |
+|---|---|
+| `vrr` | 输出时刻 = `S(n + j/k) + D`，正好落在 k 倍网格上（t ∈ {0, 1/k, …}）。渲染在 `V − lead` 开始，GPU 完成后用高精度定时器把 `Present(0, ALLOW_TEARING)` 拖到 V 才提交，使翻页节奏精确，实测间隔 p99 8.6 ms（目标 8.333 ms）。 |
+| `fixed` | 每个 vblank 输出一帧；预测下一个 vblank V，然后晚锁存：睡到 `V − lead` 才开始渲染，`Present(1)`。lead 按 AIMD 自适应：错过 vblank 就加 0.5 ms，3 s 无错过就减 0.1 ms，下限 = 最近 300 帧单帧开销的 p99 + 0.75 ms。 |
+| `passthrough` | 不插帧，源帧一到就转换并呈现。`--sync 0` 立即提交（tearing / VRR），`--sync 1` 等 vblank。这是**延迟基线**。 |
+| `auto`（默认） | 先以 `Present(1)`、每源帧一次的方式探测 2.5 s。DXGI 帧统计里，VRR 显示器每次 present 只刷新 1 次，固定刷新是 refresh/fps 次。据此选 `vrr` 或 `fixed`。 |
+
+单帧开销（lead 的依据）取 CPU 提交时间与 CUDA 链 GPU 时间的较大者。早期版本把有意的"持帧等待"也算进了开销，形成正反馈，lead 涨到 9 ms；现已修正。
+
+## 3. 延迟的定义与测量
+
+所有时间戳都是 QPC。每个输出帧记录一行 CSV（`--csv`），每隔 `--report` 秒打印一次分段的 p50 / p99 / max（`--warmup` 秒后清零一次，排除伺服收敛期）。
+
+| 指标 | 定义 |
+|---|---|
+| `cap.sample_to_arrival_ms` | MF 采样时间戳（驱动打的设备时间，QPC 域）→ 我们的回调被调用。主要是 USB 传输加 frame server。 |
+| `cap.upload_ms` | 回调开始 → memcpy 进 GPU 纹理完成 |
+| `cap.interval_ms` | 相邻帧到达间隔（抖动） |
+| `vfx.fg / hdr / sr / out / gpu_total` | CUDA event 计时的各段 GPU 时间 |
+| `gpu.*` | D3D11 timestamp query 计时的 D3D 段（转换、blit 等） |
+| `lat.arrival_to_present_ms` | 用到的**最新**源帧到达 → `Present()` 调用 |
+| `lat.arrival_to_flip_ms` | VRR / 立即模式下就是到达 → 翻页。present 已被拖到 GPU 完成之后，翻页即发生在 present 时。 |
+| `lat.content_to_flip_ms` | 画面内容的采样时刻（插值帧取 A、B 采样时间按 t 插值）→ 翻页。反映"运动延迟"。 |
+| `lat.arrival_to_scanout_ms` | 固定刷新：到达 → 实际 vblank（来自 `GetFrameStatistics` 按 PresentCount 匹配） |
+| `pace.delay_ms` / `pace.t` | 伺服的 D、实际使用的时间步分布 |
+| `present.interval_ms` | 相邻 Present 间隔（VRR 下就是显示节奏） |
+
+> 注意：在 VRR 下，`DXGI_FRAME_STATISTICS.SyncQPCTime` 是被拉长的 vblank 的**起点**，不是该帧开始扫描的时刻，所以不能逐帧用（实测会得到负延迟）。程序会自动检测 VRR，并在 VRR 下改用翻页时刻。
+
+### 3.1 绝对端到端（含采集卡和显示器本身）
+
+上面的指标覆盖"采集卡交付 → 显卡翻页"。采集卡内部延迟和显示器响应需要外部回路：
+
+1. **HDMI 回环 + 时间码条**：`--timecode` 在输出顶部画一条 34 块的条带，包括起始白块、32 位值、结束黑块，值为该帧预定显示时刻（QPC，10 µs 单位，mod 2³²）。把显卡的一路 HDMI 输出接回采集卡输入，再加 `--decode-timecode` 运行：采集线程直接在 CPU 缓冲上解码亮度，统计 `loop.scanout_to_arrival_ms`，即显示时刻到采集回调到达，包含采集卡和 USB 的全部延迟。编码和解码已用 `--selftest` 在软件里验证过，1080p 和 4K→1080p 缩放两种情况都是 64/64 解对。
+2. **光电二极管 / 手机慢动作**：`--marker` 在左下角画一个每 30 个源帧翻转一次的黑白方块。把它和 PS5 端（或另一台显示器上的源画面）一起拍，就能得到绝对的玻璃到玻璃延迟，用来校准第 1 步。
+
+## 4. 实现中值得记住的坑
+
+* **VFX 1.3 运行时与 Program Files 里的 0.7.6 冲突**：`NvCVImage` 的默认构造函数（头文件里 inline）会经由 proxy 调到 `NVCVImage.dll`。如果在加载运行时之前就构造了任何 `NvCVImage`，proxy 会按 PATH 绑定到旧的 0.7.6 DLL，后果是没有 RGB10A2，TrueHDR 分配失败。现在 `VfxChain` 构造时先用**反斜杠绝对路径**加载 1.3 运行时，并校验绑定的模块路径。`LOAD_WITH_ALTERED_SEARCH_PATH` 遇到正斜杠路径时不会当作绝对路径处理。
+* **CUDA 不能注册 R10G10B10A2 纹理**：HDR 输出先拷进一张 R32_UINT 纹理（32 位打包完全相同，只是把 NvCVImage 的格式字段改成 RGB10A2），再用一个 compute pass 解包成 R10G10B10A2_UNORM。通道顺序已用 selftest 验证：黄 → R≈G>B，蓝 → B>G>R。
+* **同一张 D3D 纹理只能向 CUDA 注册一次**，所以每个 `VfxChain` 要有自己的源帧仓库。
+* **Video Frame Generation 每换一对输入都必须重新 `SetImage` 两个输入**，即使指针没变；同一对帧不同 t 只需改 `Timestep`。
+* **DXGI 帧统计在 VRR 下的语义不同**，见 §3。
+* 显示器在全屏时是 VRR（G-SYNC），桌面报告 165 Hz，但 `WaitForVBlank` 在全屏下测得约 180 Hz 的"虚拟 vblank"。固定刷新模式下的 vblank 预测只在真正的固定刷新下有意义，所以有 auto 探测。

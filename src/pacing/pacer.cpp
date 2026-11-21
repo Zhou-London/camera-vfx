@@ -66,7 +66,9 @@ PaceDecision Pacer::Decide(int64_t s, int64_t V) {
         lastLateT_ = s;
         double predReady = src_.TimeOf((double)need) + std::max(0.0, src_.ResidualQuantile(0.99));
         double deficit = std::max(0.0, predReady - (double)s);
-        delay_ += deficit + margin;
+        // Bounded attack: one late frame raises D by at most half a source period (a one-off
+        // stall must not inflate D for seconds; repeated lateness still ramps it up quickly).
+        delay_ += std::min(deficit, 0.5 * P) + margin;
         // Show the newest frame we have, but never step content time backwards.
         x = std::max(std::min(x, (double)newestN_), lastX_);
     } else {

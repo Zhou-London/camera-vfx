@@ -196,6 +196,29 @@ bool App::Init(HINSTANCE inst) {
         else vpOut_ = dev_.CreateTex(vw, vh, of, false, true);
     }
 
+    // ---- warm-up: first runs of the VFX effects and the driver VSR/TrueHDR initialise lazily
+    // (tens of ms); do it now so the pacer never sees those stalls.
+    {
+        int64_t t0 = Qpc::Now();
+        store_[0].n = -1000; store_[1].n = -999;
+        for (int i = 0; i < 4; i++) {
+            if (vfx_) { vfx_->Ingest(store_[0]); vfx_->Ingest(store_[1]); vfx_->Process(store_[0], &store_[1], 0.5f, true); }
+            if (rtx_) rtx_->Process(store_[0].rgb.tex.Get(), vpOut_.tex.Get());
+            if (interp_) { interp_->Prepare(store_[0], store_[1]); interp_->Interpolate(store_[0], store_[1], 0.5f, interpOut_); }
+            dev_.ctx()->Flush();
+        }
+        D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+        ComPtr<ID3D11Query> q;
+        if (SUCCEEDED(dev_.dev()->CreateQuery(&qd, &q))) {
+            dev_.ctx()->End(q.Get());
+            BOOL done = FALSE;
+            while (dev_.ctx()->GetData(q.Get(), &done, sizeof(done), 0) != S_OK || !done) Sleep(0);
+        }
+        if (vfx_) vfx_->PopTimings();
+        store_[0].n = store_[1].n = -1;
+        LOGI("warm-up of processing stages: %.0f ms", Qpc::ToMs(Qpc::Now() - t0));
+    }
+
     // ---- pacing
     PacerConfig pc;
     pc.mode = o_.mode;

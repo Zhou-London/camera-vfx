@@ -138,6 +138,9 @@ int main() {
         {"vrr k=2 (120 fps)", PaceMode::Vrr, 1000.0, 2, 40, 0.01, P / 2 + base + 4.0},
         {"vrr k=2, no spikes", PaceMode::Vrr, 1000.0, 2, 40, 0.0, P / 2 + base},
         {"vrr k=3 (180 fps)", PaceMode::Vrr, 1000.0, 3, 40, 0.01, 2 * P / 3 + base + 4.0},
+        // 59.94 Hz source while configured for nominal 60 Hz (-1000 ppm).
+        {"vrr k=2, 59.94 Hz source", PaceMode::Vrr, 1000.0, 2, -1000, 0.0, P / 2 + base},
+        {"fixed 164Hz, 59.94 Hz src", PaceMode::Fixed, 164.0, 2, -1000, 0.0, P + base},
     };
     int fails = 0;
     for (auto& c : cases) {

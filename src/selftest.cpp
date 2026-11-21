@@ -129,6 +129,45 @@ int RunSelfTest(const Options& o) {
         printf("%-16s %8s %8.2f %8s   (repeat previous frame)\n", "repeat", "", s / pairs, "");
     }
 
+    // ---- Loopback timecode: render the band exactly as the presenter does, then decode it
+    // from a YUY2 / NV12 conversion of the read-back frame (as the capture card would deliver it).
+    {
+        printf("\n== Loopback timecode encode/decode ==\n");
+        Blitter blit;
+        blit.Init(dev);
+        struct TcCase { UINT w, h; int down; const char* name; };
+        TcCase tcs[] = {{1920, 1080, 1, "1080p output -> 1080p capture"}, {3840, 2160, 2, "4K output -> 1080p capture (2x box downscale)"}};
+        for (auto& tc : tcs) {
+            Device::Tex target = dev.CreateTex(tc.w, tc.h, DXGI_FORMAT_B8G8R8A8_UNORM, false, true);
+            int ok = 0, total = 0;
+            for (uint32_t k = 0; k < 64; k++) {
+                uint32_t value = 0x9E3779B9u * (k + 1) ^ (k << 7);
+                BlitParams bp; bp.timecode = true; bp.timecodeValue = value;
+                blit.Draw(store[0].rgb.srv.Get(), W, H, target.rtv.Get(), tc.w, tc.h, bp);
+                std::vector<uint8_t> px; UINT rw2, rh2;
+                Readback(dev, target.tex.Get(), px, rw2, rh2);
+                const int cw = (int)(rw2 / tc.down), ch = (int)(rh2 / tc.down);
+                // BGRA -> limited-range BT.709 luma, packed as YUY2 (Y0 U Y1 V) after box downscale.
+                std::vector<uint8_t> yuy2((size_t)cw * ch * 2, 128);
+                for (int y = 0; y < ch; y++)
+                    for (int x = 0; x < cw; x++) {
+                        double acc = 0;
+                        for (int dy = 0; dy < tc.down; dy++)
+                            for (int dx = 0; dx < tc.down; dx++) {
+                                const uint8_t* q = &px[(((size_t)(y * tc.down + dy)) * rw2 + (x * tc.down + dx)) * 4];
+                                acc += 0.0722 * q[0] + 0.7152 * q[1] + 0.2126 * q[2];
+                            }
+                        acc /= tc.down * tc.down;
+                        yuy2[((size_t)y * cw + x) * 2] = (uint8_t)(16.0 + acc * 219.0 / 255.0 + 0.5);
+                    }
+                uint32_t got = 0;
+                total++;
+                if (DecodeTimecodeFrame(yuy2.data(), (ptrdiff_t)cw * 2, PixFmt::YUY2, cw, ch, &got) && got == value) ok++;
+            }
+            printf("  %-48s decoded %d/%d correctly\n", tc.name, ok, total);
+        }
+    }
+
     // ---- VSR / TrueHDR benchmarks (VFX), 1080p -> display-size.
     printf("\n== VFX VSR / TrueHDR timing (GPU, CUDA events) ==\n");
     struct SrCase { const char* name; bool sr; int q; bool hdr; bool hdrBefore; };

@@ -200,10 +200,17 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
     LONGLONG dur = 0;
     sample->GetSampleDuration(&dur);
     if (dur <= 0) dur = (LONGLONG)(1e7 / std::max(1.0, info_.fps));
+    // Frame steps from consecutive sample times, using a *measured* frame period: sources
+    // are often 59.94 Hz while advertising 60, and a nominal-period index would skip a
+    // number every ~17 s (a fake drop that corrupts the source clock fit).
+    int64_t steps = 1;
+    if (periodHns_ <= 0) periodHns_ = (double)dur;
     if (lastSampleTime_ >= 0) {
-        LONGLONG gap = timestamp - lastSampleTime_;
-        if (gap > dur * 3 / 2) {
-            uint64_t lost = (uint64_t)((gap + dur / 2) / dur - 1);
+        const double gap = (double)(timestamp - lastSampleTime_);
+        steps = std::max<int64_t>(1, (int64_t)std::llround(gap / periodHns_));
+        if (steps == 1 && std::abs(gap - periodHns_) < 0.1 * periodHns_) periodHns_ += 0.02 * (gap - periodHns_);
+        if (steps > 1) {
+            uint64_t lost = (uint64_t)(steps - 1);
             dropped_ += lost;
             static int64_t lastWarn = 0;
             if (arrival - lastWarn > Qpc::FromMs(500)) {
@@ -223,10 +230,8 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
     f.arrivalQpc = arrival;
     f.sampleDurQpc = Qpc::FromHns(dur);
     {
-        // Source timeline index from the nominal frame period; robust to dropped frames.
-        const double nominal = 1e7 / std::max(1.0, info_.fps);
-        f.sourceIndex = (int64_t)std::llround((double)(timestamp - firstSampleTime_) / nominal);
-        if (f.sourceIndex <= lastIndex_) f.sourceIndex = lastIndex_ + 1;
+        // Source timeline index: +1 per frame, +k across a gap of k periods (dropped frames).
+        f.sourceIndex = lastIndex_ < 0 ? 0 : lastIndex_ + steps;
         lastIndex_ = f.sourceIndex;
     }
     // Absolute device capture time (QPC in 100ns) when the driver provides it.
@@ -290,12 +295,11 @@ void MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
     if (locked2d) b2d->Unlock2D(); else buf->Unlock();
 }
 
-void MfCapture::DecodeTimecode(const BYTE* top, LONG pitch, RawFrame& f) const {
-    const int W = (int)info_.width, H = (int)info_.height;
+bool DecodeTimecodeFrame(const uint8_t* top, ptrdiff_t pitch, PixFmt fmt, int W, int H, uint32_t* value) {
     const int y = std::max(1, (int)(H * kTimecodeBandFrac * 0.5f));
-    const BYTE* row = top + (ptrdiff_t)y * pitch;
+    const uint8_t* row = top + (ptrdiff_t)y * pitch;
     auto luma = [&](int x) -> int {
-        switch (info_.format) {
+        switch (fmt) {
         case PixFmt::YUY2: return row[x * 2];
         case PixFmt::NV12: return row[x];
         case PixFmt::P010: return row[x * 2 + 1];
@@ -312,14 +316,18 @@ void MfCapture::DecodeTimecode(const BYTE* top, LONG pitch, RawFrame& f) const {
         vals[b] = n ? sum / n : 0;
     }
     const int thr = (vals[0] + vals[kTimecodeBlocks - 1]) / 2;
-    if (vals[0] - vals[kTimecodeBlocks - 1] < 80) return;   // markers not present
+    if (vals[0] - vals[kTimecodeBlocks - 1] < 80) return false;   // markers not present
     uint32_t v = 0;
     for (int b = 1; b <= kTimecodeBits; b++) {
-        if (std::abs(vals[b] - thr) < 30) return;               // ambiguous (mid-transition / scaled)
+        if (std::abs(vals[b] - thr) < 30) return false;               // ambiguous (mid-transition / scaled)
         v = (v << 1) | (vals[b] > thr ? 1u : 0u);
     }
-    f.timecode = v;
-    f.timecodeValid = true;
+    *value = v;
+    return true;
+}
+
+void MfCapture::DecodeTimecode(const BYTE* top, LONG pitch, RawFrame& f) const {
+    f.timecodeValid = DecodeTimecodeFrame(top, pitch, info_.format, (int)info_.width, (int)info_.height, &f.timecode);
 }
 
 RawFrame MfCapture::Latest() const {

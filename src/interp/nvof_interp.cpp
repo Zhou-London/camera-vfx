@@ -228,6 +228,7 @@ public:
         case 1: grid_ = 4; perf_ = NV_OF_PERF_LEVEL_MEDIUM; break;
         default: grid_ = 2; perf_ = NV_OF_PERF_LEVEL_FAST; break;
         }
+        if (quality_ == 2 && getenv("NVOF_Q2")) { int g = 4, pf = 10; sscanf(getenv("NVOF_Q2"), "%d,%d", &g, &pf); grid_ = (UINT)g; perf_ = (NV_OF_PERF_LEVEL)pf; }
         fw_ = (w + grid_ - 1) / grid_;
         fh_ = (h + grid_ - 1) / grid_;
         try {
@@ -291,7 +292,7 @@ public:
             const float zero[4] = {0, 0, 0, 0};
             ctx->ClearUnorderedAccessViewFloat(tflow_.uav.Get(), zero);
         } else {
-            QueueWaitFlow(p->done);
+            WaitFlow(p->done);
             ID3D11ShaderResourceView* srvs[4] = {p->flowF.t11.srv.Get(), p->flowB.t11.srv.Get(), a.rgb.srv.Get(), b.rgb.srv.Get()};
             ctx->CSSetShader(csTFlow_.Get(), nullptr, 0);
             ctx->CSSetShaderResources(0, 4, srvs);
@@ -388,10 +389,12 @@ private:
         CloseHandle(ev);
     }
 
-    // GPU-side wait of the D3D11 queue for NVOF work (no CPU stall); skipped when already ordered.
-    void QueueWaitFlow(uint64_t v) {
+    // Makes subsequent D3D11 work safe w.r.t. NVOF job `v` (its flow is written / its inputs are no longer
+    // read). Already finished (checked with a fence read): nothing to do. Otherwise a GPU-side queue wait:
+    // no CPU stall; measured end-to-end latency is the same as spinning on the CPU for the fence.
+    void WaitFlow(uint64_t v) {
         if (v <= waitedOut_) return;
-        ctx4_->Wait(fenceOut11_.Get(), v);
+        if (fenceOut12_->GetCompletedValue() < v) ctx4_->Wait(fenceOut11_.Get(), v);
         waitedOut_ = v;
     }
 
@@ -407,6 +410,10 @@ private:
             };
             for (auto& l : luma_) unreg(l.tex);
             for (auto& p : pairs_) { unreg(p.flowF); unreg(p.flowB); unreg(p.costF); unreg(p.costB); }
+            // The D3D12 resources must be released before nvOFDestroy (releasing the input textures
+            // afterwards crashes inside the driver).
+            for (auto& l : luma_) l.tex.res12.Reset();
+            for (auto& p : pairs_) { p.flowF.res12.Reset(); p.flowB.res12.Reset(); p.costF.res12.Reset(); p.costB.res12.Reset(); }
             F.nvOFDestroy(of_);
             of_ = nullptr;
         }
@@ -435,7 +442,7 @@ private:
             if (!l.valid) { v = &l; break; }
             if (!v || l.lastUse < v->lastUse) v = &l;
         }
-        QueueWaitFlow(v->readDone);   // WAR: NVOF must be done reading the old contents
+        WaitFlow(v->readDone);   // WAR: NVOF must be done reading the old contents
         auto* ctx = dev_->ctx();
         SetCB(0.f);
         ctx->CSSetShader(csLuma_.Get(), nullptr, 0);

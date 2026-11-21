@@ -464,6 +464,33 @@ static void OrderingProbe(Ctx& c) {
     F.nvOFDestroy(h);
 }
 
+
+// Crash reporter: prints the faulting module/offset and a symbolized stack (debug aid).
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    HANDLE proc = GetCurrentProcess();
+    SymInitialize(proc, nullptr, TRUE);
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 sf{};
+    sf.AddrPC.Offset = ctx.Rip; sf.AddrPC.Mode = AddrModeFlat;
+    sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+    sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+    printf("CRASH code %08lx at %p\n", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    for (int i = 0; i < 24 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr); i++) {
+        char buf[sizeof(SYMBOL_INFO) + 256] = {};
+        auto* si = (SYMBOL_INFO*)buf; si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        char mod[MAX_PATH] = "?";
+        HMODULE hm = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)sf.AddrPC.Offset, &hm)) GetModuleFileNameA(hm, mod, MAX_PATH);
+        const char* base = strrchr(mod, '\\');
+        printf("  #%d %s+0x%llx %s\n", i, base ? base + 1 : mod, (unsigned long long)(sf.AddrPC.Offset - (DWORD64)hm),
+               SymFromAddr(proc, sf.AddrPC.Offset, &disp, si) ? si->Name : "");
+    }
+    fflush(stdout);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 // ------------------------------------------------------------------------------------------ main
 int main(int argc, char** argv) {
     std::string dumpDir;
@@ -476,6 +503,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quick")) quick = true;
     }
+    SetUnhandledExceptionFilter(CrashFilter);
     SetLogLevel(LogLevel::Info);
     try {
         Ctx c;
@@ -598,7 +626,7 @@ int main(int argc, char** argv) {
             const Case& cs = kCases[4];
             for (size_t ii = 0; ii < ips.size(); ii++) {
                 Interpolator* ip = ips[ii].ip.get();
-                std::vector<double> prepCpu, prepLat, prepTs, indepTs, interpCpu, interpTs, interpLat, e2e;
+                std::vector<double> prepCpu, prepLat, prepTs, indepTs, interpCpu, interpTs, interpLat, e2e, e2eP, e2eI, e2eW;
                 for (int n = 0; n < 61; n++) {
                     SourceFrame& B = fr[n % 3];
                     Render(c, B.rgb, cs.at(n));
@@ -623,7 +651,9 @@ int main(int argc, char** argv) {
                     // Prepare-only latency (separately, without the independent work)
                     // is measured on the second half of the run below via e2e.
                     (void)t2;
-                    // Interpolate x3 (flow already computed): GPU timestamps.
+                    // Interpolate x3 (flow already computed): GPU timestamps. The first Interpolate of a pair
+                    // contains the GPU-side fence wait for the OFA engine, so do one unmeasured call first.
+                    ip->Interpolate(A, B, 0.1f, out);
                     for (int k = 0; k < 3; k++) {
                         WaitIdle(c);
                         int64_t a0 = Qpc::Now();
@@ -659,15 +689,20 @@ int main(int argc, char** argv) {
                     WaitIdle(c);
                     t0 = Qpc::Now();
                     ip->Prepare(B, B2);
+                    int64_t tp = Qpc::Now();
                     ip->Interpolate(B, B2, 0.5f, out);
+                    int64_t ti = Qpc::Now();
                     WaitIdle(c);
                     t1 = Qpc::Now();
                     e2e.push_back(Qpc::ToMs(t1 - t0));
+                    e2eP.push_back(Qpc::ToMs(tp - t0)); e2eI.push_back(Qpc::ToMs(ti - tp)); e2eW.push_back(Qpc::ToMs(t1 - ti));
                 }
                 printf("%-8s Prepare: CPU %.3f ms, GPU-ts %.3f ms, submit->done %.3f/%.3f ms | indep. work after Prepare %.3f ms | "
                        "Interpolate: GPU-ts %.3f/%.3f ms, CPU %.3f ms, submit->done %.3f ms | Prepare+Interpolate submit->done %.3f/%.3f ms\n",
                        ips[ii].name.c_str(), Median(prepCpu), Median(prepTs), Median(prepLat), Pct(prepLat, 0.95), Median(indepTs),
                        Median(interpTs), Pct(interpTs, 0.95), Median(interpCpu), Median(interpLat), Median(e2e), Pct(e2e, 0.95));
+                printf("         e2e breakdown: Prepare call %.3f, Interpolate call (incl. CPU fence wait) %.3f, GPU drain %.3f ms\n",
+                       Median(e2eP), Median(e2eI), Median(e2eW));
             }
             // Reference: cost of the independent work alone.
             std::vector<double> ref;
