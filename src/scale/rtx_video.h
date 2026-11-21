@@ -26,6 +26,8 @@ public:
     // Follow a runtime SR toggle (re-sends the stream extension only on change).
     void SetVsr(bool on);
     bool hdrActive() const { return hdrOk_; }
+    // Drop cached input/output views (their textures are about to be released, e.g. a VFX chain rebuild).
+    void ClearViewCache() { inViews_.clear(); outViews_.clear(); }
 private:
     ID3D11VideoProcessorInputView* InView(ID3D11Texture2D* t);
     ID3D11VideoProcessorOutputView* OutView(ID3D11Texture2D* t);

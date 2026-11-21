@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Steady-state latency runs on the real capture device. Usage: tools/bench.sh [seconds]
+# --no-config: ignore camss.ini; --no-audio: video only. Add --no-fg-adaptive for a static source (e.g. the
+# card's "No Signal" screen): with repeat detection every frame of a still picture is a held repeat.
 set -u
 D=${1:-30}
 mkdir -p out/bench
-run() { name=$1; shift; echo "== $name: $*"; timeout $((D + 40)) ./build/camss.exe "$@" --duration "$D" --warmup 10 --report 1000 --csv "out/bench/$name.csv" > "out/bench/$name.log" 2>&1; tail -n 40 "out/bench/$name.log" | grep -v "^\s*$" > "out/bench/$name.summary"; }
+run() { name=$1; shift; echo "== $name: $*"; timeout $((D + 40)) ./build/camss.exe --no-config --no-audio "$@" --duration "$D" --warmup 10 --report 1000 --csv "out/bench/$name.csv" > "out/bench/$name.log" 2>&1; tail -n 40 "out/bench/$name.log" | grep -v "^\s*$" > "out/bench/$name.summary"; }
 run pass_vrr      --mode passthrough --sync 0
 run pass_vsync    --mode passthrough --sync 1
 run fg_vrr_k2     --mode vrr --k 2 --interp vfx --vfg-mode 0

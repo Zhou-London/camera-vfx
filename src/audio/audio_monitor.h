@@ -23,6 +23,8 @@ struct AudioOptions {
     double bufferMs = 10.0;          // jitter buffer target on top of the device periods
     double delayMs = 0.0;            // extra fixed delay
     bool autoSync = true;            // add delay so audio latency matches SetVideoLatencyMs()
+    bool testTone = false;           // replace the captured samples with a -36 dBFS 440 Hz sine (render path test)
+    bool forceDropInsert = false;    // testing: do not use IAudioClockAdjustment, absorb drift by frame drop/insert
 };
 
 struct AudioStats {
@@ -36,6 +38,13 @@ struct AudioStats {
     double rateAdjustPpm = 0;        // current resampling trim
     uint64_t underruns = 0, overflows = 0, discontinuities = 0;
     float peak = 0;                  // recent peak level (0..1), for a simple meter
+    // diagnostics
+    std::string matchMethod;         // how the capture endpoint was chosen ("ContainerId", "name", ...)
+    bool playing = false;            // false while (re)priming the buffer or reopening devices
+    bool rateAdjust = false;         // IAudioClockAdjustment in use (else sample drop/insert)
+    double capturePeriodMs = 0, renderPeriodMs = 0, renderLatencyMs = 0;
+    uint64_t glitches = 0;           // render buffer found empty while playing (engine starved)
+    uint64_t reopens = 0;            // device error recoveries
 };
 
 struct AudioImpl;

@@ -1,6 +1,7 @@
 // camss application: wires capture -> convert -> pacing -> interpolation -> SR/HDR -> present.
 #pragma once
 #include "util/common.h"
+#include "config.h"
 #include "util/stats.h"
 #include "gfx/device.h"
 #include "gfx/color_convert.h"
@@ -11,6 +12,8 @@
 #include "pacing/pacer.h"
 #include "interp/interpolator.h"
 #include "scale/rtx_video.h"
+#include "pacing/cadence.h"
+#include "audio/audio_monitor.h"
 #include <memory>
 #include <deque>
 #include <array>
@@ -19,55 +22,7 @@ namespace camss {
 
 class VfxChain;
 
-struct Options {
-    // capture
-    std::wstring device;
-    int deviceIndex = -1;
-    PixFmt format = PixFmt::YUY2;
-    UINT capW = 1920, capH = 1080;
-    double capFps = 60.0;
-    bool synthetic = false;
-    ColorOptions color;
-    // pacing
-    PaceMode mode = PaceMode::Fixed;
-    int vrrK = 2;
-    bool lateLatch = true;
-    double leadMs = 3.0;            // initial render lead (late latch / VRR)
-    double initialDelayMs = 0;      // 0 = estimate from mode
-    double marginMs = 1.0;
-    double snapEps = 0.06;
-    int passSync = 1;               // passthrough: present sync interval
-    // processing
-    std::string interp = "none";    // none | blend | nvof | vfx
-    int vfgMode = 0;                // VFX frame generation: 0 low, 1 medium, 2 high
-    int nvofQuality = 1;
-    std::string sr = "none";        // none | rtx | vfx
-    int srQuality = 21;             // VFX VSR quality level (21 = streaming medium)
-    std::string hdr = "none";       // none | rtx | vfx
-    bool hdrBeforeSr = true;        // VFX chain: TrueHDR at source resolution, then VSR in RGB10A2
-    UINT outW = 0, outH = 0;        // processing output size (0 = display size)
-    float sdrWhiteNits = 203.f;
-    // presentation
-    bool windowed = false;
-    int monitor = 0;
-    // measurement
-    double durationSec = 0;         // 0 = until ESC
-    std::string csvPath;
-    std::string logPath;
-    bool timecode = false;          // draw loopback timecode band
-    bool decodeTimecode = false;    // decode timecode band from capture (HDMI loopback)
-    bool marker = false;            // flashing photodiode marker square
-    double reportSec = 2.0;
-    double warmupSec = 6.0;         // statistics are reset once after this
-    bool autoMode = true;           // probe the display for VRR, then pick vrr or fixed
-    bool debug = false;
-    bool statsDebug = false;
-    bool selftest = false;       // dump raw DXGI frame statistics for the first frames
-};
-
-bool ParseOptions(int argc, wchar_t** argv, Options& o);
 int RunSelfTest(const Options& o);
-void PrintUsage();
 
 class App {
 public:
@@ -77,13 +32,13 @@ public:
     int Run();
 
 private:
-    static constexpr int kStore = 8;
+    static constexpr int kStore = 16;   // source frames kept (covers content periods up to 4 with the pacing lag)
     struct OutRecord {
         uint64_t idx = 0;
         UINT presentId = 0;
         int64_t renderStart = 0, presentCall = 0, predictedV = 0, actualV = 0;
         int64_t nA = 0, nB = 0; float t = 0;
-        double delayMs = 0, slackMs = 0; bool late = false;
+        double delayMs = 0, slackMs = 0; bool late = false, hold = false;
         int64_t newestArrival = 0, newestSample = 0, contentSample = 0, newestUploaded = 0;
         double renderCpuMs = 0;
         bool finalized = false;
@@ -98,6 +53,15 @@ private:
     void FinalizeRecord(OutRecord& r);
     void Report(bool final);
     void HandleKeys();
+    // Frame generation adapts to the content rate (repeat detection + cadence).
+    void OnContentRateChanged();
+    int ChooseMultiplier(double contentFps) const;
+    // (Re)creates the Maxine chain with the current quality settings (run-time F / Q keys).
+    bool BuildVfx();
+    void RebuildVfx();
+    void WarmUp(bool initial);
+    void PrintDetail();
+    void StartAudio();
     void RunFixed();
     void RunVrr();
     void RunPassthrough(double untilSec = 0, int sync = -1);
@@ -115,6 +79,8 @@ private:
     std::unique_ptr<Interpolator> interp_;
     std::unique_ptr<RtxVideo> rtx_;
     std::unique_ptr<VfxChain> vfx_;
+    CadenceDetector cadence_;
+    AudioMonitor audio_;
     StatBook stats_;
     PreciseSleeper sleeper_;
 
@@ -130,6 +96,12 @@ private:
     bool hdrOut_ = false;
 
     int64_t synthNext_ = 0, synthN_ = 0, synthT0_ = 0;
+    int64_t synthContent_ = -1;      // synthetic source: last content frame index rendered
+    bool adaptive_ = false;          // repeat-aware frame generation active
+    int64_t lastUniqueN_ = -1;       // newest source frame carrying new content
+    uint64_t repeats_ = 0;           // repeated source frames skipped
+    int curK_ = 2;                   // output frames per content frame (VRR)
+    uint64_t lastReportOut_ = 0;     // output count at the previous report (output rate)
     int64_t lastArrival_ = 0;
     int64_t lastPresentCall_ = 0;
     UINT lastStatsPresent_ = 0, lastStatsRefresh_ = 0;

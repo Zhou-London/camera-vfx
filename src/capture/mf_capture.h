@@ -4,6 +4,7 @@
 #pragma once
 #include "../util/common.h"
 #include "../gfx/device.h"
+#include "frame_diff.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -28,6 +29,7 @@ struct CaptureRequest {
 
 struct CaptureInfo {
     std::string deviceName;
+    std::wstring symbolicLink;   // MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK (may be empty)
     PixFmt format = PixFmt::Unknown;
     UINT width = 0, height = 0;
     double fps = 0;
@@ -45,6 +47,13 @@ struct RawFrame {
     int64_t sourceIndex = 0;     // position on the source timeline (gaps = dropped frames)
     bool timecodeValid = false;  // loopback timecode decoded from the frame's top band
     uint32_t timecode = 0;
+    // Repeat-frame detection (MfCapture::detectRepeats). repeat = the frame repeats the last
+    // content (non-repeat) frame; the first frame after start / an error / a gap is never a repeat.
+    bool repeatChecked = false;  // detection ran for this frame
+    bool repeat = false;
+    float changedFrac = 0;       // fraction of compared samples that changed (vs the last content frame)
+    float meanAbsDiff = 0;       // mean |difference| of compared samples (8-bit levels)
+    float repeatCheckMs = 0;     // cost of the check on the capture thread
 };
 
 class MfCapture : public IMFSourceReaderCallback {
@@ -74,6 +83,13 @@ public:
     uint64_t Errors() const { return errors_.load(); }
     // Decode the loopback timecode band (HDMI out -> capture in) from each frame.
     bool decodeTimecode = false;
+    // Detect repeated frames (30 fps content in a 60 Hz signal) on the capture thread and flag
+    // them in RawFrame::repeat. repeatConfig is applied by Open() and Start(); set both before Start().
+    bool detectRepeats = false;
+    RepeatConfig repeatConfig;
+    // Cost of the last repeat check (ms, capture thread) and frames flagged as repeats so far.
+    double RepeatLastCostMs() const { return repeatCostMs_.load(std::memory_order_relaxed); }
+    uint64_t RepeatFrames() const { return repeatFrames_.load(std::memory_order_relaxed); }
     // Optional hook called on the capture thread after each upload.
     std::function<void(const RawFrame&)> onFrame;
 
@@ -99,6 +115,8 @@ private:
     bool CreateSlots();
     bool Upload(IMFSample* sample, Slot& s, RawFrame& f);
     void DecodeTimecode(const BYTE* top, LONG pitch, RawFrame& f) const;
+    void ConfigureRepeat();
+    void DetectRepeat(const BYTE* top, LONG pitch, RawFrame& f);
     void RequestNext();
 
     Device* dev_ = nullptr;
@@ -123,6 +141,9 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> dropped_{0}, errors_{0};
     std::vector<uint8_t> flipBuf_;
+    RepeatDetector repeat_;      // capture thread only (after Open/Start)
+    std::atomic<double> repeatCostMs_{0};
+    std::atomic<uint64_t> repeatFrames_{0};
 };
 
 } // namespace camss

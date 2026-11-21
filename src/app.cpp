@@ -7,121 +7,11 @@
 
 namespace camss {
 
-// ------------------------------------------------------------------ options
-void PrintUsage() {
-    printf(
-        "camss - capture -> frame generation -> super resolution -> HDR -> low-latency present\n"
-        "\n"
-        "  --list                     list capture devices and native formats\n"
-        "  --device <name|index>      capture device (substring of friendly name, or index)\n"
-        "  --format yuy2|nv12|p010|rgb24   preferred native capture format (default yuy2)\n"
-        "  --capture WxH@fps          capture mode (default 1920x1080@60)\n"
-        "  --synthetic                built-in moving test pattern instead of a capture device\n"
-        "  --range limited|full       YCbCr range (default limited), --bt601 for SD matrix\n"
-        "\n"
-        "  --mode auto|passthrough|fixed|vrr  pacing (default auto: probe display for VRR)\n"
-        "  --k N                      VRR output multiplier (default 2 -> 120 fps from 60)\n"
-        "  --no-latch                 fixed mode: render immediately after vblank instead of late\n"
-        "  --lead MS                  initial render lead (default 3.0)\n"
-        "  --delay MS                 initial pipeline delay (default: estimated, then adapts)\n"
-        "  --margin MS                pacing slack margin (default 1.0)\n"
-        "  --snap EPS                 snap |t| < eps to a real frame (default 0.06)\n"
-        "  --sync 0|1                 passthrough: present interval (0 = immediate, tearing)\n"
-        "\n"
-        "  --interp none|blend|nvof|vfx    frame generation (vfx = Maxine Video Frame Generation)\n"
-        "  --vfg-mode 0|1|2           VFX frame generation quality (default 0 = low/fastest)\n"
-        "  --nvof-quality 0|1|2       NVOF interpolator quality (default 1)\n"
-        "  --sr none|rtx|vfx          super resolution (rtx = driver RTX VSR, vfx = Maxine VSR)\n"
-        "  --sr-quality N             Maxine VSR QualityLevel (default 21 streaming-medium; 1-4, 16-19, 23)\n"
-        "  --hdr none|rtx|vfx         SDR->HDR (TrueHDR); needs Windows HDR on for correct display\n"
-        "  --hdr-after-sr             VFX: run TrueHDR at output resolution (default: before VSR)\n"
-        "  --out WxH                  processing output size (default = display size)\n"
-        "  --white NITS               SDR paper white when composing into HDR10 (default 203)\n"
-        "\n"
-        "  --windowed                 windowed instead of borderless fullscreen\n"
-        "  --monitor N                display output index (default 0)\n"
-        "  --duration SEC             run for SEC seconds then exit\n"
-        "  --csv FILE                 per-output-frame timing log\n"
-        "  --log FILE                 log file\n"
-        "  --timecode                 draw loopback timecode band (for HDMI-out -> capture-in tests)\n"
-        "  --decode-timecode          decode the timecode band from captured frames\n"
-        "  --marker                   flashing corner square for photodiode / slow-motion camera tests\n"
-        "  --warmup SEC               reset statistics once after SEC seconds (default 6)\n"
-        "  --report SEC               stats report interval (default 2)\n"
-        "  --debug                    D3D11 debug layer, verbose log\n"
-        "\n"
-        "keys: ESC quit, I toggle interpolation, S toggle SR, R reset stats, T toggle timecode\n");
-}
-
-static bool ParseWxH(const wchar_t* s, UINT& w, UINT& h) { return swscanf_s(s, L"%ux%u", &w, &h) == 2; }
-
-bool ParseOptions(int argc, wchar_t** argv, Options& o) {
-    auto narrow = [](const wchar_t* w) { return WideToUtf8(w); };
-    for (int i = 1; i < argc; i++) {
-        std::wstring a = argv[i];
-        auto next = [&]() -> const wchar_t* {
-            if (i + 1 >= argc) { LOGE("missing value for %s", narrow(a.c_str()).c_str()); throw std::runtime_error("args"); }
-            return argv[++i];
-        };
-        if (a == L"--help" || a == L"-h") { PrintUsage(); return false; }
-        else if (a == L"--list") { return false; }
-        else if (a == L"--device") {
-            std::wstring v = next();
-            if (!v.empty() && iswdigit(v[0]) && v.size() < 3) o.deviceIndex = _wtoi(v.c_str()); else o.device = v;
-        }
-        else if (a == L"--format") {
-            std::wstring v = next();
-            if (v == L"yuy2") o.format = PixFmt::YUY2; else if (v == L"nv12") o.format = PixFmt::NV12;
-            else if (v == L"p010") o.format = PixFmt::P010; else if (v == L"rgb24") o.format = PixFmt::RGB24;
-            else if (v == L"rgb32") o.format = PixFmt::RGB32;
-        }
-        else if (a == L"--capture") { double f = 60; UINT w = 0, h = 0; if (swscanf_s(next(), L"%ux%u@%lf", &w, &h, &f) >= 2) { o.capW = w; o.capH = h; o.capFps = f; } }
-        else if (a == L"--synthetic") o.synthetic = true;
-        else if (a == L"--range") o.color.fullRange = std::wstring(next()) == L"full";
-        else if (a == L"--bt601") o.color.bt601 = true;
-        else if (a == L"--mode") {
-            std::wstring v = next();
-            o.autoMode = v == L"auto";
-            o.mode = v == L"passthrough" ? PaceMode::Passthrough : v == L"vrr" ? PaceMode::Vrr : PaceMode::Fixed;
-        }
-        else if (a == L"--k") o.vrrK = std::max(1, _wtoi(next()));
-        else if (a == L"--no-latch") o.lateLatch = false;
-        else if (a == L"--lead") o.leadMs = _wtof(next());
-        else if (a == L"--delay") o.initialDelayMs = _wtof(next());
-        else if (a == L"--margin") o.marginMs = _wtof(next());
-        else if (a == L"--snap") o.snapEps = _wtof(next());
-        else if (a == L"--sync") o.passSync = _wtoi(next());
-        else if (a == L"--interp") o.interp = narrow(next());
-        else if (a == L"--vfg-mode") o.vfgMode = _wtoi(next());
-        else if (a == L"--nvof-quality") o.nvofQuality = _wtoi(next());
-        else if (a == L"--sr") o.sr = narrow(next());
-        else if (a == L"--sr-quality") o.srQuality = _wtoi(next());
-        else if (a == L"--hdr") o.hdr = narrow(next());
-        else if (a == L"--hdr-after-sr") o.hdrBeforeSr = false;
-        else if (a == L"--out") ParseWxH(next(), o.outW, o.outH);
-        else if (a == L"--white") o.sdrWhiteNits = (float)_wtof(next());
-        else if (a == L"--windowed") o.windowed = true;
-        else if (a == L"--monitor") o.monitor = _wtoi(next());
-        else if (a == L"--duration") o.durationSec = _wtof(next());
-        else if (a == L"--csv") o.csvPath = narrow(next());
-        else if (a == L"--log") o.logPath = narrow(next());
-        else if (a == L"--timecode") o.timecode = true;
-        else if (a == L"--decode-timecode") o.decodeTimecode = true;
-        else if (a == L"--marker") o.marker = true;
-        else if (a == L"--report") o.reportSec = _wtof(next());
-        else if (a == L"--warmup") o.warmupSec = _wtof(next());
-        else if (a == L"--debug") o.debug = true;
-        else if (a == L"--stats-debug") o.statsDebug = true;
-        else if (a == L"--selftest") o.selftest = true;
-        else { LOGE("unknown option %s", narrow(a.c_str()).c_str()); PrintUsage(); return false; }
-    }
-    return true;
-}
-
 // ------------------------------------------------------------------ app
 App::App(const Options& o) : o_(o) { leadMs_ = o.leadMs; }
 
 App::~App() {
+    audio_.Stop();
     vsync_.Stop();
     if (cap_) { cap_->Stop(); delete cap_; cap_ = nullptr; }
     // Teardown order matters with the NVIDIA driver: drain the GPU, drop the video processor
@@ -190,17 +80,7 @@ bool App::Init(HINSTANCE inst) {
     if (interp_ && !interp_->Init(dev_, srcW_, srcH_)) { LOGE("interpolator %s init failed", interp_->Name()); interp_.reset(); }
 
     // ---- VFX (Maxine) chain: any of frame generation / VSR / TrueHDR
-    const bool vfxFg = o_.interp == "vfx", vfxSr = o_.sr == "vfx", vfxHdr = o_.hdr == "vfx";
-    if (vfxFg || vfxSr || vfxHdr) {
-        VfxChain::Config c;
-        c.fg = vfxFg; c.fgMode = o_.vfgMode;
-        c.sr = vfxSr; c.srQuality = o_.srQuality;
-        c.hdr = vfxHdr; c.hdrBeforeSr = o_.hdrBeforeSr;
-        c.srcW = srcW_; c.srcH = srcH_;
-        c.outW = vfxSr ? outW_ : srcW_; c.outH = vfxSr ? outH_ : srcH_;
-        vfx_ = std::make_unique<VfxChain>();
-        if (!vfx_->Init(dev_, c, store_.data(), kStore)) { LOGE("VFX chain init failed"); return false; }
-    }
+    if (!BuildVfx()) return false;
 
     // ---- RTX video (driver VSR / TrueHDR via D3D11 video processor)
     if (o_.sr == "rtx" || o_.hdr == "rtx") {
@@ -222,8 +102,75 @@ bool App::Init(HINSTANCE inst) {
 
     // ---- warm-up: first runs of the VFX effects and the driver VSR/TrueHDR initialise lazily
     // (tens of ms); do it now so the pacer never sees those stalls.
-    {
-        int64_t t0 = Qpc::Now();
+    WarmUp(true);
+
+    // ---- pacing
+    const bool haveFg = interp_ || (vfx_ && vfx_->HasFg());
+    adaptive_ = o_.fgAdaptive && haveFg && !(o_.mode == PaceMode::Passthrough && !o_.autoMode);
+    curK_ = ChooseMultiplier(o_.capFps);
+    PacerConfig pc;
+    pc.mode = o_.mode;
+    pc.vrrMultiplier = curK_;
+    pc.snapEps = o_.snapEps;
+    pc.marginMs = o_.marginMs;
+    // Start near the expected steady state (VRR k-grid needs (k-1)/k of a source period,
+    // arbitrary-phase fixed refresh up to a full period) so the servo converges quickly.
+    pc.initialDelayMs = o_.initialDelayMs > 0 ? o_.initialDelayMs
+                                               : 1000.0 / o_.capFps * (o_.mode == PaceMode::Vrr || o_.autoMode ? (double)(curK_ - 1) / curK_ : 1.0) + 7.0;
+    pacer_.Configure(pc, o_.capFps);
+    vsync_.Start(pres_.output(), pres_.refreshHz());
+    if (cap_) {
+        RepeatConfig rc;
+        rc.levelThreshold = o_.repeatThreshold;
+        rc.maxChangedFrac = o_.repeatMaxChanged;
+        rc.maxTileChanged = o_.repeatMaxTile;
+        cap_->repeatConfig = rc;
+        cap_->detectRepeats = adaptive_;
+    }
+    if (adaptive_) LOGI("adaptive frame generation: repeated frames are detected; output = x%d of the content rate", curK_);
+
+
+    if (!o_.csvPath.empty()) {
+        csv_ = fopen(o_.csvPath.c_str(), "w");
+        if (csv_) fprintf(csv_, "idx,present_id,render_start_ms,present_call_ms,predicted_v_ms,actual_v_ms,nA,nB,t,delay_ms,slack_ms,late,"
+                                "newest_sample_ms,newest_arrival_ms,newest_uploaded_ms,content_sample_ms,render_cpu_ms,"
+                                "arrival_to_scanout_ms,content_to_scanout_ms,hold\n");
+    }
+    LOGI("pipeline: mode=%s interp=%s%s sr=%s%s hdr=%s src=%ux%u out=%ux%u display=%ux%u@%.0fHz",
+         o_.autoMode ? "auto" : PaceModeName(o_.mode), o_.interp.c_str(),
+         o_.interp == "vfx" ? (std::string("(") + FgQualityName(o_.vfgMode) + ")").c_str() : "",
+         o_.sr.c_str(), o_.sr == "vfx" ? (std::string("(") + SrQualityName(o_.srQuality) + ")").c_str() : "",
+         o_.hdr.c_str(), srcW_, srcH_, outW_, outH_, pres_.width(), pres_.height(), pres_.refreshHz());
+    return true;
+}
+
+bool App::BuildVfx() {
+    const bool vfxFg = o_.interp == "vfx", vfxSr = o_.sr == "vfx", vfxHdr = o_.hdr == "vfx";
+    if (!(vfxFg || vfxSr || vfxHdr)) return true;
+    VfxChain::Config c;
+    c.fg = vfxFg; c.fgMode = o_.vfgMode;
+    c.sr = vfxSr; c.srQuality = o_.srQuality;
+    c.hdr = vfxHdr; c.hdrBeforeSr = o_.hdrBeforeSr;
+    c.srcW = srcW_; c.srcH = srcH_;
+    c.outW = vfxSr ? outW_ : srcW_; c.outH = vfxSr ? outH_ : srcH_;
+    vfx_ = std::make_unique<VfxChain>();
+    if (!vfx_->Init(dev_, c, store_.data(), kStore)) { LOGE("VFX chain init failed"); vfx_.reset(); return false; }
+    return true;
+}
+
+static void WaitGpuIdle(Device& dev) {
+    D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+    ComPtr<ID3D11Query> q;
+    if (FAILED(dev.dev()->CreateQuery(&qd, &q))) return;
+    dev.ctx()->End(q.Get());
+    BOOL done = FALSE;
+    const int64_t until = Qpc::Now() + Qpc::FromMs(2000);
+    while ((dev.ctx()->GetData(q.Get(), &done, sizeof(done), 0) != S_OK || !done) && Qpc::Now() < until) Sleep(0);
+}
+
+void App::WarmUp(bool initial) {
+    const int64_t t0 = Qpc::Now();
+    if (initial) {
         // Positive frame numbers mapping to slots 0/1 (n % kStore must never be negative).
         store_[0].n = (int64_t)kStore * 100000; store_[1].n = store_[0].n + 1;
         for (int i = 0; i < 4; i++) {
@@ -232,41 +179,75 @@ bool App::Init(HINSTANCE inst) {
             if (interp_) { interp_->Prepare(store_[0], store_[1]); interp_->Interpolate(store_[0], store_[1], 0.5f, interpOut_); }
             dev_.ctx()->Flush();
         }
-        D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
-        ComPtr<ID3D11Query> q;
-        if (SUCCEEDED(dev_.dev()->CreateQuery(&qd, &q))) {
-            dev_.ctx()->End(q.Get());
-            BOOL done = FALSE;
-            while (dev_.ctx()->GetData(q.Get(), &done, sizeof(done), 0) != S_OK || !done) Sleep(0);
-        }
-        if (vfx_) vfx_->PopTimings();
+        WaitGpuIdle(dev_);
         store_[0].n = store_[1].n = -1;
-        LOGI("warm-up of processing stages: %.0f ms", Qpc::ToMs(Qpc::Now() - t0));
+    } else if (vfx_) {
+        // Live rebuild: the store holds real frames; hand them to the new chain and run it on the
+        // newest pair without touching the store.
+        SourceFrame* a = nullptr; SourceFrame* b = nullptr;
+        for (auto& f : store_) {
+            if (f.n < 0) continue;
+            vfx_->Ingest(f);
+            if (!b || f.n > b->n) { a = b; b = &f; } else if (!a || f.n > a->n) a = &f;
+        }
+        if (a && b && a->n > b->n) std::swap(a, b);
+        for (int i = 0; i < 4 && b; i++) { vfx_->Process(a ? *a : *b, a ? b : nullptr, 0.5f, true); dev_.ctx()->Flush(); }
+        WaitGpuIdle(dev_);
     }
+    if (vfx_) vfx_->PopTimings();
+    LOGI("warm-up of processing stages: %.0f ms", Qpc::ToMs(Qpc::Now() - t0));
+}
 
-    // ---- pacing
-    PacerConfig pc;
-    pc.mode = o_.mode;
-    pc.vrrMultiplier = o_.vrrK;
-    pc.snapEps = o_.snapEps;
-    pc.marginMs = o_.marginMs;
-    // Start near the expected steady state (VRR k-grid needs (k-1)/k of a source period,
-    // arbitrary-phase fixed refresh up to a full period) so the servo converges quickly.
-    pc.initialDelayMs = o_.initialDelayMs > 0 ? o_.initialDelayMs
-                                               : 1000.0 / o_.capFps * (o_.mode == PaceMode::Vrr || o_.autoMode ? (double)(o_.vrrK - 1) / o_.vrrK : 1.0) + 7.0;
-    pacer_.Configure(pc, o_.capFps);
-    vsync_.Start(pres_.output(), pres_.refreshHz());
+void App::RebuildVfx() {
+    LOGI("reloading Maxine models: frame generation %s, super resolution %s ...",
+         o_.interp == "vfx" ? FgQualityName(o_.vfgMode) : "-", o_.sr == "vfx" ? SrQualityName(o_.srQuality) : "-");
+    dev_.ctx()->Flush();
+    WaitGpuIdle(dev_);
+    if (rtx_) rtx_->ClearViewCache();   // views may reference the old chain's output texture
+    vfx_.reset();
+    if (!BuildVfx()) { LOGE("Maxine chain rebuild failed; continuing without it"); return; }
+    WarmUp(false);
+    stats_.Clear();
+}
 
-    if (!o_.csvPath.empty()) {
-        csv_ = fopen(o_.csvPath.c_str(), "w");
-        if (csv_) fprintf(csv_, "idx,present_id,render_start_ms,present_call_ms,predicted_v_ms,actual_v_ms,nA,nB,t,delay_ms,slack_ms,late,"
-                                "newest_sample_ms,newest_arrival_ms,newest_uploaded_ms,content_sample_ms,render_cpu_ms,"
-                                "arrival_to_scanout_ms,content_to_scanout_ms\n");
+void App::StartAudio() {
+    if (!o_.audio) { LOGI("audio: disabled"); return; }
+    AudioOptions ao;
+    ao.captureDevice = o_.audioDevice;
+    ao.renderDevice = o_.audioOut;
+    if (cap_) { ao.videoDeviceName = Utf8ToWide(cap_->info().deviceName.c_str()); ao.videoSymbolicLink = cap_->info().symbolicLink; }
+    ao.volume = (float)(o_.audioVolume / 100.0);
+    ao.bufferMs = o_.audioBufferMs;
+    ao.delayMs = o_.audioDelayMs;
+    ao.autoSync = o_.audioSync;
+    ao.testTone = o_.audioTone;
+    if (!o_.synthetic || !ao.captureDevice.empty()) {
+        if (!audio_.Start(ao)) LOGW("audio: not started (see the warning above; --list shows the endpoints, --audio-device / --audio-out select them)");
     }
-    LOGI("pipeline: mode=%s interp=%s sr=%s hdr=%s src=%ux%u out=%ux%u display=%ux%u@%.0fHz",
-         PaceModeName(o_.mode), o_.interp.c_str(), o_.sr.c_str(), o_.hdr.c_str(), srcW_, srcH_, outW_, outH_,
-         pres_.width(), pres_.height(), pres_.refreshHz());
-    return true;
+}
+
+int App::ChooseMultiplier(double contentFps) const {
+    int k = o_.fgMultiplier;
+    if (o_.fgTargetFps > 0 && contentFps > 0) k = (int)std::lround(o_.fgTargetFps / contentFps);
+    k = std::clamp(k, 1, 8);
+    // Never ask a VRR display for more than its maximum refresh rate.
+    const double maxHz = pres_.refreshHz() > 0 ? pres_.refreshHz() : 1000.0;
+    while (k > 1 && contentFps * k > maxHz + 0.5) k--;
+    return k;
+}
+
+void App::OnContentRateChanged() {
+    const double pc = cadence_.ContentPeriod();
+    const double sigHz = pacer_.SourceHz() > 0 ? pacer_.SourceHz() : o_.capFps;
+    const double contentFps = sigHz / pc;
+    const int k = ChooseMultiplier(contentFps);
+    pacer_.SetContentPeriod(pc);
+    pacer_.SetMultiplier(k);
+    curK_ = k;
+    if (o_.mode == PaceMode::Fixed)
+        LOGI("content rate %.2f fps (1 new frame per %.2f source frames) -> interpolated to the %.0f Hz refresh", contentFps, pc, pres_.refreshHz());
+    else
+        LOGI("content rate %.2f fps (1 new frame per %.2f source frames) -> output %.1f fps (x%d)", contentFps, pc, contentFps * k, k);
 }
 
 SourceFrame* App::Frame(int64_t n) {
@@ -277,15 +258,6 @@ SourceFrame* App::Frame(int64_t n) {
 
 void App::IngestCaptured(const RawFrame& rf) {
     const int64_t n = rf.sourceIndex;
-    SourceFrame& f = store_[(size_t)(n % kStore)];
-    if (!cap_->LockSlot(rf)) { stats_.Add("cap.overwritten", 1); return; }
-    conv_.Convert(cap_->PlaneSrv(rf.slot, 0), cap_->PlaneCount() > 1 ? cap_->PlaneSrv(rf.slot, 1) : nullptr, f.rgb);
-    cap_->UnlockSlot(rf);
-    f.n = n; f.seq = rf.seq; f.generation++;
-    f.sampleQpc = rf.sampleTimeQpc; f.arrivalQpc = rf.arrivalQpc; f.uploadedQpc = rf.uploadedQpc;
-    f.readyQpc = rf.uploadedQpc;
-    pacer_.OnSourceFrame(n, rf.uploadedQpc);
-
     stats_.Add("cap.upload_ms", Qpc::ToMs(rf.uploadedQpc - rf.arrivalQpc));
     double drv = Qpc::ToMs(rf.arrivalQpc - rf.sampleTimeQpc);
     if (drv > -5 && drv < 500) stats_.Add("cap.sample_to_arrival_ms", drv);
@@ -297,28 +269,63 @@ void App::IngestCaptured(const RawFrame& rf) {
         int32_t diff = (int32_t)(arr - rf.timecode);
         if (diff > 0 && diff < 100000) { stats_.Add("loop.scanout_to_arrival_ms", diff / 100.0); timecodeHits_++; }
     }
+    if (adaptive_) stats_.Add("cap.repeat_check_ms", rf.repeatCheckMs);
 
-    // Precompute for the new pair.
+    // A repeated frame (content slower than the signal) only advances the signal clock: it is not
+    // converted, stored or interpolated from; the pair is formed by the real content frames.
+    const bool unique = !(adaptive_ && rf.repeat);
+    if (!unique) {
+        repeats_++;
+        pacer_.OnSourceFrame(n, rf.uploadedQpc, false);
+        if (cadence_.OnFrame(n, false)) OnContentRateChanged();
+        return;
+    }
+    SourceFrame& f = store_[(size_t)(n % kStore)];
+    if (!cap_->LockSlot(rf)) { stats_.Add("cap.overwritten", 1); return; }
+    conv_.Convert(cap_->PlaneSrv(rf.slot, 0), cap_->PlaneCount() > 1 ? cap_->PlaneSrv(rf.slot, 1) : nullptr, f.rgb);
+    cap_->UnlockSlot(rf);
+    f.n = n; f.seq = rf.seq; f.generation++;
+    f.sampleQpc = rf.sampleTimeQpc; f.arrivalQpc = rf.arrivalQpc; f.uploadedQpc = rf.uploadedQpc;
+    f.readyQpc = rf.uploadedQpc;
+    pacer_.OnSourceFrame(n, rf.uploadedQpc, true);
+    if (adaptive_ && cadence_.OnFrame(n, true)) OnContentRateChanged();
+
+    // Precompute for the new pair (previous content frame, this one).
     if (vfx_) vfx_->Ingest(f);
-    if (interp_) if (SourceFrame* prev = Frame(n - 1)) interp_->Prepare(*prev, f);
+    if (interp_) if (SourceFrame* prev = Frame(lastUniqueN_)) interp_->Prepare(*prev, f);
+    lastUniqueN_ = n;
 }
 
 void App::Ingest(int64_t now) {
     if (o_.synthetic) {
         const int64_t per = (int64_t)((double)Qpc::Freq() / o_.capFps);
+        const double contentFps = o_.syntheticContentFps > 0 ? std::min(o_.syntheticContentFps, o_.capFps) : o_.capFps;
         if (!synthT0_) { synthT0_ = now; synthNext_ = now; }
         while (now >= synthNext_) {
             int64_t n = synthN_++;
+            // Content frame shown by signal frame n (e.g. 30 fps content: every frame twice).
+            const int64_t c = (int64_t)std::floor((double)n * contentFps / o_.capFps + 1e-6);
+            const bool unique = c != synthContent_;
+            synthContent_ = c;
+            const int64_t tick = synthNext_;
+            synthNext_ += per;
+            if (!unique && adaptive_) {
+                repeats_++;
+                pacer_.OnSourceFrame(n, tick, false);
+                if (cadence_.OnFrame(n, false)) OnContentRateChanged();
+                continue;
+            }
             SourceFrame& f = store_[(size_t)(n % kStore)];
-            synth_.Render(f.rgb, (double)n / o_.capFps);
+            synth_.Render(f.rgb, (double)c / contentFps);
             f.n = n; f.seq = (uint64_t)n + 1; f.generation++;
             // A clock-driven source: frame n exists from its tick time on (like a capture
             // card delivering at exactly 60 Hz); rendering it lazily here does not change that.
-            f.sampleQpc = synthNext_; f.arrivalQpc = synthNext_; f.uploadedQpc = synthNext_; f.readyQpc = synthNext_;
-            pacer_.OnSourceFrame(n, synthNext_);
+            f.sampleQpc = tick; f.arrivalQpc = tick; f.uploadedQpc = tick; f.readyQpc = tick;
+            pacer_.OnSourceFrame(n, tick, true);
+            if (adaptive_ && cadence_.OnFrame(n, true)) OnContentRateChanged();
             if (vfx_) vfx_->Ingest(f);
-            if (interp_) if (SourceFrame* prev = Frame(n - 1)) interp_->Prepare(*prev, f);
-            synthNext_ += per;
+            if (interp_) if (SourceFrame* prev = Frame(lastUniqueN_)) interp_->Prepare(*prev, f);
+            lastUniqueN_ = n;
         }
         return;
     }
@@ -417,6 +424,7 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
     r.renderStart = renderStart; r.presentCall = presentCall; r.predictedV = V;
     r.nA = d.nA; r.nB = doInterp ? d.nB : d.nA; r.t = doInterp ? d.t : 0.f;
     r.delayMs = d.delayMs; r.slackMs = pacer_.MinSlackMs(); r.late = d.late;
+    r.hold = d.stall;   // static content / stalled source: the shown frame is old by design
     const SourceFrame* newest = (doInterp && B) ? B : A;
     r.newestArrival = newest->arrivalQpc; r.newestSample = newest->sampleQpc; r.newestUploaded = newest->uploadedQpc;
     r.contentSample = doInterp ? (int64_t)((double)A->sampleQpc + (double)(B->sampleQpc - A->sampleQpc) * d.t) : A->sampleQpc;
@@ -433,17 +441,23 @@ bool App::Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT syn
         presentIntervalEma_ = presentIntervalEma_ <= 0 ? iv : 0.9 * presentIntervalEma_ + 0.1 * std::min(iv, 100.0);
     }
     lastPresentCall_ = presentCall;
-    stats_.Add("lat.arrival_to_present_ms", Qpc::ToMs(presentCall - newest->arrivalQpc));
+    if (!r.hold) stats_.Add("lat.arrival_to_present_ms", Qpc::ToMs(presentCall - newest->arrivalQpc));
+    else stats_.Add("pace.hold", 1.0);
     stats_.Add("pace.delay_ms", d.delayMs);
     if (doInterp) stats_.Add("pace.t", d.t);
-    prof_.Collect(ctx, [&](const char* name, double ms) { stats_.Add(std::string("gpu.") + name, ms); });
+    prof_.Collect(ctx, [&](const char* name, double ms) {
+        char key[64];
+        int n = snprintf(key, sizeof(key), "gpu.%s", name);   // no allocation per frame
+        stats_.Add(std::string_view(key, (size_t)std::clamp(n, 0, (int)sizeof(key) - 1)), ms);
+    });
     return true;
 }
 
 void App::FinalizeRecord(OutRecord& r) {
     r.finalized = true;
     finalizedCount_++;
-    if (o_.mode == PaceMode::Vrr || vrrActive_ || (o_.mode == PaceMode::Passthrough && o_.passSync == 0)) {
+    // A held picture (static content, stalled source) is old by design: not a pipeline latency.
+    if (!r.hold && (o_.mode == PaceMode::Vrr || vrrActive_ || (o_.mode == PaceMode::Passthrough && o_.passSync == 0))) {
         // VRR / immediate: the flip (scan-out start) happens at Present() once the GPU is done;
         // in VRR mode the present is held until the scheduled time, after the GPU work.
         stats_.Add("lat.arrival_to_flip_ms", Qpc::ToMs(r.presentCall - r.newestArrival));
@@ -451,9 +465,11 @@ void App::FinalizeRecord(OutRecord& r) {
         if (cs > 0 && cs < 500) stats_.Add("lat.content_to_flip_ms", cs);
     }
     if (r.actualV) {
-        stats_.Add("lat.arrival_to_scanout_ms", Qpc::ToMs(r.actualV - r.newestArrival));
-        double cs = Qpc::ToMs(r.actualV - r.contentSample);
-        if (cs > 0 && cs < 500) stats_.Add("lat.content_to_scanout_ms", cs);
+        if (!r.hold) {
+            stats_.Add("lat.arrival_to_scanout_ms", Qpc::ToMs(r.actualV - r.newestArrival));
+            double cs = Qpc::ToMs(r.actualV - r.contentSample);
+            if (cs > 0 && cs < 500) stats_.Add("lat.content_to_scanout_ms", cs);
+        }
         stats_.Add("lat.present_to_scanout_ms", Qpc::ToMs(r.actualV - r.presentCall));
         double err = Qpc::ToMs(r.actualV - r.predictedV);
         stats_.Add("present.vblank_error_ms", err);
@@ -464,11 +480,11 @@ void App::FinalizeRecord(OutRecord& r) {
     }
     if (csv_) {
         auto ms = [&](int64_t q) { return q ? Qpc::ToMs(q - startQpc_) : 0.0; };
-        fprintf(csv_, "%llu,%u,%.3f,%.3f,%.3f,%.3f,%lld,%lld,%.4f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+        fprintf(csv_, "%llu,%u,%.3f,%.3f,%.3f,%.3f,%lld,%lld,%.4f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
                 (unsigned long long)r.idx, r.presentId, ms(r.renderStart), ms(r.presentCall), ms(r.predictedV), ms(r.actualV),
                 (long long)r.nA, (long long)r.nB, r.t, r.delayMs, r.slackMs, r.late ? 1 : 0, ms(r.newestSample), ms(r.newestArrival),
                 ms(r.newestUploaded), ms(r.contentSample), r.renderCpuMs,
-                r.actualV ? Qpc::ToMs(r.actualV - r.newestArrival) : 0.0, r.actualV ? Qpc::ToMs(r.actualV - r.contentSample) : 0.0);
+                r.actualV ? Qpc::ToMs(r.actualV - r.newestArrival) : 0.0, r.actualV ? Qpc::ToMs(r.actualV - r.contentSample) : 0.0, r.hold ? 1 : 0);
     }
 }
 
@@ -492,7 +508,7 @@ void App::PollPresentStats() {
         // (fixed refresh: ~refresh/fps refreshes per present; VRR: exactly 1).
         const bool slowPresents = presentIntervalEma_ > 1.5 * 1000.0 / pres_.refreshHz();
         if (slowPresents) {
-            const bool vrrActive = vrrRatio_ < 1.3;
+            const bool vrrActive = vrrActive_ ? vrrRatio_ < 1.5 : vrrRatio_ < 1.2;   // hysteresis
             if (vrrActive != vrrActive_) { vrrActive_ = vrrActive; LOGI("display VRR %s (refreshes/present %.2f)", vrrActive ? "ACTIVE" : "inactive", vrrRatio_); }
         }
         // Fixed refresh: SyncQPCTime is the vblank at which present #PresentCount became visible.
@@ -523,6 +539,21 @@ void App::PollPresentStats() {
     }
 }
 
+void App::PrintDetail() {
+    const int64_t now = Qpc::Now();
+    char head[512];
+    snprintf(head, sizeof(head),
+             "---- %.1fs  mode=%s interp=%s%s sr=%s%s hdr=%s | src %.3f Hz (jit %.2f ms) content Pc=%.2f x%d disp %.3f Hz (jit %.2f ms) | "
+             "D=%.2f ms minslack=%.2f lead=%.2f late=%llu stall=%llu missed=%llu gpubusy=%llu drops=%llu repeats=%llu%s",
+             Qpc::ToSec(now - startQpc_), PaceModeName(o_.mode), o_.interp.c_str(), interpOn_ ? "" : "(off)", o_.sr.c_str(),
+             srOn_ ? "" : "(off)", o_.hdr.c_str(), pacer_.SourceHz(), pacer_.SourceJitterMs(), pacer_.ContentPeriod(), curK_,
+             vsync_.MeasuredHz(), vsync_.JitterMs(), pacer_.DelayMs(), pacer_.MinSlackMs(), leadMs_, (unsigned long long)pacer_.LateCount(),
+             (unsigned long long)pacer_.StallCount(), (unsigned long long)missed_, (unsigned long long)gpuBusyAtPresent_,
+             (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0), (unsigned long long)repeats_,
+             o_.decodeTimecode ? (timecodeHits_ ? " tc=ok" : " tc=none") : "");
+    LOGI("%s\n%s", head, stats_.Report().c_str());
+}
+
 void App::Report(bool final) {
     const int64_t now = Qpc::Now();
     if (!warmupDone_ && Qpc::ToSec(now - startQpc_) > o_.warmupSec) {
@@ -530,39 +561,103 @@ void App::Report(bool final) {
         stats_.Clear();
         LOGI("warm-up (%.0f s) done: statistics reset", o_.warmupSec);
     }
-    if (!final && now - lastReport_ < Qpc::FromMs(o_.reportSec * 1000.0)) return;
+    const double interval = o_.reportSec > 0 ? o_.reportSec : 2.0;
+    if (!final && now - lastReport_ < Qpc::FromMs(interval * 1000.0)) return;
+    const double dt = Qpc::ToSec(now - lastReport_);
+    const double outFps = dt > 0 ? (double)(outCount_ - lastReportOut_) / dt : 0;
     lastReport_ = now;
-    char head[512];
-    snprintf(head, sizeof(head),
-             "---- %.1fs  mode=%s interp=%s%s sr=%s%s hdr=%s | src %.3f Hz (jit %.2f ms) disp %.3f Hz (jit %.2f ms) | "
-             "D=%.2f ms minslack=%.2f lead=%.2f late=%llu stall=%llu missed=%llu gpubusy=%llu drops=%llu%s",
-             Qpc::ToSec(now - startQpc_), PaceModeName(o_.mode), o_.interp.c_str(), interpOn_ ? "" : "(off)", o_.sr.c_str(),
-             srOn_ ? "" : "(off)", o_.hdr.c_str(), pacer_.SourceHz(), pacer_.SourceJitterMs(), vsync_.MeasuredHz(),
-             vsync_.JitterMs(), pacer_.DelayMs(), pacer_.MinSlackMs(), leadMs_, (unsigned long long)pacer_.LateCount(),
-             (unsigned long long)pacer_.StallCount(), (unsigned long long)missed_, (unsigned long long)gpuBusyAtPresent_, (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0),
-             o_.decodeTimecode ? (timecodeHits_ ? " tc=ok" : " tc=none") : "");
-    LOGI("%s\n%s", head, stats_.Report().c_str());
-    char title[256];
-    double p50 = 0, p99 = 0;
+    lastReportOut_ = outCount_;
+
+    // Latency: scan-out based where the display reports it (fixed refresh), flip based under VRR.
+    double p50 = 0, p99 = 0, c50 = 0, c99 = 0;
     const char* metric = "arrival->scanout";
-    if (!stats_.Get("lat.arrival_to_scanout_ms", p50, p99)) { stats_.Get("lat.arrival_to_flip_ms", p50, p99); metric = "arrival->flip"; }
-    snprintf(title, sizeof(title), "camss | %s | D %.1f ms | %s p50 %.1f p99 %.1f ms", PaceModeName(o_.mode),
-             pacer_.DelayMs(), metric, p50, p99);
+    bool haveLat = stats_.Get("lat.arrival_to_scanout_ms", p50, p99);
+    bool haveContent = stats_.Get("lat.content_to_scanout_ms", c50, c99);
+    if (!haveLat) { haveLat = stats_.Get("lat.arrival_to_flip_ms", p50, p99); metric = "arrival->flip"; }
+    if (!haveContent) haveContent = stats_.Get("lat.content_to_flip_ms", c50, c99);
+    // Audio follows the video path (capture timestamp -> display).
+    if (audio_.Running() && haveContent) audio_.SetVideoLatencyMs(c50);
+
+    const double sigHz = pacer_.SourceHz();
+    const double contentFps = sigHz > 0 ? sigHz / pacer_.ContentPeriod() : 0;
+    const char* modeName = o_.mode == PaceMode::Vrr ? "vrr" : o_.mode == PaceMode::Fixed ? "fixed" : "passthrough";
+    char line[640];
+    int n = snprintf(line, sizeof(line), "in %.2f Hz", sigHz);
+    if (adaptive_) {
+        if (cadence_.UniqueFraction() < 0.05) n += snprintf(line + n, sizeof(line) - n, " | content static");
+        else n += snprintf(line + n, sizeof(line) - n, " | content %.1f fps", contentFps);
+    }
+    n += snprintf(line + n, sizeof(line) - n, " -> out %.1f fps (%s%s", outFps, modeName, o_.mode == PaceMode::Passthrough ? ")" : "");
+    if (o_.mode != PaceMode::Passthrough) n += snprintf(line + n, sizeof(line) - n, ", x%d)", curK_);
+    if (haveLat) n += snprintf(line + n, sizeof(line) - n, " | %s %.1f/%.1f ms", metric, p50, p99);
+    if (o_.mode != PaceMode::Passthrough) n += snprintf(line + n, sizeof(line) - n, " | D %.1f lead %.1f", pacer_.DelayMs(), leadMs_);
+    double g50, g99;
+    if (stats_.Get("vfx.gpu_total", g50, g99)) {
+        n += snprintf(line + n, sizeof(line) - n, " | gpu %.2f/%.2f ms", g50, g99);
+        // The processing must fit into one output interval, or frames are skipped.
+        const double budget = o_.mode == PaceMode::Vrr && contentFps > 0 ? 1000.0 / (contentFps * curK_)
+                            : o_.mode == PaceMode::Fixed ? 1000.0 / std::max(1.0, pres_.refreshHz()) : 0;
+        if (budget > 0 && g50 > 0.9 * budget)
+            LOG_EVERY_MS(LogLevel::Warn, 10000, "GPU time %.1f ms per output frame exceeds the %.1f ms frame budget: frames are skipped; "
+                         "lower fg-quality / sr-quality (keys F / Q) or the multiplier", g50, budget);
+    }
+    n += snprintf(line + n, sizeof(line) - n, " | late %llu hold %llu drop %llu", (unsigned long long)pacer_.LateCount(),
+                  (unsigned long long)pacer_.StallCount(), (unsigned long long)(cap_ ? cap_->DroppedFrames() : 0));
+    if (o_.mode == PaceMode::Fixed) n += snprintf(line + n, sizeof(line) - n, " miss %llu", (unsigned long long)missed_);
+    if (audio_.Running()) {
+        AudioStats as = audio_.Stats();
+        n += snprintf(line + n, sizeof(line) - n, " | audio %.0f ms%s buf %.0f ms", as.latencyMs, audio_.Muted() ? " (muted)" : "", as.bufferMs);
+        if (as.syncDelayMs > 0.5) n += snprintf(line + n, sizeof(line) - n, " sync +%.0f", as.syncDelayMs);
+        if (as.underruns) n += snprintf(line + n, sizeof(line) - n, " underrun %llu", (unsigned long long)as.underruns);
+    }
+    if (o_.decodeTimecode) {
+        double l50, l99;
+        if (stats_.Get("loop.scanout_to_arrival_ms", l50, l99)) n += snprintf(line + n, sizeof(line) - n, " | loop %.1f/%.1f ms", l50, l99);
+        else n += snprintf(line + n, sizeof(line) - n, " | loop: no timecode");
+    }
+    if (final || o_.reportDetail) PrintDetail();
+    if (o_.reportSec > 0 || final) LOGI("%s", line);
+
+    char title[256];
+    snprintf(title, sizeof(title), "camss | %s x%d | %s p50 %.1f p99 %.1f ms | D %.1f ms", modeName, curK_, metric, p50, p99,
+             pacer_.DelayMs());
     pres_.SetTitle(title);
 }
 
 void App::HandleKeys() {
     int k = pres_.PopKey();
     switch (k) {
-    case 'I': interpOn_ = !interpOn_; LOGI("interpolation %s", interpOn_ ? "on" : "off"); break;
+    case 'I': interpOn_ = !interpOn_; LOGI("frame generation %s", interpOn_ ? "on" : "off"); break;
     case 'S': srOn_ = !srOn_; LOGI("super resolution %s", srOn_ ? "on" : "off"); break;
+    case 'F':
+        if (o_.interp != "vfx") { LOGI("F: frame generation quality applies to --interp vfx"); break; }
+        o_.vfgMode = (o_.vfgMode + 1) % 3;
+        RebuildVfx();
+        break;
+    case 'Q':
+        if (o_.sr != "vfx") { LOGI("Q: super resolution quality applies to --sr vfx"); break; }
+        o_.srQuality = NextSrQuality(o_.srQuality);
+        RebuildVfx();
+        break;
+    case 'M':
+        if (audio_.Running()) { audio_.SetMuted(!audio_.Muted()); LOGI("audio %s", audio_.Muted() ? "muted" : "unmuted"); }
+        break;
+    case VK_OEM_PLUS: case VK_ADD: case VK_OEM_MINUS: case VK_SUBTRACT:
+        if (audio_.Running()) {
+            const bool up = k == VK_OEM_PLUS || k == VK_ADD;
+            const float v = std::clamp(audio_.Volume() + (up ? 0.1f : -0.1f), 0.0f, 2.0f);
+            audio_.SetVolume(v);
+            LOGI("audio volume %.0f%%", v * 100.0f);
+        }
+        break;
+    case 'L': PrintDetail(); break;
     case 'R': stats_.Clear(); LOGI("stats reset"); break;
     case 'T': o_.timecode = !o_.timecode; LOGI("timecode %s", o_.timecode ? "on" : "off"); break;
     default: break;
     }
 }
 
-bool g_quitRequested = false;
+std::atomic<bool> g_quitRequested{false};
 
 void App::RunFixed() {
     while (pres_.PumpMessages() && !g_quitRequested) {
@@ -628,13 +723,16 @@ void App::RunPassthrough(double untilSec, int sync) {
         }
         int64_t s = Qpc::Now();
         Ingest(s);
+        // One present per received signal frame (a repeat re-shows the newest content frame), so the
+        // present rate stays at the signal rate (inside the VRR range) whatever the content rate.
+        const int64_t sig = pacer_.NewestSignalIndex();
         int64_t n = pacer_.NewestIndex();
-        if (n < 0 || n == shown) continue;
+        if (n < 0 || sig == shown) continue;
         PaceDecision d;
         d.valid = true; d.nA = d.nB = n; d.t = 0; d.delayMs = 0;
         int64_t V = sync ? vsync_.NextVblankAfter(s + Qpc::FromMs(1.0)) : s + Qpc::FromMs(1.0);
         Render(d, s, V, (UINT)sync, sync == 0);
-        shown = n;
+        shown = sig;
         PollPresentStats();
         Report(false);
     }
@@ -657,6 +755,9 @@ int App::Run() {
         stats_.Clear();
         records_.clear();
     }
+    // Audio starts once video capture is streaming (and after the probe in auto mode): the USB card
+    // delivers audio packets irregularly while its video stream starts up. Never fatal.
+    StartAudio();
     switch (o_.mode) {
     case PaceMode::Fixed: RunFixed(); break;
     case PaceMode::Vrr: RunVrr(); break;
@@ -680,6 +781,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     char name[MAX_PATH] = "?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod))
         GetModuleFileNameA(mod, name, MAX_PATH);
+    camss::LogFlush(200);
     fprintf(stderr, "FATAL exception 0x%08lX at %p (%s+0x%llX)\n", ep->ExceptionRecord->ExceptionCode, addr, name,
             (unsigned long long)((uintptr_t)addr - (uintptr_t)mod));
     fflush(stderr);
@@ -697,20 +799,25 @@ int wmain(int argc, wchar_t** argv) {
     int rc = 0;
     try {
         Options o;
-        bool list = false;
-        for (int i = 1; i < argc; i++) if (std::wstring(argv[i]) == L"--list") list = true;
-        if (list) { MfCapture::ListDevices(); MFShutdown(); return 0; }
-        if (!ParseOptions(argc, argv, o)) { MFShutdown(); return 0; }
-        if (!o.logPath.empty()) SetLogFile(o.logPath.c_str());
-        if (o.debug) SetLogLevel(LogLevel::Debug);
-        if (o.selftest) { rc = RunSelfTest(o); MFShutdown(); CoUninitialize(); return rc; }
-        App app(o);
-        if (!app.Init(GetModuleHandleW(nullptr))) { LOGE("init failed"); rc = 1; }
-        else rc = app.Run();
+        ParseResult pr = LoadOptions(argc, argv, o);
+        if (pr != ParseResult::Run) rc = pr == ParseResult::Error ? 1 : 0;
+        else {
+            SetLogLevel(o.debug ? LogLevel::Debug : ParseLogLevel(o.logLevel.c_str(), LogLevel::Info));
+            if (!o.logPath.empty()) SetLogFile(o.logPath.c_str());
+            if (o.list) { MfCapture::ListDevices(); AudioMonitor::ListDevices(); }
+            else if (o.selftest) rc = RunSelfTest(o);
+            else {
+                App app(o);
+                if (!app.Init(GetModuleHandleW(nullptr))) { LOGE("init failed"); rc = 1; }
+                else rc = app.Run();
+            }
+        }
     } catch (const std::exception& e) {
         LOGE("fatal: %s", e.what());
+        LogFlush();
         rc = 2;
     }
+    LogShutdown();
     MFShutdown();
     CoUninitialize();
     return rc;

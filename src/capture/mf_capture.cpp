@@ -42,13 +42,14 @@ struct DeviceList {
         for (UINT32 i = 0; i < count; i++) devs[i]->Release();
         CoTaskMemFree(devs);
     }
-    std::wstring Name(UINT32 i) {
+    std::wstring Str(UINT32 i, const GUID& key) {
         WCHAR* n = nullptr; UINT32 len = 0;
-        devs[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &n, &len);
+        devs[i]->GetAllocatedString(key, &n, &len);
         std::wstring s = n ? n : L"";
         CoTaskMemFree(n);
         return s;
     }
+    std::wstring Name(UINT32 i) { return Str(i, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME); }
 };
 
 void MfCapture::ListDevices() {
@@ -106,6 +107,7 @@ bool MfCapture::Open(Device& dev, const CaptureRequest& req) {
     }
     if (idx < 0 || idx >= (int)dl.count) { LOGE("capture device not found"); return false; }
     info_.deviceName = WideToUtf8(dl.Name(idx).c_str());
+    info_.symbolicLink = dl.Str(idx, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
     HR_CHECK(dl.devs[idx]->ActivateObject(IID_PPV_ARGS(&source_)));
 
     ComPtr<IMFAttributes> ra;
@@ -143,7 +145,31 @@ bool MfCapture::Open(Device& dev, const CaptureRequest& req) {
     HR_CHECK(reader_->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, chosen.Get()));
     LOGI("capture: '%s' %s %ux%u @ %.3f fps (default stride %d)", info_.deviceName.c_str(), PixFmtName(info_.format),
          info_.width, info_.height, info_.fps, info_.stride);
+    ConfigureRepeat();
     return CreateSlots();
+}
+
+// Repeat detection compares plane 0 (the luma plane for NV12 / P010) of each frame.
+void MfCapture::ConfigureRepeat() {
+    const int w = (int)info_.width, h = (int)info_.height;
+    switch (info_.format) {
+    case PixFmt::YUY2: repeat_.Configure(DiffLayout::Bytes8, w * 2, h, repeatConfig); break;
+    case PixFmt::NV12: repeat_.Configure(DiffLayout::Bytes8, w, h, repeatConfig); break;
+    case PixFmt::P010: repeat_.Configure(DiffLayout::HighBytes16, w * 2, h, repeatConfig); break;
+    case PixFmt::RGB24: repeat_.Configure(DiffLayout::Bytes8, w * 3, h, repeatConfig); break;
+    case PixFmt::RGB32: repeat_.Configure(DiffLayout::Bytes8, w * 4, h, repeatConfig); break;
+    default: repeat_.Configure(DiffLayout::Bytes8, 0, 0, repeatConfig); break;
+    }
+}
+
+void MfCapture::DetectRepeat(const BYTE* top, LONG pitch, RawFrame& f) {
+    f.repeatChecked = repeat_.Configured();
+    f.repeat = repeat_.Check(top, pitch);
+    f.changedFrac = (float)repeat_.LastChangedFrac();
+    f.meanAbsDiff = (float)repeat_.LastMeanAbsDiff();
+    f.repeatCheckMs = (float)repeat_.LastCostMs();
+    repeatCostMs_.store(repeat_.LastCostMs(), std::memory_order_relaxed);
+    if (f.repeat) repeatFrames_.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool MfCapture::CreateSlots() {
@@ -177,6 +203,7 @@ bool MfCapture::CreateSlots() {
 }
 
 void MfCapture::Start() {
+    if (detectRepeats) ConfigureRepeat();   // picks up repeatConfig set after Open(); resets the reference
     running_ = true;
     RequestNext();
 }
@@ -207,8 +234,10 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
     if (!running_) return S_OK;
     // Issue the next read immediately so the source never starves.
     RequestNext();
-    if (FAILED(hrStatus)) { errors_++; LOGE("capture error: %s", HrToString(hrStatus).c_str()); return S_OK; }
-    if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { LOGW("capture end of stream"); return S_OK; }
+    // Errors and stream discontinuities: the next frame must never be called a repeat of a stale frame.
+    if (FAILED(hrStatus)) { errors_++; repeat_.Reset(); LOGE("capture error: %s", HrToString(hrStatus).c_str()); return S_OK; }
+    if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { repeat_.Reset(); LOGW("capture end of stream"); return S_OK; }
+    if (flags & MF_SOURCE_READERF_STREAMTICK) repeat_.Reset();
     if (!sample) return S_OK;
 
     LONGLONG dur = 0;
@@ -224,6 +253,7 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
         steps = std::max<int64_t>(1, (int64_t)std::llround(gap / periodHns_));
         if (steps == 1 && std::abs(gap - periodHns_) < 0.1 * periodHns_) periodHns_ += 0.02 * (gap - periodHns_);
         if (steps > 1) {
+            repeat_.Reset();   // frames were lost: compare the next one against nothing stale
             uint64_t lost = (uint64_t)(steps - 1);
             dropped_ += lost;
             static int64_t lastWarn = 0;
@@ -260,6 +290,7 @@ STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGL
         std::lock_guard<std::mutex> lk(s.lock);
         if (!Upload(sample, s, f)) {
             s.seq = 0;   // slot content is undefined now; never publish it
+            repeat_.Reset();
             return S_OK;
         }
         s.seq = f.seq;
@@ -310,6 +341,9 @@ bool MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
         // NV12/P010 chroma plane follows the luma plane with the same pitch.
         src = src + (ptrdiff_t)pitch * pl.rows;
     }
+    // After the copy, while the buffer is still locked: the frame was just read, so the
+    // compared rows come from cache (~50 us for 1080p YUY2 with the default rowStep 2).
+    if (ok && detectRepeats) DetectRepeat(base, pitch, f);
     if (locked2d) b2d->Unlock2D(); else buf->Unlock();
     return ok;
 }

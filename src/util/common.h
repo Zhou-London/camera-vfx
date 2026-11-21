@@ -22,17 +22,63 @@ using Microsoft::WRL::ComPtr;
 namespace camss {
 
 // ---------------------------------------------------------------- logging
+// Asynchronous logger. The calling thread only checks the level, formats the
+// message (timestamp taken at call time) and copies it into a bounded 1 MB ring
+// under a very short lock. A background writer thread drains the ring in batches:
+// one console write per batch (Warn/Error yellow/red when the console supports VT
+// sequences, never in redirected output or the log file) and buffered log-file
+// writes (flushed every 250 ms, immediately for Warn/Error). When the ring is full
+// messages are dropped and counted; "[log] N messages dropped" is emitted once the
+// writer catches up. Before the writer has started / after LogShutdown() LogV
+// writes synchronously. Normal process exit (return from main / exit()) flushes.
 enum class LogLevel { Debug = 0, Info, Warn, Error };
+
+namespace detail {
+inline std::atomic<int> g_logLevel{(int)LogLevel::Info};
+bool LogRateOk(std::atomic<int64_t>& last, double ms);
+}
+
+inline bool LogEnabled(LogLevel lvl) { return (int)lvl >= detail::g_logLevel.load(std::memory_order_relaxed); }
 void SetLogLevel(LogLevel lvl);
-void SetLogFile(const char* path);
+// "debug|info|warn|error" (case-insensitive; also "d|i|w|e", "warning"); fallback otherwise.
+LogLevel ParseLogLevel(const char* s, LogLevel fallback);
+void SetLogFile(const char* path);          // nullptr closes; messages queued before the call are not written to the new file
+void SetLogConsole(bool enabled);           // console (stdout/stderr) output on/off; the log file is unaffected
 void LogV(LogLevel lvl, const char* fmt, va_list ap);
 inline void Log(LogLevel lvl, const char* fmt, ...) {
+    if (!LogEnabled(lvl)) return;
     va_list ap; va_start(ap, fmt); LogV(lvl, fmt, ap); va_end(ap);
 }
+// Blocks until everything logged before the call is written (console + file flushed),
+// at most timeoutMs. Returns false on timeout.
+bool LogFlush(int timeoutMs = 500);
+// Flushes and stops the writer thread; later messages are written synchronously. Idempotent.
+void LogShutdown();
+
+struct LogCounters {
+    uint64_t enqueued = 0;   // messages accepted into the ring
+    uint64_t dropped = 0;    // messages lost because the ring was full
+    uint64_t written = 0;    // messages written by the writer thread
+    uint64_t batches = 0;    // writer batches (= console writes when console output is on)
+};
+LogCounters GetLogCounters();
+
+namespace detail {
+void LogTestPauseWriter(bool paused);       // test hook: stop draining (to exercise overflow)
+}
+
 #define LOGD(...) ::camss::Log(::camss::LogLevel::Debug, __VA_ARGS__)
 #define LOGI(...) ::camss::Log(::camss::LogLevel::Info, __VA_ARGS__)
 #define LOGW(...) ::camss::Log(::camss::LogLevel::Warn, __VA_ARGS__)
 #define LOGE(...) ::camss::Log(::camss::LogLevel::Error, __VA_ARGS__)
+// Rate-limited log: at most one message per `ms` milliseconds per call site.
+// e.g. LOG_EVERY_MS(::camss::LogLevel::Warn, 1000, "late frame %d", n);
+#define LOG_EVERY_MS(lvl, ms, ...)                                                                   \
+    do {                                                                                             \
+        static std::atomic<int64_t> _camss_log_last{0};                                              \
+        if (::camss::LogEnabled(lvl) && ::camss::detail::LogRateOk(_camss_log_last, (double)(ms)))   \
+            ::camss::Log((lvl), __VA_ARGS__);                                                        \
+    } while (0)
 
 // ---------------------------------------------------------------- errors
 std::string HrToString(HRESULT hr);
