@@ -1,6 +1,7 @@
 build/
+build-*/
+out/
+dist/
 third_party/nvvfx_runtime/
 *.csv
-out/
 .vs/
-build*/

@@ -1,143 +1,107 @@
-// Latency statistics: per-stage rolling samples with p50/p99/max.
 #pragma once
-#include <vector>
-#include <string>
-#include <string_view>
 #include <algorithm>
-#include <map>
-#include <mutex>
 #include <cstdint>
 #include <cstdio>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
-namespace camss {
+namespace cameravfx {
 
-// Rolling window of samples (ms). Not thread safe; protect externally.
+namespace stat {
+inline constexpr std::string_view kCaptureDelivery = "cap.sample_to_arrival_ms";
+inline constexpr std::string_view kCaptureUpload = "cap.upload_ms";
+inline constexpr std::string_view kLoopLatency = "loop.scanout_to_arrival_ms";
+inline constexpr std::string_view kVfxFg = "vfx.fg";
+inline constexpr std::string_view kVfxHdr = "vfx.hdr";
+inline constexpr std::string_view kVfxSr = "vfx.sr";
+inline constexpr std::string_view kVfxOut = "vfx.out";
+inline constexpr std::string_view kVfxGpuTotal = "vfx.gpu_total";
+inline constexpr std::string_view kArrivalToShown = "lat.arrival_to_shown_ms";
+inline constexpr std::string_view kContentToShown = "lat.content_to_shown_ms";
+inline constexpr std::string_view kTimerLate = "timer.late_ms";
+inline constexpr std::string_view kWaitReady = "present.wait_ready_ms";
+inline constexpr std::string_view kPresentInterval = "present.interval_ms";
+inline constexpr std::string_view kRenderCpu = "render.cpu_ms";
+}
+
+template <class T>
+T Quantile(std::vector<T>& nonEmptySamples, double q) {
+    std::vector<T>& v = nonEmptySamples;
+    const size_t k = (size_t)std::clamp<double>(q * (double)(v.size() - 1) + 0.5, 0.0, (double)(v.size() - 1));
+    std::nth_element(v.begin(), v.begin() + (ptrdiff_t)k, v.end());
+    return v[k];
+}
+
 class RollingStat {
 public:
-    explicit RollingStat(size_t cap = 4096) : cap_(cap) { buf_.reserve(cap); }
+    explicit RollingStat(size_t capacity) : capacity_(capacity) { samples_.reserve(capacity); }
     void Add(double v) {
-        if (buf_.size() < cap_) buf_.push_back(v); else buf_[pos_] = v;
-        pos_ = (pos_ + 1) % cap_;
-        total_++;
+        if (samples_.size() < capacity_) samples_.push_back(v);
+        else samples_[next_] = v;
+        next_ = (next_ + 1) % capacity_;
     }
-    size_t Count() const { return buf_.size(); }
-    uint64_t Total() const { return total_; }
-    // Copies the (unordered) samples into `out`, reusing its capacity.
-    void CopySamples(std::vector<double>& out) const { out.assign(buf_.begin(), buf_.end()); }
-    // In-place quantile of an arbitrary sample vector (reorders it).
-    static double QuantileOf(std::vector<double>& v, double q) {
-        if (v.empty()) return 0.0;
-        size_t k = (size_t)std::clamp<double>(q * (double)(v.size() - 1) + 0.5, 0.0, (double)(v.size() - 1));
-        std::nth_element(v.begin(), v.begin() + k, v.end());
-        return v[k];
-    }
-    // No allocation after the first call (scratch buffer keeps its capacity).
+    size_t Count() const { return samples_.size(); }
+    const std::vector<double>& Samples() const { return samples_; }
     double Quantile(double q) const {
-        if (buf_.empty()) return 0.0;
-        tmp_.assign(buf_.begin(), buf_.end());
-        return QuantileOf(tmp_, q);
+        scratch_.assign(samples_.begin(), samples_.end());
+        return cameravfx::Quantile(scratch_, q);
     }
-    double Mean() const {
-        if (buf_.empty()) return 0.0;
-        double s = 0; for (double v : buf_) s += v; return s / (double)buf_.size();
-    }
-    double Max() const { return buf_.empty() ? 0.0 : *std::max_element(buf_.begin(), buf_.end()); }
-    void Clear() { buf_.clear(); pos_ = 0; }
+    void Clear() { samples_.clear(); next_ = 0; }
 private:
-    size_t cap_;
-    size_t pos_ = 0;
-    uint64_t total_ = 0;
-    std::vector<double> buf_;
-    mutable std::vector<double> tmp_;
+    size_t capacity_;
+    size_t next_ = 0;
+    std::vector<double> samples_;
+    mutable std::vector<double> scratch_;
 };
 
-struct StatSummary {
-    std::string name;
-    double p50 = 0, p99 = 0, max = 0;
-    size_t n = 0;
+struct Percentiles {
+    double p50 = 0, p99 = 0;
 };
 
-// Named collection of RollingStats, thread safe.
-// Add() does not allocate once a name is known (heterogeneous lookup by string_view).
-// Snapshot()/Report()/Get() hold the Add() lock only to memcpy one stat's samples at a
-// time; quantiles are computed outside the lock.
 class StatBook {
 public:
     void Add(std::string_view name, double v) {
-        std::lock_guard<std::mutex> lk(m_);
         auto it = stats_.find(name);
         if (it == stats_.end()) {
-            it = stats_.emplace(std::string(name), RollingStat(2048)).first;
-            order_.push_back(&*it);
+            it = stats_.emplace(std::string(name), RollingStat(kWindowSamples)).first;
+            order_.push_back(it);
         }
         it->second.Add(v);
     }
 
-    std::vector<StatSummary> Snapshot() const {
-        std::lock_guard<std::mutex> slk(snapM_);
-        std::vector<StatSummary> out;
-        size_t count;
-        { std::lock_guard<std::mutex> lk(m_); count = order_.size(); }
-        out.reserve(count);
-        for (size_t i = 0;; i++) {
-            const Entry* e;
-            {
-                std::lock_guard<std::mutex> lk(m_);
-                if (i >= order_.size()) break;
-                e = order_[i];
-                e->second.CopySamples(scratch_);   // brief: one memcpy (<= 2048 doubles)
-            }
-            // Map nodes are never erased and names are immutable: safe to read outside the lock.
-            StatSummary s;
-            s.name = e->first;
-            s.n = scratch_.size();
-            if (s.n) {
-                s.max = *std::max_element(scratch_.begin(), scratch_.end());
-                s.p50 = RollingStat::QuantileOf(scratch_, 0.5);
-                s.p99 = RollingStat::QuantileOf(scratch_, 0.99);
-            }
-            out.push_back(std::move(s));
-        }
-        return out;
-    }
-
-    // Formats a snapshot as the multi-line report "name p50 p99 max n".
-    static std::string Report(const std::vector<StatSummary>& snap) {
+    std::string Report() const {
         std::string out;
-        out.reserve(64 + snap.size() * 72);
         char line[256];
         snprintf(line, sizeof(line), "  %-26s %8s %8s %8s %8s\n", "stage(ms)", "p50", "p99", "max", "n");
         out += line;
-        for (const auto& s : snap) {
-            snprintf(line, sizeof(line), "  %-26s %8.3f %8.3f %8.3f %8zu\n", s.name.c_str(), s.p50, s.p99, s.max, s.n);
+        std::vector<double> samples;
+        for (const auto& it : order_) {
+            if (!it->second.Count()) continue;
+            samples = it->second.Samples();
+            const double max = *std::max_element(samples.begin(), samples.end());
+            const double p50 = Quantile(samples, 0.5), p99 = Quantile(samples, 0.99);
+            snprintf(line, sizeof(line), "  %-26s %8.3f %8.3f %8.3f %8zu\n", it->first.c_str(), p50, p99, max, samples.size());
             out += line;
         }
         return out;
     }
-    std::string Report() const { return Report(Snapshot()); }
 
-    bool Get(std::string_view name, double& p50, double& p99) const {
-        std::lock_guard<std::mutex> slk(snapM_);
-        {
-            std::lock_guard<std::mutex> lk(m_);
-            auto it = stats_.find(name);
-            if (it == stats_.end() || it->second.Count() == 0) return false;
-            it->second.CopySamples(scratch_);
-        }
-        p50 = RollingStat::QuantileOf(scratch_, 0.5);
-        p99 = RollingStat::QuantileOf(scratch_, 0.99);
-        return true;
+    std::optional<Percentiles> Get(std::string_view name) const {
+        const auto it = stats_.find(name);
+        if (it == stats_.end() || !it->second.Count()) return std::nullopt;
+        return Percentiles{it->second.Quantile(0.5), it->second.Quantile(0.99)};
     }
-    void Clear() { std::lock_guard<std::mutex> lk(m_); for (auto& kv : stats_) kv.second.Clear(); }
+
+    void Clear() { for (auto& [name, stat] : stats_) stat.Clear(); }
 
 private:
+    static constexpr size_t kWindowSamples = 2048;
     using Map = std::map<std::string, RollingStat, std::less<>>;
-    using Entry = Map::value_type;
-    mutable std::mutex m_;                 // guards stats_ / order_ (taken by Add)
-    mutable std::mutex snapM_;             // serialises readers sharing scratch_ (lock order: snapM_ -> m_)
     Map stats_;
-    std::vector<const Entry*> order_;      // insertion order
-    mutable std::vector<double> scratch_;
+    std::vector<Map::const_iterator> order_;
 };
 
-} // namespace camss
+}

@@ -1,64 +1,59 @@
-// Clock models for the two independent timebases in the pipeline:
-//  * the source clock (capture card, nominally 60 Hz, drifts vs. QPC)
-//  * the display clock (monitor vblank, e.g. 120/164 Hz, also drifts)
-// Both are modelled as t(n) = a + n * P fitted over a sliding window by least
-// squares on integer tick indices, which removes USB/driver jitter and tracks drift.
 #pragma once
 #include "../util/common.h"
-#include "../util/stats.h"
+#include <atomic>
 #include <deque>
+#include <mutex>
 #include <thread>
+#include <vector>
 #include <dxgi1_6.h>
 
-namespace camss {
+namespace cameravfx {
 
 class LinearClock {
 public:
-    explicit LinearClock(size_t window = 240) : window_(window) {}
-    // Adds an observation of tick `n` at QPC time `t`.
+    explicit LinearClock(size_t window) : window_(window) {}
+    void SetNominalPeriod(double period) { period_ = period; }
     void Add(int64_t n, int64_t t);
     bool Valid() const { return valid_; }
-    double Period() const { return period_; }            // QPC ticks per tick
-    double TimeOf(double n) const { return base_t_ + (n - base_n_) * period_ + intercept_; }
-    double IndexAt(double t) const { return (t - base_t_ - intercept_) / period_ + base_n_; }
-    // Residual (observed - fitted) quantile in ticks, over the window.
-    double ResidualQuantile(double q) const;
-    double LastResidual() const { return lastResid_; }
-    void Reset() { obs_.clear(); valid_ = false; }
-    void SetNominalPeriod(double p) { if (!valid_) period_ = p; }
+    double Period() const { return period_; }
+    double TimeOf(double n) const { return (double)baseTime_ + (n - (double)baseIndex_) * period_ + intercept_; }
+    double IndexAt(double t) const { return (t - (double)baseTime_ - intercept_) / period_ + (double)baseIndex_; }
+    double AbsResidualQuantile(double q) const;
+    double JitterMs() const { return Qpc::ToMs((int64_t)AbsResidualQuantile(0.99)); }
+
 private:
+    struct Observation { int64_t n; int64_t t; };
     void Refit();
-    struct Obs { int64_t n; int64_t t; };
     size_t window_;
-    std::deque<Obs> obs_;
+    std::deque<Observation> observations_;
     bool valid_ = false;
-    double period_ = 0, intercept_ = 0;   // relative to base
-    int64_t base_n_ = 0, base_t_ = 0;
-    double lastResid_ = 0;
-    std::vector<double> resid_;
+    double period_ = 0, intercept_ = 0;
+    int64_t baseIndex_ = 0, baseTime_ = 0;
+    std::vector<double> absResiduals_;
+    mutable std::vector<double> scratch_;
 };
 
-// Display vblank clock fed by a thread blocked in IDXGIOutput::WaitForVBlank.
+int64_t VblankIndex(const LinearClock& clock, int64_t lastIndex, int64_t lastTime, int64_t time, double nominalPeriod);
+
 class VsyncClock {
 public:
-    bool Start(IDXGIOutput* output, double nominalHz);
-    void Stop();
     ~VsyncClock() { Stop(); }
-    // Predicted QPC time of the first vblank strictly after `t`.
+    void Start(IDXGIOutput* output, double nominalHz);
+    void Stop();
     int64_t NextVblankAfter(int64_t t) const;
-    double PeriodTicks() const;
-    double MeasuredHz() const { double p = PeriodTicks(); return p > 0 ? (double)Qpc::Freq() / p : 0; }
-    double JitterMs() const; // p99 |residual|
-    bool Valid() const;
+    double MeasuredHz() const;
+    double JitterMs() const;
+
 private:
+    static constexpr size_t kWindow = 600;
     void Run();
     ComPtr<IDXGIOutput> output_;
-    std::thread thr_;
-    std::atomic<bool> run_{false};
-    mutable std::mutex m_;
-    LinearClock clock_{600};
-    double nominalTicks_ = 0;
-    int64_t count_ = 0, lastT_ = 0;
+    std::thread thread_;
+    std::atomic<bool> running_{false};
+    mutable std::mutex mutex_;
+    LinearClock clock_{kWindow};
+    double nominalPeriod_ = 0;
+    int64_t lastVblankTime_ = 0;
 };
 
-} // namespace camss
+}

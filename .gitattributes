@@ -1,4 +1,1 @@
 * text=auto eol=lf
-*.cmd text eol=crlf
-*.dll binary
-*.pdf binary

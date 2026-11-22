@@ -1,576 +1,738 @@
-// Offline simulation of the pacing core: a jittery, drifting 60 Hz source feeding
-// fixed-refresh (120 / 144 / 164 Hz) and VRR (k = 2, 3) output. Verifies that
-//  * the delay controller converges and stays late-free after warm-up,
-//  * the steady-state delay matches the theory  D ≈ (1 - t_min)·P + jitter + margin,
-//  * content time advances monotonically with smooth speed (drift absorbed),
-//  * VRR output lands exactly on the k-grid (t ∈ {0, 1/k, ...}).
-// Content cadence (a 60 Hz signal carrying 30 fps / 24p / 40 fps content):
-//  * CadenceDetector estimates the content period with hysteresis (no flapping, no change on static scenes),
-//  * output = k x content rate, D ≈ (k-1)/k·Pc·P + lead + jitter + margin, t on the content grid,
-//  * 60 -> 30 -> 60 switches retime D with few late frames, static scenes are stalls (D not raised).
-#include "pacing/pacer.h"
+#include "check.h"
 #include "pacing/cadence.h"
+#include "pacing/lead.h"
+#include "pacing/multiplier.h"
+#include "pacing/pacer.h"
+#include "util/stats.h"
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <functional>
 #include <cmath>
+#include <cstdio>
+#include <functional>
 #include <random>
 #include <vector>
 
-using namespace camss;
+using namespace cameravfx;
+using check::Verdict;
 
-struct Result {
-    double delayP50 = 0, delayMax = 0;
-    uint64_t lateAfterWarmup = 0, outputs = 0;
-    double maxSpeedDev = 0;       // max |dx/dV - 1/P| relative, after warm-up
-    double maxGridErr = 0;        // VRR: distance of t from the k-grid
-    uint64_t interpolated = 0;
-    uint64_t backwards = 0;
-    double delayBeforeStall = 0, delayMaxAfterStall = 0;
-    uint64_t stalls = 0;
-};
+namespace {
 
-static double Ms(double ticks) { return ticks * 1000.0 / (double)Qpc::Freq(); }
+constexpr double kSignalHz = 60.0;
+constexpr double kPeriodMs = 1000.0 / kSignalHz;
+constexpr double kLeadMs = 3.0;
+constexpr double kMarginMs = 1.0;
+constexpr double kBaseDelayMs = 7.0;
+constexpr double kSnap = 0.06;
+constexpr double kJitterMs = 1.5;
+constexpr double kToleranceMs = 1.0;
+constexpr double kSpikeMs = 4.0;
+constexpr double kProcessingMs = 1.0;
+constexpr double kStallSec = 0.25;
+constexpr double kRampMs = 4.0;
+constexpr double kVrrPollMs = 1.0;
+constexpr double kVrrOutputFps = 120.0;
+constexpr double kWarmUpSec = 8.0;
+constexpr double kEventWatchSec = 10.0;
+constexpr double kSlowReleaseMsPerSec = 2.0;
+constexpr double kSmallExcessMs = 3.0;
+constexpr double kReleaseRateWindowSec = 0.25;
+constexpr double kReleaseRateTolerance = 1.05;
 
-static Result Simulate(PaceMode mode, double displayHz, int k, double srcHz, double driftPpm, double jitterMs, double seconds,
-                       unsigned seed, double spikeProb, double stallAtSec = -1) {
-    const double F = (double)Qpc::Freq();
-    const double P = F / (srcHz * (1.0 + driftPpm * 1e-6));
-    const double T = F / displayHz;
-    const double lead = F * 0.003;
-    std::mt19937 rng(seed);
-    std::uniform_real_distribution<double> U(0.0, 1.0);
+using UniquePattern = std::function<bool(int64_t n, double sec)>;
 
-    Pacer pacer;
+bool Every2nd(int64_t n) { return n % 2 == 0; }
+bool Cadence32(int64_t n) { const int64_t r = n % 5; return r == 0 || r == 3; }
+bool Cadence21(int64_t n) { return n % 3 != 1; }
+bool Cadence112(int64_t n) { return n % 4 != 3; }
+
+double P50(std::vector<double> values) { return values.empty() ? 0 : Quantile(values, 0.5); }
+
+double Sec(int64_t ticks) { return (double)ticks / (double)Qpc::Freq(); }
+
+PacerConfig TestConfig(PaceMode mode, int multiplier, bool fg) {
     PacerConfig cfg;
-    cfg.mode = mode; cfg.vrrMultiplier = k; cfg.initialDelayMs = 30;
-    pacer.Configure(cfg, srcHz);
-
-    // Pre-generate ready times: base + processing 1 ms + jitter, occasional 4 ms spike.
-    const int64_t base = (int64_t)(F * 10);
-    const int N = (int)(seconds * srcHz) + 10;
-    std::vector<int64_t> ready(N);
-    for (int n = 0; n < N; n++) {
-        double j = U(rng) * jitterMs + (U(rng) < spikeProb ? 4.0 : 0.0);
-        ready[n] = base + (int64_t)(n * P + F * (1.0 + j) / 1000.0);
-    }
-    // Optional 250 ms source stall: frames due in the window arrive in a burst at its end.
-    if (stallAtSec > 0) {
-        const int64_t a = base + (int64_t)(stallAtSec * F), b = a + (int64_t)(0.25 * F);
-        for (int n = 0; n < N; n++) if (ready[n] >= a && ready[n] < b) ready[n] = b + n % 3;
-    }
-    int fed = 0;
-    auto feed = [&](int64_t until) { while (fed < N && ready[fed] <= until) { pacer.OnSourceFrame(fed, ready[fed]); fed++; } };
-
-    Result r;
-    std::vector<double> delays;
-    const int64_t end = base + (int64_t)(seconds * F);
-    const int64_t warm = base + (int64_t)(8 * F);
-    double prevX = -1, prevV = 0;
-    int64_t lastLate = 0;
-    int64_t V = base + (int64_t)T;
-    while (V < end) {
-        int64_t s;
-        if (mode == PaceMode::Vrr) {
-            feed(V - (int64_t)lead - (int64_t)T);   // what we know when scheduling
-            int64_t nv = pacer.NextVrrDisplayTime(V - (int64_t)lead, 3.0);
-            if (!nv) { V += (int64_t)T; continue; }
-            V = nv;
-        }
-        s = V - (int64_t)lead;
-        feed(s);
-        PaceDecision d = pacer.Decide(s, V);
-        if (d.valid) {
-            r.outputs++;
-            if (getenv("PACE_TRACE") && mode == PaceMode::Vrr && k == 2 && V > base + (int64_t)(30 * F) && V < base + (int64_t)(30.15 * F))
-                printf("    V=%.3f x=%.3f nA=%lld nB=%lld t=%.3f late=%d newest=%d D=%.2f minslack=%.2f slack(B)=%.2f\n",
-                       Ms((double)(V - base)), d.x, (long long)d.nA, (long long)d.nB, d.t, d.late, fed - 1, d.delayMs,
-                       pacer.MinSlackMs(), Ms((double)(s - ready[d.nB])));
-            if (getenv("PACE_UPTRACE") && spikeProb == 0 && mode == PaceMode::Vrr) {
-                static double lastD = 0;
-                static int printed = 0;
-                if (d.delayMs > lastD + 0.01 && printed++ < 25)
-                    printf("    up: V=%.3f D=%.3f (+%.3f) minslack=%.2f t=%.3f x=%.4f slack(B)=%.2f late=%d\n", Ms((double)(V - base)),
-                           d.delayMs, d.delayMs - lastD, pacer.MinSlackMs(), d.t, d.x, Ms((double)(s - ready[d.nB])), d.late);
-                lastD = d.delayMs;
-            }
-            if (getenv("PACE_DTRACE")) {
-                static int64_t lastPrint = 0;
-                if (V - lastPrint > (int64_t)(5 * F) || V < lastPrint) {
-                    lastPrint = V;
-                    printf("    [%5.1fs] D=%.2f minslack=%.2f\n", Ms((double)(V - base)) / 1000.0, d.delayMs, pacer.MinSlackMs());
-                }
-            }
-            if (stallAtSec > 0) {
-                const double tsec = (double)(V - base) / F;
-                if (tsec < stallAtSec) r.delayBeforeStall = d.delayMs;
-                else if (tsec < stallAtSec + 10) r.delayMaxAfterStall = std::max(r.delayMaxAfterStall, d.delayMs);
-            }
-            if (V > warm) {
-                delays.push_back(d.delayMs);
-                if (d.late) {
-                    lastLate = V;
-                    r.lateAfterWarmup++;
-                    if (getenv("PACE_DEBUG") && r.lateAfterWarmup < 6)
-                        printf("    late: V=%.3f s=%.3f x=%.3f newest=%d ready(newest)=%.3f ready(next)=%.3f D=%.2f\n", Ms((double)(V - base)),
-                               Ms((double)(s - base)), d.x, fed - 1, Ms((double)(ready[fed - 1] - base)), Ms((double)(ready[fed] - base)), d.delayMs);
-                }
-                // Speed smoothness, excluding the intentional freeze right after a late frame.
-                if (prevX >= 0 && V - lastLate > (int64_t)(0.5 * F)) {
-                    double speed = (d.x - prevX) / ((double)(V - prevV) / P);
-                    r.maxSpeedDev = std::max(r.maxSpeedDev, std::abs(speed - 1.0));
-                }
-                if (d.t > 0) r.interpolated++;
-                if (mode == PaceMode::Vrr) {
-                    double g = d.x * k;
-                    r.maxGridErr = std::max(r.maxGridErr, std::abs(g - std::round(g)) / k);
-                }
-            }
-            if (d.x < prevX - 1e-9) { printf("  ERROR: content time went backwards\n"); r.lateAfterWarmup += 1000; }
-            prevX = d.x; prevV = (double)V;
-        }
-        if (mode != PaceMode::Vrr) V += (int64_t)T;
-        else V += 1;  // next schedule computed by the pacer
-    }
-    r.stalls = pacer.StallCount();
-    if (!delays.empty()) {
-        std::sort(delays.begin(), delays.end());
-        r.delayP50 = delays[delays.size() / 2];
-        r.delayMax = delays.back();
-    }
-    return r;
+    cfg.mode = mode;
+    cfg.multiplier = multiplier;
+    cfg.fg = fg;
+    cfg.snapEps = kSnap;
+    cfg.marginMs = kMarginMs;
+    cfg.baseDelayMs = kBaseDelayMs;
+    return cfg;
 }
 
-// ======================================================================= content cadence
-// A 60 Hz signal carrying content at a lower rate: each signal frame is either new content
-// ("unique") or a repeat of the previous one.
-using Pattern = std::function<bool(int64_t n)>;
-static bool Pat60(int64_t) { return true; }
-static bool Pat30(int64_t n) { return n % 2 == 0; }                         // 30 fps: every frame twice
-static bool Pat24(int64_t n) { int64_t r = n % 5; return r == 0 || r == 3; } // 24p 3:2 pulldown (intervals 3,2)
-static bool Pat40(int64_t n) { int64_t r = n % 3; return r != 1; }           // 40 fps (intervals 2,1)
-static bool Pat45(int64_t n) { return n % 4 != 3; }                          // ~45 fps (intervals 1,1,2)
+enum class Detector { Off, ContentPeriod, ContentPeriodAndMultiplier };
 
-struct CadRun {
+struct SimCase {
+    const char* name = "";
+    PaceMode mode = PaceMode::Vrr;
+    double displayHz = 164.0;
+    int multiplier = 2;
+    bool fg = true;
+    UniquePattern unique = [](int64_t, double) { return true; };
+    double contentPeriod = 1.0;
+    Detector detector = Detector::Off;
+    double driftPpm = 20;
+    double jitterMs = kJitterMs;
+    double spikeProb = 0;
+    double seconds = 60;
+    unsigned seed = 4321;
+    double stallAtSec = -1;
+    double rampAtSec = -1;
+    double rampMsPerSec = 0;
+    double eventSec = -1;
+    double switchToFixedAtSec = -1;
+    double reconfigureAtSec = -1;
+};
+
+struct SimResult {
+    uint64_t outputs = 0, interpolated = 0, lates = 0, holds = 0, backwards = 0;
+    double outFps = 0, delayP50 = 0, delayMax = 0, latencyP50 = 0;
+    double maxSpeedDev = 0, maxGridErr = 0, maxMotionStep = 0, maxPresentGapMs = 0, maxSlowReleaseMsPerSec = 0;
+    std::vector<double> lateSec;
+    std::vector<std::pair<double, double>> delays;
+    std::vector<std::pair<double, double>> delayTrace;
+    std::vector<std::pair<double, bool>> interpolatedAt;
+    std::vector<double> latencies;
+    double delayBeforeEvent = 0, delayMaxAfterEvent = 0;
+    uint64_t holdsAfterEvent = 0;
+};
+
+double MaxSlowReleaseMsPerSec(const std::vector<std::pair<double, double>>& trace, double settledMs) {
+    double maxRate = 0;
+    size_t later = 0;
+    for (size_t i = 0; i < trace.size(); i++) {
+        while (later < trace.size() && trace[later].first < trace[i].first + kReleaseRateWindowSec) later++;
+        if (later == trace.size()) break;
+        if (trace[i].second - settledMs > kSmallExcessMs) continue;
+        maxRate = std::max(maxRate, (trace[i].second - trace[later].second) / (trace[later].first - trace[i].first));
+    }
+    return maxRate;
+}
+
+class Simulation {
+public:
+    explicit Simulation(const SimCase& c)
+        : c_(c), freq_((double)Qpc::Freq()), period_(freq_ / (kSignalHz * (1.0 + c.driftPpm * 1e-6))), base_((int64_t)(freq_ * 10)),
+          warm_(base_ + (int64_t)(kWarmUpSec * freq_)), mode_(c.mode) {
+        BuildSource();
+        cfg_ = TestConfig(c.mode, c.multiplier, c.fg);
+        if (c.detector == Detector::Off) cfg_.contentPeriod = c.contentPeriod;
+        pacer_.Configure(cfg_, kSignalHz);
+    }
+
+    SimResult Run() {
+        const int64_t lead = (int64_t)(freq_ * kLeadMs / 1000.0);
+        const int64_t vrrPoll = (int64_t)(freq_ * kVrrPollMs / 1000.0);
+        const int64_t refresh = (int64_t)(freq_ / c_.displayHz);
+        const int64_t end = base_ + (int64_t)(c_.seconds * freq_);
+        int64_t displayTime = base_ + vrrPoll;
+        while (displayTime < end) {
+            const double sec = Sec(displayTime - base_);
+            if (mode_ == PaceMode::Vrr && c_.switchToFixedAtSec > 0 && sec >= c_.switchToFixedAtSec) {
+                mode_ = PaceMode::Fixed;
+                pacer_.SetMode(mode_);
+            }
+            if (!reconfigured_ && c_.reconfigureAtSec > 0 && sec >= c_.reconfigureAtSec) Reconfigure();
+            if (mode_ == PaceMode::Vrr) {
+                Feed(displayTime - lead - vrrPoll);
+                const int64_t next = pacer_.NextVrrDisplayTime(displayTime - lead, kLeadMs);
+                if (!next) {
+                    displayTime += vrrPoll;
+                    continue;
+                }
+                displayTime = next;
+            }
+            const int64_t renderStart = displayTime - lead;
+            Feed(renderStart);
+            const uint64_t holdsBefore = pacer_.HoldCount();
+            const PaceDecision d = pacer_.Decide(renderStart, displayTime);
+            if (d.valid) Score(d, displayTime, pacer_.HoldCount() - holdsBefore);
+            displayTime += mode_ == PaceMode::Vrr ? 1 : refresh;
+        }
+        return Summarize();
+    }
+
+private:
+    void BuildSource() {
+        std::mt19937 rng(c_.seed);
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+        const int frames = (int)(c_.seconds * kSignalHz) + 10;
+        ready_.resize(frames);
+        unique_.resize(frames);
+        motion_.resize(frames);
+        double content = -1;
+        for (int n = 0; n < frames; n++) {
+            const double sec = n / kSignalHz;
+            const double jitter = uniform(rng) * c_.jitterMs + (uniform(rng) < c_.spikeProb ? kSpikeMs : 0.0);
+            const double ramp = c_.rampAtSec > 0 ? std::clamp((sec - c_.rampAtSec) * c_.rampMsPerSec, 0.0, kRampMs) : 0.0;
+            ready_[n] = base_ + (int64_t)(n * period_ + freq_ * (kProcessingMs + jitter + ramp) / 1000.0);
+            unique_[n] = n == 0 || c_.unique(n, sec);
+            if (unique_[n]) content += 1;
+            motion_[n] = content;
+        }
+        if (c_.stallAtSec > 0) {
+            const int64_t from = base_ + (int64_t)(c_.stallAtSec * freq_), to = from + (int64_t)(kStallSec * freq_);
+            for (int n = 0; n < frames; n++)
+                if (ready_[n] >= from && ready_[n] < to) ready_[n] = to + n % 3;
+        }
+    }
+
+    void Feed(int64_t until) {
+        for (; fed_ < ready_.size() && ready_[fed_] <= until; fed_++) {
+            const int64_t n = (int64_t)fed_;
+            pacer_.OnSourceFrame(n, ready_[fed_], unique_[fed_]);
+            if (c_.detector == Detector::Off || !detector_.OnFrame(n, unique_[fed_])) continue;
+            pacer_.SetContentPeriod(detector_.ContentPeriod());
+            if (c_.detector == Detector::ContentPeriodAndMultiplier)
+                pacer_.SetMultiplier(std::max(1, (int)std::lround(kVrrOutputFps / (kSignalHz / detector_.ContentPeriod()))));
+        }
+    }
+
+    void Reconfigure() {
+        reconfigured_ = true;
+        cfg_.contentPeriod = detector_.ContentPeriod();
+        pacer_.Configure(cfg_, kSignalHz);
+        detector_ = CadenceDetector(kDefaultContentPeriods, cfg_.contentPeriod);
+        previousPosition_ = -1;
+    }
+
+    void Score(const PaceDecision& d, int64_t displayTime, uint64_t newHolds) {
+        const double sec = Sec(displayTime - base_);
+        if (!unique_[(size_t)d.frameA] || !unique_[(size_t)d.frameB]) Error("repeat frame used");
+        if (d.sourcePosition < previousPosition_ - 1e-9) Error("source position went backwards");
+        const double shown = motion_[(size_t)d.frameA] + (d.t > 0 ? d.t * (motion_[(size_t)d.frameB] - motion_[(size_t)d.frameA]) : 0.0);
+        if (shown < previousMotion_ - 1e-9) Error("motion went backwards");
+        r_.delayTrace.push_back({sec, d.delayMs});
+        if (c_.eventSec > 0) {
+            if (sec < c_.eventSec) r_.delayBeforeEvent = d.delayMs;
+            else if (sec < c_.eventSec + kEventWatchSec) {
+                r_.delayMaxAfterEvent = std::max(r_.delayMaxAfterEvent, d.delayMs);
+                r_.holdsAfterEvent += newHolds;
+            }
+        }
+        if (d.late) {
+            r_.lateSec.push_back(sec);
+            lastLate_ = displayTime;
+        }
+        if (displayTime > warm_) {
+            r_.outputs++;
+            r_.delays.push_back({sec, d.delayMs});
+            r_.interpolatedAt.push_back({sec, d.t > 0});
+            if (d.late) r_.lates++;
+            if (d.t > 0) r_.interpolated++;
+            if (!d.hold) r_.latencies.push_back(Qpc::ToMs(displayTime - ready_[(size_t)(d.t > 0 ? d.frameB : d.frameA)]));
+            if (previousPosition_ >= 0 && displayTime - lastLate_ > (int64_t)(0.5 * freq_)) {
+                const double speed = (d.sourcePosition - previousPosition_) / ((double)(displayTime - previousDisplayTime_) / period_);
+                r_.maxSpeedDev = std::max(r_.maxSpeedDev, std::abs(speed - 1.0));
+            }
+            if (mode_ == PaceMode::Vrr) {
+                const double grid = d.sourcePosition * pacer_.Multiplier() / pacer_.ContentPeriod();
+                r_.maxGridErr = std::max(r_.maxGridErr, std::abs(grid - std::round(grid)) / pacer_.Multiplier());
+                r_.maxPresentGapMs = std::max(r_.maxPresentGapMs, Qpc::ToMs(displayTime - previousDisplayTime_));
+            }
+            if (previousMotion_ >= 0) r_.maxMotionStep = std::max(r_.maxMotionStep, shown - previousMotion_);
+        }
+        previousPosition_ = d.sourcePosition;
+        previousMotion_ = shown;
+        previousDisplayTime_ = displayTime;
+    }
+
+    void Error(const char* what) {
+        printf("  ERROR: %s\n", what);
+        r_.backwards++;
+    }
+
+    SimResult Summarize() {
+        r_.holds = pacer_.HoldCount();
+        r_.outFps = (double)r_.outputs / (c_.seconds - kWarmUpSec);
+        std::vector<double> delays;
+        for (const auto& [sec, delay] : r_.delays) delays.push_back(delay);
+        r_.delayP50 = P50(delays);
+        r_.delayMax = delays.empty() ? 0 : *std::max_element(delays.begin(), delays.end());
+        r_.latencyP50 = P50(r_.latencies);
+        r_.maxSlowReleaseMsPerSec = MaxSlowReleaseMsPerSec(r_.delayTrace, r_.delayP50);
+        return r_;
+    }
+
+    const SimCase c_;
+    const double freq_, period_;
+    const int64_t base_, warm_;
+    PacerConfig cfg_;
+    Pacer pacer_;
+    CadenceDetector detector_;
+    PaceMode mode_;
+    std::vector<int64_t> ready_;
+    std::vector<bool> unique_;
+    std::vector<double> motion_;
+    size_t fed_ = 0;
+    bool reconfigured_ = false;
+    double previousPosition_ = -1, previousMotion_ = -1;
+    int64_t previousDisplayTime_ = 0, lastLate_ = 0;
+    SimResult r_;
+};
+
+SimResult Simulate(const SimCase& c) { return Simulation(c).Run(); }
+
+double DelayP50In(const SimResult& r, double fromSec, double toSec) {
+    std::vector<double> values;
+    for (const auto& [sec, delay] : r.delays)
+        if (sec >= fromSec && sec < toSec) values.push_back(delay);
+    return P50(values);
+}
+
+size_t LatesIn(const SimResult& r, double fromSec, double toSec) {
+    return (size_t)std::count_if(r.lateSec.begin(), r.lateSec.end(), [&](double sec) { return sec >= fromSec && sec < toSec; });
+}
+
+double TheoryVrr(double contentPeriod, int multiplier) { return (double)(multiplier - 1) / multiplier * contentPeriod * kPeriodMs + kLeadMs + kMarginMs; }
+
+void SteadyTests() {
+    struct Case { SimCase sim; double boundMs; };
+    const double clean = kLeadMs + kJitterMs + kMarginMs + kToleranceMs;
+    const double fixedNoGuard = kPeriodMs + kLeadMs + kMarginMs;
+    auto fixed = [](const char* name, double hz, double drift, double spikes) {
+        SimCase c; c.name = name; c.mode = PaceMode::Fixed; c.displayHz = hz; c.driftPpm = drift; c.spikeProb = spikes; c.seed = 1234; return c;
+    };
+    auto vrr = [](const char* name, int multiplier, double drift, double spikes) {
+        SimCase c; c.name = name; c.multiplier = multiplier; c.driftPpm = drift; c.spikeProb = spikes; c.seed = 1234; return c;
+    };
+    const Case cases[] = {
+        {fixed("fixed 120Hz +80ppm", 120.0, 80, 0.01), kPeriodMs + clean + kSpikeMs},
+        {fixed("fixed 120Hz -30ppm", 119.998, -30, 0.01), kPeriodMs + clean + kSpikeMs},
+        {fixed("fixed 144Hz", 144.0, 20, 0.01), kPeriodMs + clean + kSpikeMs},
+        {fixed("fixed 164Hz", 164.0, 20, 0.01), kPeriodMs + clean + kSpikeMs},
+        {fixed("fixed 164Hz, no spikes", 164.0, 20, 0.0), fixedNoGuard},
+        {vrr("vrr k=2 (120 fps)", 2, 40, 0.01), kPeriodMs / 2 + clean + kSpikeMs},
+        {vrr("vrr k=2, no spikes", 2, 40, 0.0), kPeriodMs / 2 + clean},
+        {vrr("vrr k=3 (180 fps)", 3, 40, 0.01), 2 * kPeriodMs / 3 + clean + kSpikeMs},
+        {vrr("vrr k=2, 59.94 Hz source", 2, -1000, 0.0), kPeriodMs / 2 + clean},
+        {fixed("fixed 164Hz, 59.94 Hz src", 164.0, -1000, 0.0), fixedNoGuard},
+    };
+    for (const Case& c : cases) {
+        const SimResult r = Simulate(c.sim);
+        const bool vrrMode = c.sim.mode == PaceMode::Vrr;
+        const bool spikes = c.sim.spikeProb > 0;
+        const bool ok = r.lates <= (spikes ? 20u : 0u) && r.backwards == 0 && r.delayP50 <= c.boundMs && r.maxSpeedDev < 0.03 &&
+                        (!vrrMode || r.maxGridErr < 0.02) && (spikes || r.maxSlowReleaseMsPerSec <= kSlowReleaseMsPerSec * kReleaseRateTolerance);
+        printf("%-26s out=%6llu interp=%6llu late=%2llu back=%llu  D p50=%6.2f max=%6.2f (bound %5.2f) ms  release<=%.2f ms/s  speed dev=%.4f  "
+               "grid err=%.4f  %s\n",
+               c.sim.name, (unsigned long long)r.outputs, (unsigned long long)r.interpolated, (unsigned long long)r.lates,
+               (unsigned long long)r.backwards, r.delayP50, r.delayMax, c.boundMs, r.maxSlowReleaseMsPerSec, r.maxSpeedDev, r.maxGridErr,
+               Verdict(ok));
+    }
+    for (PaceMode mode : {PaceMode::Vrr, PaceMode::Fixed}) {
+        SimCase c;
+        c.name = mode == PaceMode::Vrr ? "stall 250ms (vrr)" : "stall 250ms (fixed 164)";
+        c.mode = mode; c.jitterMs = 0.5; c.seconds = 30; c.seed = 99; c.stallAtSec = 15; c.eventSec = 15;
+        const SimResult r = Simulate(c);
+        const bool ok = r.delayMaxAfterEvent - r.delayBeforeEvent < 3.0 && r.backwards == 0 && r.holds > 0;
+        printf("%-26s D before %.2f ms, max within 10 s after %.2f ms, hold outputs %llu, late %llu  %s\n", c.name, r.delayBeforeEvent,
+               r.delayMaxAfterEvent, (unsigned long long)r.holds, (unsigned long long)r.lateSec.size(), Verdict(ok));
+    }
+    for (double rampMsPerSec : {4.0, 6.0}) {
+        SimCase c;
+        c.name = rampMsPerSec == 4.0 ? "arrival +4 ms at 4 ms/s" : "arrival +4 ms at 6 ms/s";
+        c.seconds = 40; c.rampAtSec = 20; c.rampMsPerSec = rampMsPerSec;
+        const SimResult r = Simulate(c);
+        const bool ok = r.lates == 0 && r.backwards == 0;
+        printf("%-26s late=%llu back=%llu  D before %.2f ms, after %.2f ms  %s\n", c.name, (unsigned long long)r.lates,
+               (unsigned long long)r.backwards, DelayP50In(r, 15, 20), DelayP50In(r, 30, 40), Verdict(ok));
+    }
+}
+
+struct CadenceRun {
     int switches = 0;
     double final = 1.0;
-    std::vector<std::pair<int64_t, double>> sw;   // (frame, new period)
+    std::vector<std::pair<int64_t, double>> changes;
 };
 
-// Feed `frames` signal frames; `received` (optional) drops frames that return false.
-static CadRun RunCadence(const Pattern& uniq, int64_t frames, const Pattern& received = nullptr, const CadenceConfig& cfg = {}) {
-    CadenceDetector det(cfg);
-    CadRun r;
+CadenceRun RunCadence(const std::function<bool(int64_t)>& unique, int64_t frames, const std::function<bool(int64_t)>& received = nullptr,
+                      const std::vector<double>& periods = kDefaultContentPeriods, double startPeriod = 1.0) {
+    CadenceDetector detector(periods, startPeriod);
+    CadenceRun r;
+    r.final = startPeriod;
     for (int64_t n = 0; n < frames; n++) {
         if (received && !received(n)) continue;
-        if (det.OnFrame(n, uniq(n))) { r.switches++; r.sw.push_back({n, det.ContentPeriod()}); }
+        if (detector.OnFrame(n, unique(n))) { r.switches++; r.changes.push_back({n, detector.ContentPeriod()}); }
     }
-    r.final = det.ContentPeriod();
+    r.final = detector.ContentPeriod();
     return r;
 }
 
-static int CadenceTests() {
-    int fails = 0;
-    const CadenceConfig cfg;
-    auto report = [&](const char* name, const CadRun& r, bool ok, const char* extra = "") {
+void CadenceTests() {
+    auto report = [&](const char* name, const CadenceRun& r, bool ok, const char* extra = "") {
         printf("%-34s active=%.3f switches=%d", name, r.final, r.switches);
-        for (size_t i = 0; i < r.sw.size() && i < 4; i++) printf(" [@%lld -> %.3f]", (long long)r.sw[i].first, r.sw[i].second);
-        printf("%s  %s\n", extra, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+        for (size_t i = 0; i < r.changes.size() && i < 4; i++) printf(" [@%lld -> %.3f]", (long long)r.changes[i].first, r.changes[i].second);
+        printf("%s  %s\n", extra, Verdict(ok));
     };
-    { CadRun r = RunCadence(Pat60, 1200); report("cadence 60 fps", r, r.final == 1.0 && r.switches == 0); }
-    { CadRun r = RunCadence(Pat30, 1200); report("cadence 30-in-60", r, r.final == 2.0 && r.switches == 1); }
-    { CadRun r = RunCadence(Pat24, 1200); report("cadence 24p 3:2", r, r.final == 2.5 && r.switches == 1); }
-    { CadRun r = RunCadence(Pat40, 1200); report("cadence 40 fps (2:1)", r, r.final == 1.5 && r.switches == 1); }
-    { CadRun r = RunCadence(Pat45, 1200); report("cadence ~45 fps (1,1,2)", r, std::abs(r.final - 4.0 / 3.0) < 0.05 && r.switches == 1); }
-    {   // 60 fps with a 1 s static pause (no unique frames for 60 signal frames).
-        CadRun r = RunCadence([](int64_t n) { return n < 600 || n >= 660; }, 1200);
+    auto every = [](int64_t) { return true; };
+    { CadenceRun r = RunCadence(every, 1200); report("cadence 60 fps", r, r.final == 1.0 && r.switches == 0); }
+    { CadenceRun r = RunCadence(Every2nd, 1200); report("cadence 30-in-60", r, r.final == 2.0 && r.switches == 1); }
+    { CadenceRun r = RunCadence(Cadence32, 1200); report("cadence 24p 3:2", r, r.final == 2.5 && r.switches == 1); }
+    { CadenceRun r = RunCadence(Cadence21, 1200); report("cadence 40 fps (2:1)", r, r.final == 1.5 && r.switches == 1); }
+    { CadenceRun r = RunCadence(Cadence112, 1200); report("cadence ~45 fps (1,1,2)", r, std::abs(r.final - 4.0 / 3.0) < 0.05 && r.switches == 1); }
+    { CadenceRun r = RunCadence(Every2nd, 1200, nullptr, kDefaultContentPeriods, 2.0); report("cadence 30-in-60, started at 30", r, r.final == 2.0 && r.switches == 0); }
+    { CadenceRun r = RunCadence(every, 1200, nullptr, kDefaultContentPeriods, 2.0); report("cadence 60 fps, started at 30", r, r.final == 1.0 && r.switches == 1); }
+    {
+        CadenceRun r = RunCadence([](int64_t n) { return n < 600 || n >= 660; }, 1200);
         report("cadence 60 + 1 s static", r, r.final == 1.0 && r.switches == 0);
     }
-    {   // 60 fps with a 5 s static pause (window empties completely).
-        CadRun r = RunCadence([](int64_t n) { return n < 600 || n >= 900; }, 1500);
+    {
+        CadenceRun r = RunCadence([](int64_t n) { return n < 600 || n >= 900; }, 1500);
         report("cadence 60 + 5 s static", r, r.final == 1.0 && r.switches == 0);
     }
-    {   // Alternating 30 / 60 fps segments shorter than the hold: never flap back and forth.
-        for (int seg : {20, 30}) {
-            CadRun r = RunCadence([seg](int64_t n) { return ((n / seg) % 2 == 0) ? true : (n % 2 == 0); }, 3600);
-            char name[64];
-            snprintf(name, sizeof(name), "cadence 30/60 alternating %d fr", seg);
-            report(name, r, r.switches <= 1);
-        }
+    for (int segment : {20, 30}) {
+        CadenceRun r = RunCadence([segment](int64_t n) { return (n / segment) % 2 == 0 || n % 2 == 0; }, 3600);
+        char name[64];
+        snprintf(name, sizeof(name), "cadence 30/60 alternating %d fr", segment);
+        report(name, r, r.switches <= 1);
     }
-    for (int dir = 0; dir < 2; dir++) {
-        // Switch latency: 60 -> 30 (and 30 -> 60) at frame 1200.
+    for (bool toThirty : {true, false}) {
         const int64_t at = 1200;
-        Pattern p = dir == 0 ? Pattern([at](int64_t n) { return n < at ? true : n % 2 == 0; })
-                             : Pattern([at](int64_t n) { return n < at ? n % 2 == 0 : true; });
-        CadRun r = RunCadence(p, 2400);
-        const int64_t lat = r.sw.empty() ? -1 : r.sw.back().first - at;
-        const bool ok = r.final == (dir == 0 ? 2.0 : 1.0) && r.switches == (dir == 0 ? 1 : 2) && lat >= cfg.holdFrames &&
-                        lat <= cfg.holdFrames + cfg.windowFrames / 2 + 2;
+        auto pattern = [at, toThirty](int64_t n) { return (n < at) == toThirty ? true : n % 2 == 0; };
+        CadenceRun r = RunCadence(pattern, 2400);
+        const int64_t latency = r.changes.empty() ? -1 : r.changes.back().first - at;
+        const bool ok = r.final == (toThirty ? 2.0 : 1.0) && r.switches == (toThirty ? 1 : 2) && latency >= CadenceDetector::kHoldFrames &&
+                        latency <= CadenceDetector::kHoldFrames + CadenceDetector::kWindowFrames + 2;
         char extra[64];
-        snprintf(extra, sizeof(extra), "  latency %lld frames (%.0f ms)", (long long)lat, lat * 1000.0 / 60.0);
-        report(dir == 0 ? "cadence 60->30 switch" : "cadence 30->60 switch", r, ok, extra);
+        snprintf(extra, sizeof(extra), "  latency %lld frames (%.0f ms)", (long long)latency, latency * kPeriodMs);
+        report(toThirty ? "cadence 60->30 switch" : "cadence 30->60 switch", r, ok, extra);
     }
-    {   // 30-in-60 with 3% random drops and a 100-frame signal gap: stays at 2.
+    {
         std::mt19937 rng(7);
-        std::vector<bool> rx(3000);
-        for (auto&& v : rx) v = (rng() % 100) >= 3;
-        for (int i = 1500; i < 1600; i++) rx[i] = false;
-        CadRun r = RunCadence(Pat30, 3000, [&](int64_t n) { return (bool)rx[(size_t)n]; });
+        std::vector<bool> received(3000);
+        for (auto&& v : received) v = (rng() % 100) >= 3;
+        for (int i = 1500; i < 1600; i++) received[i] = false;
+        CadenceRun r = RunCadence(Every2nd, 3000, [&](int64_t n) { return (bool)received[(size_t)n]; });
         report("cadence 30-in-60, drops + gap", r, r.final == 2.0 && r.switches == 1);
     }
-    {   // 24p with drops: stays at 2.5.
+    {
+        const std::vector<double> console = ContentPeriods({60, 30}, kSignalHz);
+        auto pattern = [](int64_t n) { return n < 600 ? true : n < 690 ? n % 4 != 3 : n % 2 == 0; };
+        CadenceRun r = RunCadence(pattern, 1500, nullptr, console);
+        bool onlyListed = true;
+        for (const auto& change : r.changes) onlyListed &= change.second == 1.0 || change.second == 2.0;
+        report("console 60->45 mix->30", r, onlyListed && r.final == 2.0 && r.switches == 1);
+        CadenceRun all = RunCadence(pattern, 1500);
+        report("default 60->45 mix->30", all, all.final == 2.0);
+        CadenceRun menu = RunCadence([](int64_t n) { return n < 300 ? true : (n * 100) % 471 < 100; }, 1500, nullptr, console);
+        report("console menu ~12.7 fps", menu, menu.final == 1.0 && menu.switches == 0);
+    }
+    {
         std::mt19937 rng(9);
-        std::vector<bool> rx(3000);
-        for (auto&& v : rx) v = (rng() % 100) >= 2;
-        CadRun r = RunCadence(Pat24, 3000, [&](int64_t n) { return (bool)rx[(size_t)n]; });
+        std::vector<bool> received(3000);
+        for (auto&& v : received) v = (rng() % 100) >= 2;
+        CadenceRun r = RunCadence(Cadence32, 3000, [&](int64_t n) { return (bool)received[(size_t)n]; });
         report("cadence 24p 3:2, 2% drops", r, r.final == 2.5 && r.switches == 1);
     }
-    return fails;
+    {
+        const std::vector<double> periods = ContentPeriods({120, 60, 30, 24}, kSignalHz);
+        const bool ok = periods == std::vector<double>{1.0, 2.0, 2.5} && ContentPeriods({120}, kSignalHz).empty();
+        printf("%-34s %zu periods  %s\n", "content rates 120,60,30,24 at 60 Hz", periods.size(), Verdict(ok));
+    }
 }
 
-// The needed-next-frame rule before the next content frame has arrived must match the snap rule it
-// gets once it arrives. 24p 3:2 (Pc = 2.5): unique 290 starts a 3-interval (next unique 293). With
-// repeats 291, 292 received, x = 290.165 snaps to A once 293 is here (t = 0.055 <= eps), so it is
-// not late; and one late content frame is penalised once, even when its predicted index moves
-// (290 + 2.5 -> 293) because a repeat arrived where it was expected.
-static int PredictionTests() {
-    int fails = 0;
-    const double F = (double)Qpc::Freq(), P = F / 60.0;
-    const int64_t base = (int64_t)(F * 10);
-    auto mk = [&](Pacer& p, int64_t last, double delayMs) {   // perfect 60 Hz timing, frames 0..last received
-        PacerConfig cfg;
-        cfg.mode = PaceMode::Fixed; cfg.initialDelayMs = delayMs;
-        p.SetContentPeriod(2.5);   // before Configure (which keeps Pc), so D starts at exactly delayMs
-        p.Configure(cfg, 60.0);
-        for (int64_t n = 0; n <= last; n++) p.OnSourceFrame(n, base + (int64_t)std::llround((double)n * P), Pat24(n));
+void PredictionTests() {
+    const double freq = (double)Qpc::Freq(), period = freq / kSignalHz;
+    const int64_t base = (int64_t)(freq * 10);
+    auto make = [&](Pacer& p, int64_t last, double delayMs) {
+        PacerConfig cfg = TestConfig(PaceMode::Fixed, 1, true);
+        cfg.contentPeriod = 2.5;
+        cfg.baseDelayMs = delayMs - 2.5 * kPeriodMs;
+        p.Configure(cfg, kSignalHz);
+        for (int64_t n = 0; n <= last; n++) p.OnSourceFrame(n, base + (int64_t)std::llround((double)n * period), Cadence32(n));
     };
-    auto at = [&](Pacer& p, double x) {   // decide for content position x (render starts 3 ms before V)
-        const int64_t V = base + (int64_t)std::llround(x * P + (double)Qpc::FromMs(p.DelayMs()));
-        return p.Decide(V - Qpc::FromMs(3.0), V);
+    auto at = [&](Pacer& p, double position) {
+        const int64_t displayTime = base + (int64_t)std::llround(position * period + (double)Qpc::FromMs(p.DelayMs()));
+        return p.Decide(displayTime - Qpc::FromMs(kLeadMs), displayTime);
     };
     {
-        Pacer p; mk(p, 292, 50.0);                            // render starts after 292 arrived, before 293
-        PaceDecision d = at(p, 290.165);
-        const bool ok = d.valid && !d.late && !d.stall && d.nA == 290 && d.t == 0 && p.LateCount() == 0;
-        printf("%-34s x=%.3f nA=%lld t=%.3f late=%d lates=%llu  %s\n", "predict 24p: snaps to A, not late", d.x, (long long)d.nA, d.t,
-               d.late, (unsigned long long)p.LateCount(), ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+        Pacer p;
+        make(p, 292, 50.0);
+        const PaceDecision d = at(p, 290.165);
+        const bool ok = d.valid && !d.late && !d.hold && d.frameA == 290 && d.t == 0 && p.LateCount() == 0;
+        printf("%-34s x=%.3f frameA=%lld t=%.3f late=%d lates=%llu  %s\n", "predict 24p: snaps to A, not late", d.sourcePosition,
+               (long long)d.frameA, d.t, d.late, (unsigned long long)p.LateCount(), Verdict(ok));
     }
     {
-        Pacer p; mk(p, 291, 25.0);                            // render starts before 292 arrives
-        PaceDecision d1 = at(p, 290.3);                       // 293 needed, expected at 292.5: late
-        p.OnSourceFrame(292, base + (int64_t)std::llround(292.0 * P), false);
-        PaceDecision d2 = at(p, 290.6);                       // same content frame, now expected at 293
-        const bool ok = d1.late && !d1.stall && d2.late && !d2.stall && p.LateCount() == 1;
-        printf("%-34s late=%d,%d penalties=%llu  %s\n", "predict 24p: one penalty per frame", d1.late, d2.late,
-               (unsigned long long)p.LateCount(), ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+        Pacer p;
+        make(p, 291, 25.0);
+        const PaceDecision first = at(p, 290.3);
+        p.OnSourceFrame(292, base + (int64_t)std::llround(292.0 * period), false);
+        const PaceDecision second = at(p, 290.6);
+        const bool ok = first.late && !first.hold && second.late && !second.hold && p.LateCount() == 1;
+        printf("%-34s late=%d,%d penalties=%llu  %s\n", "predict 24p: one penalty per frame", first.late, second.late,
+               (unsigned long long)p.LateCount(), Verdict(ok));
     }
-    return fails;
 }
 
-// Pacer driven by content at a lower rate than the signal.
-struct ContentCase {
-    const char* name;
-    PaceMode mode;
-    double hz;              // display Hz (VRR: scheduler granularity)
-    int k;
-    std::function<bool(int64_t n, double tsec)> uniq;
-    double pc = 1.0;        // content period set up front (detector == 0)
-    int detector = 0;       // 1: CadenceDetector -> SetContentPeriod; 2: also SetMultiplier for a constant 120 fps target
-    double spike = 0.0;
-    double stallAtSec = -1;
-    double seconds = 60;
-};
-
-struct ContentResult {
-    uint64_t outputs = 0, interpolated = 0, lates = 0, stalls = 0, backwards = 0;
-    double outFps = 0;
-    double delayP50 = 0, delayMax = 0, latP50 = 0;
-    double maxGridErr = 0;
-    double maxMotionStep = 0;     // largest per-output change of the shown motion (in content frames)
-    std::vector<double> lateT;    // seconds
-    std::vector<std::pair<double, double>> delays;   // (sec, D)
-    std::vector<std::pair<double, int>> interpT;     // (sec, interpolated?)
-    double delayBefore = 0, delayMaxAfter = 0;      // around stallAtSec / a static scene
-    uint64_t stallsDuring = 0;
-};
-
-static double P50(std::vector<double> v) {
-    if (v.empty()) return 0;
-    std::sort(v.begin(), v.end());
-    return v[v.size() / 2];
-}
-
-static ContentResult SimulateContent(const ContentCase& c, double eventSec = -1) {
-    const double F = (double)Qpc::Freq();
-    const double srcHz = 60.0, jitterMs = 1.5, driftPpm = 20;
-    const double P = F / (srcHz * (1.0 + driftPpm * 1e-6));
-    const double T = F / c.hz;
-    const double lead = F * 0.003;
-    std::mt19937 rng(4321);
-    std::uniform_real_distribution<double> U(0.0, 1.0);
-
-    Pacer pacer;
-    PacerConfig cfg;
-    cfg.mode = c.mode; cfg.vrrMultiplier = c.k; cfg.initialDelayMs = 30;
-    pacer.Configure(cfg, srcHz);
-    if (!c.detector) pacer.SetContentPeriod(c.pc);
-    CadenceDetector det;
-
-    const int64_t base = (int64_t)(F * 10);
-    const int N = (int)(c.seconds * srcHz) + 10;
-    std::vector<int64_t> ready(N);
-    std::vector<char> uniq(N);
-    std::vector<double> motion(N);   // content frames shown up to n (motion position of frame n)
-    double m = -1;
-    for (int n = 0; n < N; n++) {
-        double j = U(rng) * jitterMs + (U(rng) < c.spike ? 4.0 : 0.0);
-        ready[n] = base + (int64_t)(n * P + F * (1.0 + j) / 1000.0);
-        uniq[n] = (n == 0 || c.uniq(n, n / srcHz)) ? 1 : 0;
-        if (uniq[n]) m += 1;
-        motion[n] = m;
-    }
-    if (c.stallAtSec > 0) {
-        const int64_t a = base + (int64_t)(c.stallAtSec * F), b = a + (int64_t)(0.25 * F);
-        for (int n = 0; n < N; n++) if (ready[n] >= a && ready[n] < b) ready[n] = b + n % 3;
-    }
-    int fed = 0;
-    auto feed = [&](int64_t until) {
-        while (fed < N && ready[fed] <= until) {
-            const bool u = uniq[fed] != 0;
-            pacer.OnSourceFrame(fed, ready[fed], u);
-            if (c.detector && det.OnFrame(fed, u)) {
-                pacer.SetContentPeriod(det.ContentPeriod());
-                if (c.detector == 2) pacer.SetMultiplier(std::max(1, (int)std::lround(120.0 / (srcHz / det.ContentPeriod()))));
-            }
-            fed++;
-        }
+void ContentTests() {
+    auto every2nd = [](int64_t n, double) { return Every2nd(n); };
+    auto cadence32 = [](int64_t n, double) { return Cadence32(n); };
+    auto content = [](const char* name, PaceMode mode, double hz, int multiplier, UniquePattern unique, double contentPeriod) {
+        SimCase c; c.name = name; c.mode = mode; c.displayHz = hz; c.multiplier = multiplier; c.unique = std::move(unique); c.contentPeriod = contentPeriod;
+        return c;
     };
-
-    ContentResult r;
-    std::vector<double> lat;
-    const int64_t end = base + (int64_t)(c.seconds * F);
-    const int64_t warm = base + (int64_t)(8 * F);
-    double prevCx = -1, prevMotion = -1;
-    int64_t V = base + (int64_t)T;
-    while (V < end) {
-        if (c.mode == PaceMode::Vrr) {
-            feed(V - (int64_t)lead - (int64_t)T);
-            int64_t nv = pacer.NextVrrDisplayTime(V - (int64_t)lead, 3.0);
-            if (!nv) { V += (int64_t)T; continue; }
-            V = nv;
-        }
-        const int64_t s = V - (int64_t)lead;
-        feed(s);
-        const uint64_t stallsBefore = pacer.StallCount();
-        PaceDecision d = pacer.Decide(s, V);
-        if (d.valid) {
-            const double tsec = (double)(V - base) / F;
-            if (!uniq[(size_t)d.nA] || !uniq[(size_t)d.nB]) { printf("  ERROR: repeat frame used\n"); r.backwards += 1000; }
-            if (d.cx < prevCx - 1e-9) { printf("  ERROR: content time went backwards (%.3f -> %.3f)\n", prevCx, d.cx); r.backwards++; }
-            const double mo = d.t > 0 ? motion[(size_t)d.nA] + d.t * (motion[(size_t)d.nB] - motion[(size_t)d.nA]) : motion[(size_t)d.nA];
-            if (mo < prevMotion - 1e-9) { printf("  ERROR: motion went backwards\n"); r.backwards++; }
-            if (eventSec > 0) {
-                if (tsec < eventSec) r.delayBefore = d.delayMs;
-                else if (tsec < eventSec + 10) {
-                    r.delayMaxAfter = std::max(r.delayMaxAfter, d.delayMs);
-                    r.stallsDuring += pacer.StallCount() - stallsBefore;
-                }
-            }
-            if (V > warm) {
-                r.outputs++;
-                r.delays.push_back({tsec, d.delayMs});
-                r.interpT.push_back({tsec, d.t > 0 ? 1 : 0});
-                if (d.late && !d.stall) {
-                    r.lates++;
-                    r.lateT.push_back(tsec);
-                    if (getenv("PACE_DEBUG") && r.lates < 8)
-                        printf("    late: t=%.3fs x=%.3f nA=%lld newest signal=%d (unique %d) ready(next)=%+.2f ms vs s, D=%.2f minslack=%.2f\n",
-                               tsec, d.x, (long long)d.nA, fed - 1, (int)uniq[(size_t)fed - 1], Ms((double)(ready[(size_t)fed] - s)),
-                               d.delayMs, pacer.MinSlackMs());
-                }
-                if (d.t > 0) r.interpolated++;
-                if (!d.stall) lat.push_back(Ms((double)(V - ready[(size_t)(d.t > 0 ? d.nB : d.nA)])));
-                if (c.mode == PaceMode::Vrr) {
-                    // On the content grid t is a multiple of 1/k (exact for integer Pc).
-                    const double g = d.t * pacer.Multiplier();
-                    r.maxGridErr = std::max(r.maxGridErr, std::abs(g - std::round(g)) / pacer.Multiplier());
-                }
-                if (prevMotion >= 0) r.maxMotionStep = std::max(r.maxMotionStep, mo - prevMotion);
-                if (getenv("PACE_CTRACE") && tsec > atof(getenv("PACE_CTRACE")) && tsec < atof(getenv("PACE_CTRACE")) + 0.15)
-                    printf("    V=%.3f x=%.3f cx=%.3f nA=%lld nB=%lld t=%.3f late=%d stall=%d sig=%d D=%.2f minslack=%.2f\n", tsec, d.x, d.cx,
-                           (long long)d.nA, (long long)d.nB, d.t, d.late, d.stall, fed - 1, d.delayMs, pacer.MinSlackMs());
-            }
-            prevCx = d.cx; prevMotion = mo;
-        }
-        if (c.mode != PaceMode::Vrr) V += (int64_t)T;
-        else V += 1;
-    }
-    r.stalls = pacer.StallCount();
-    r.outFps = (double)r.outputs / (c.seconds - 8.0);
-    std::vector<double> ds;
-    for (auto& p : r.delays) ds.push_back(p.second);
-    r.delayP50 = P50(ds);
-    r.delayMax = ds.empty() ? 0 : *std::max_element(ds.begin(), ds.end());
-    r.latP50 = P50(lat);
-    return r;
-}
-
-static double DelayP50In(const ContentResult& r, double a, double b) {
-    std::vector<double> v;
-    for (auto& p : r.delays) if (p.first >= a && p.first < b) v.push_back(p.second);
-    return P50(v);
-}
-
-static int ContentTests() {
-    int fails = 0;
-    const double P = 1000.0 / 60.0;
-    const double lead = 3.0, margin = 1.0;
-    auto theoryVrr = [&](double pc, int k) { return (double)(k - 1) / k * pc * P + lead + margin; };
-    auto p30 = [](int64_t n, double) { return Pat30(n); };
-    auto p24 = [](int64_t n, double) { return Pat24(n); };
-
-    // Steady cadences with Pc set up front. Theory: (k-1)/k * Pc * P + lead + margin (VRR);
-    // fixed refresh: up to a whole content period (all phases occur). Bound: theory + jitter (1.5)
-    // + tolerance (1.0). 3:2 pulldown: content frames arrive off the Pc grid (intervals 3,2); with
-    // the grid anchored at the start of a 3-interval the worst wait is 1.75 P (k = 2).
-    struct Steady { ContentCase c; double theory; double bound; double expectFps; bool gridCheck; };
+    const double bound = kJitterMs + kToleranceMs;
+    const double fixedTheory = 2 * kPeriodMs + kLeadMs + kMarginMs;
+    struct Steady { SimCase sim; double theory; double expectFps; bool gridCheck; };
     Steady cases[] = {
-        {{"30-in-60 vrr k=2 (60 fps)", PaceMode::Vrr, 1000.0, 2, p30, 2.0}, theoryVrr(2, 2), theoryVrr(2, 2) + 2.5, 60, true},
-        {{"30-in-60 vrr k=4 (120 fps)", PaceMode::Vrr, 1000.0, 4, p30, 2.0}, theoryVrr(2, 4), theoryVrr(2, 4) + 2.5, 120, true},
-        {{"30-in-60 fixed 120Hz", PaceMode::Fixed, 120.0, 2, p30, 2.0}, 2 * P + lead + margin, 2 * P + lead + margin + 2.5, 120, false},
-        {{"30-in-60 fixed 165Hz", PaceMode::Fixed, 165.0, 2, p30, 2.0}, 2 * P + lead + margin, 2 * P + lead + margin + 2.5, 165, false},
-        {{"24p 3:2 vrr k=2 (48 fps)", PaceMode::Vrr, 1000.0, 2, p24, 2.5}, 1.75 * P + lead + margin, 1.75 * P + lead + margin + 2.5, 48, false},
-        {{"30-in-60 vrr k=2, 1% spikes", PaceMode::Vrr, 1000.0, 2, p30, 2.0, 0, 0.01}, theoryVrr(2, 2), theoryVrr(2, 2) + 2.5 + 4.0, 60, true},
+        {content("30-in-60 vrr k=2 (60 fps)", PaceMode::Vrr, 0, 2, every2nd, 2.0), TheoryVrr(2, 2), 60, true},
+        {content("30-in-60 vrr k=4 (120 fps)", PaceMode::Vrr, 0, 4, every2nd, 2.0), TheoryVrr(2, 4), 120, true},
+        {content("30-in-60 fixed 120Hz", PaceMode::Fixed, 120.0, 2, every2nd, 2.0), fixedTheory, 120, false},
+        {content("30-in-60 fixed 165Hz", PaceMode::Fixed, 165.0, 2, every2nd, 2.0), fixedTheory, 165, false},
+        {content("24p 3:2 vrr k=2 (48 fps)", PaceMode::Vrr, 0, 2, cadence32, 2.5), 1.75 * kPeriodMs + kLeadMs + kMarginMs, 48, false},
+        {content("30-in-60 vrr k=2, 1% spikes", PaceMode::Vrr, 0, 2, every2nd, 2.0), TheoryVrr(2, 2) + kSpikeMs, 60, true},
+        {content("30-in-60 fixed 120Hz, no fg", PaceMode::Fixed, 120.0, 2, every2nd, 2.0), kLeadMs + 2 * kMarginMs + kSnap * 2 * kPeriodMs, 120, false},
     };
-    for (auto& sc : cases) {
-        ContentResult r = SimulateContent(sc.c);
-        const bool ok = r.lates <= (sc.c.spike > 0 ? 20u : 0u) && r.backwards == 0 && r.delayP50 <= sc.bound &&
-                        std::abs(r.outFps - sc.expectFps) < 0.02 * sc.expectFps && (!sc.gridCheck || r.maxGridErr < 0.01) &&
-                        r.maxMotionStep < 1.01;
+    cases[5].sim.spikeProb = 0.01;
+    cases[6].sim.fg = false;
+    for (const Steady& sc : cases) {
+        const SimResult r = Simulate(sc.sim);
+        const bool ok = r.lates <= (sc.sim.spikeProb > 0 ? 20u : 0u) && r.backwards == 0 && r.delayP50 <= sc.theory + bound &&
+                        std::abs(r.outFps - sc.expectFps) < 0.02 * sc.expectFps && (!sc.gridCheck || r.maxGridErr < 0.01) && r.maxMotionStep < 1.01;
         printf("%-30s out %6.1f fps interp=%5llu late=%2llu back=%llu  D p50=%6.2f max=%6.2f (theory %5.2f, bound %5.2f) ms  "
                "arrival->display p50 %5.2f ms  grid err=%.4f  motion step<=%.2f  %s\n",
-               sc.c.name, r.outFps, (unsigned long long)r.interpolated, (unsigned long long)r.lates, (unsigned long long)r.backwards,
-               r.delayP50, r.delayMax, sc.theory, sc.bound, r.latP50, r.maxGridErr, r.maxMotionStep, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+               sc.sim.name, r.outFps, (unsigned long long)r.interpolated, (unsigned long long)r.lates, (unsigned long long)r.backwards,
+               r.delayP50, r.delayMax, sc.theory, sc.theory + bound, r.latencyP50, r.maxGridErr, r.maxMotionStep, Verdict(ok));
     }
 
-    // 60 -> 30 -> 60 driven by the CadenceDetector (content changes at 20 s and 40 s).
-    for (int det : {1, 2}) {
-        ContentCase c{det == 1 ? "switch 60->30->60 vrr k=2" : "switch 60->30->60 vrr 120 fps", PaceMode::Vrr, 1000.0, 2,
-                      [](int64_t n, double t) { return (t >= 20 && t < 40) ? Pat30(n) : true; }, 1.0, det};
-        ContentResult r = SimulateContent(c);
-        int nearSw = 0, elsewhere = 0;
-        for (double t : r.lateT) ((t >= 20 && t < 23) || (t >= 40 && t < 43)) ? nearSw++ : elsewhere++;
-        const int k30 = det == 1 ? 2 : 4;
+    auto switching = [](int64_t n, double sec) { return sec >= 20 && sec < 40 ? Every2nd(n) : true; };
+    for (Detector detector : {Detector::ContentPeriod, Detector::ContentPeriodAndMultiplier}) {
+        const bool multiplierFollows = detector == Detector::ContentPeriodAndMultiplier;
+        SimCase c = content(multiplierFollows ? "switch 60->30->60 vrr 120 fps" : "switch 60->30->60 vrr k=2", PaceMode::Vrr, 0, 2, switching, 1.0);
+        c.detector = detector;
+        const SimResult r = Simulate(c);
+        const size_t nearSwitch = LatesIn(r, 20, 23) + LatesIn(r, 40, 43);
+        const size_t elsewhere = LatesIn(r, kWarmUpSec, 60) - nearSwitch;
+        const int multiplier30 = multiplierFollows ? 4 : 2;
         const double d60a = DelayP50In(r, 15, 20), d30 = DelayP50In(r, 35, 40), d60b = DelayP50In(r, 55, 60);
-        const double t60 = theoryVrr(1, 2), t30 = theoryVrr(2, k30);
-        const bool ok = nearSw <= 6 && elsewhere == 0 && r.backwards == 0 && d60a - t60 < 2.5 && d60a > t60 - 0.5 && d30 - t30 < 2.5 &&
-                        d30 > t30 - 0.5 && d60b - t60 < 2.5 && d60b > t60 - 0.5;
-        printf("%-30s late near switches=%d elsewhere=%d back=%llu stalls=%llu  D p50 60fps %.2f (theory %.2f) | 30fps %.2f (theory %.2f) | "
-               "60fps %.2f  %s\n", c.name, nearSw, elsewhere, (unsigned long long)r.backwards, (unsigned long long)r.stalls, d60a, t60, d30,
-               t30, d60b, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+        const double t60 = TheoryVrr(1, 2), t30 = TheoryVrr(2, multiplier30);
+        const double maxGapMs = 1.5 * 1000.0 / kVrrOutputFps + kToleranceMs;
+        auto closeToTheory = [](double measured, double theory) { return measured - theory < 2.5 && measured > theory - 0.5; };
+        const bool ok = nearSwitch <= 6 && elsewhere == 0 && r.backwards == 0 && closeToTheory(d60a, t60) && closeToTheory(d30, t30) &&
+                        closeToTheory(d60b, t60) && (!multiplierFollows || r.maxPresentGapMs <= maxGapMs);
+        printf("%-30s late near switches=%zu elsewhere=%zu back=%llu holds=%llu  D p50 60fps %.2f (theory %.2f) | 30fps %.2f (theory %.2f) | "
+               "60fps %.2f  max present gap %.2f ms  %s\n", c.name, nearSwitch, elsewhere, (unsigned long long)r.backwards,
+               (unsigned long long)r.holds, d60a, t60, d30, t30, d60b, r.maxPresentGapMs, Verdict(ok));
     }
-    {   // Same in fixed refresh (164 Hz).
-        ContentCase c{"switch 60->30->60 fixed 164", PaceMode::Fixed, 164.0, 2,
-                      [](int64_t n, double t) { return (t >= 20 && t < 40) ? Pat30(n) : true; }, 1.0, 1};
-        ContentResult r = SimulateContent(c);
-        int nearSw = 0, elsewhere = 0;
-        for (double t : r.lateT) ((t >= 20 && t < 23) || (t >= 40 && t < 43)) ? nearSw++ : elsewhere++;
+    {
+        SimCase c = content("switch 60->30->60 fixed 164", PaceMode::Fixed, 164.0, 2, switching, 1.0);
+        c.detector = Detector::ContentPeriod;
+        const SimResult r = Simulate(c);
+        const size_t nearSwitch = LatesIn(r, 20, 23) + LatesIn(r, 40, 43);
+        const size_t elsewhere = LatesIn(r, kWarmUpSec, 60) - nearSwitch;
         const double d60a = DelayP50In(r, 15, 20), d30 = DelayP50In(r, 35, 40), d60b = DelayP50In(r, 55, 60);
-        const bool ok = nearSw <= 6 && elsewhere == 0 && r.backwards == 0 && d60a < P + 6.5 && d30 < 2 * P + 6.5 && d60b < P + 6.5;
-        printf("%-30s late near switches=%d elsewhere=%d back=%llu stalls=%llu  D p50 60fps %.2f | 30fps %.2f | 60fps %.2f  %s\n", c.name,
-               nearSw, elsewhere, (unsigned long long)r.backwards, (unsigned long long)r.stalls, d60a, d30, d60b, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+        const double fixedBound = kLeadMs + kJitterMs + kMarginMs + kToleranceMs;
+        const bool ok = nearSwitch <= 6 && elsewhere == 0 && r.backwards == 0 && d60a < kPeriodMs + fixedBound && d30 < 2 * kPeriodMs + fixedBound &&
+                        d60b < kPeriodMs + fixedBound;
+        printf("%-30s late near switches=%zu elsewhere=%zu back=%llu holds=%llu  D p50 60fps %.2f | 30fps %.2f | 60fps %.2f  %s\n", c.name,
+               nearSwitch, elsewhere, (unsigned long long)r.backwards, (unsigned long long)r.holds, d60a, d30, d60b, Verdict(ok));
     }
-
-    // 1 s static scene in 60 fps content (no new frames from 20 s to 21 s, repeats keep coming).
     for (PaceMode mode : {PaceMode::Vrr, PaceMode::Fixed}) {
-        ContentCase c{mode == PaceMode::Vrr ? "static 1 s (vrr k=2)" : "static 1 s (fixed 164)", mode, mode == PaceMode::Vrr ? 1000.0 : 164.0,
-                      2, [](int64_t, double t) { return !(t >= 20 && t < 21); }, 1.0};
-        ContentResult r = SimulateContent(c, 20.0);
-        uint64_t interpAfter = 0;
-        for (auto& p : r.interpT) if (p.first > 21.5 && p.first < 30) interpAfter += p.second;
-        const bool ok = r.delayMaxAfter - r.delayBefore < 1.0 && r.stallsDuring > 0 && r.lates == 0 && r.backwards == 0 &&
-                        interpAfter > 100 && r.maxMotionStep < 0.76;
-        printf("%-30s D before %.2f ms, max within 10 s after %.2f ms, stall outputs %llu, late %llu, interp after %llu, "
-               "max motion step %.2f frames  %s\n", c.name, r.delayBefore, r.delayMaxAfter, (unsigned long long)r.stallsDuring,
-               (unsigned long long)r.lates, (unsigned long long)interpAfter, r.maxMotionStep, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+        SimCase c = content(mode == PaceMode::Vrr ? "static 1 s (vrr k=2)" : "static 1 s (fixed 164)", mode, 164.0, 2,
+                            [](int64_t, double sec) { return !(sec >= 20 && sec < 21); }, 1.0);
+        c.eventSec = 20;
+        const SimResult r = Simulate(c);
+        uint64_t interpolatedAfter = 0;
+        for (const auto& [sec, interpolated] : r.interpolatedAt)
+            if (sec > 21.5 && sec < 30) interpolatedAfter += interpolated;
+        const bool ok = r.delayMaxAfterEvent - r.delayBeforeEvent < 1.0 && r.holdsAfterEvent > 0 && r.lates == 0 && r.backwards == 0 &&
+                        interpolatedAfter > 100 && r.maxMotionStep < 0.76;
+        printf("%-30s D before %.2f ms, max within 10 s after %.2f ms, hold outputs %llu, late %llu, interp after %llu, "
+               "max motion step %.2f frames  %s\n", c.name, r.delayBeforeEvent, r.delayMaxAfterEvent, (unsigned long long)r.holdsAfterEvent,
+               (unsigned long long)r.lates, (unsigned long long)interpolatedAfter, r.maxMotionStep, Verdict(ok));
     }
-    {   // 30 fps content whose cadence phase shifts (a game hitch: one frame shown 3 times at 20 s), VRR k=3:
-        // the grid must re-anchor on the new phase, otherwise no output shows a real frame and D grows by Pc*P/(2k).
-        ContentCase c{"30-in-60 phase shift vrr k=3", PaceMode::Vrr, 1000.0, 3,
-                      [](int64_t n, double t) { return t < 20 ? Pat30(n) : !Pat30(n); }, 2.0};
-        ContentResult r = SimulateContent(c);
-        const double before = DelayP50In(r, 12, 20), after = DelayP50In(r, 30, 60), th = theoryVrr(2, 3);
-        const bool ok = r.lates <= 2 && r.backwards == 0 && before - th < 2.5 && after - th < 2.5;
+    {
+        SimCase c = content("30-in-60 phase shift vrr k=3", PaceMode::Vrr, 0, 3, [](int64_t n, double sec) { return sec < 20 ? Every2nd(n) : !Every2nd(n); },
+                            2.0);
+        const SimResult r = Simulate(c);
+        const double before = DelayP50In(r, 12, 20), after = DelayP50In(r, 30, 60), theory = TheoryVrr(2, 3);
+        const bool ok = r.lates <= 2 && r.backwards == 0 && before - theory < 2.5 && after - theory < 2.5;
         printf("%-30s late=%llu back=%llu  D p50 before %.2f | after %.2f (theory %.2f)  %s\n", c.name, (unsigned long long)r.lates,
-               (unsigned long long)r.backwards, before, after, th, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+               (unsigned long long)r.backwards, before, after, theory, Verdict(ok));
     }
-    {   // 250 ms source stall with 30 fps content.
-        ContentCase c{"stall 250ms (30-in-60 vrr k=2)", PaceMode::Vrr, 1000.0, 2, p30, 2.0, 0, 0.0, 15.0, 30};
-        ContentResult r = SimulateContent(c, 15.0);
-        const bool ok = r.delayMaxAfter - r.delayBefore < 3.0 && r.backwards == 0 && r.stalls > 0;
-        printf("%-30s D before %.2f ms, max within 10 s after %.2f ms, stall outputs %llu, late %llu  %s\n", c.name, r.delayBefore,
-               r.delayMaxAfter, (unsigned long long)r.stalls, (unsigned long long)r.lates, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
+    {
+        SimCase c = content("stall 250ms (30-in-60 vrr k=2)", PaceMode::Vrr, 0, 2, every2nd, 2.0);
+        c.stallAtSec = 15; c.eventSec = 15; c.seconds = 30;
+        const SimResult r = Simulate(c);
+        const bool ok = r.delayMaxAfterEvent - r.delayBeforeEvent < 3.0 && r.backwards == 0 && r.holds > 0;
+        printf("%-30s D before %.2f ms, max within 10 s after %.2f ms, hold outputs %llu, late %llu  %s\n", c.name, r.delayBeforeEvent,
+               r.delayMaxAfterEvent, (unsigned long long)r.holds, (unsigned long long)r.lates, Verdict(ok));
     }
-    return fails;
+}
+
+void StartupPathTests() {
+    {
+        SimCase c;
+        c.name = "vrr start, fixed 164 at 3 s";
+        c.switchToFixedAtSec = 3;
+        c.seconds = 30;
+        const SimResult r = Simulate(c);
+        const double bound = kPeriodMs + kLeadMs + kJitterMs + kMarginMs + kToleranceMs;
+        const bool ok = LatesIn(r, 6, 30) == 0 && r.backwards == 0 && r.delayP50 <= bound;
+        printf("%-30s late after 6 s=%zu back=%llu  D p50=%.2f (bound %.2f) ms  %s\n", c.name, LatesIn(r, 6, 30), (unsigned long long)r.backwards,
+               r.delayP50, bound, Verdict(ok));
+    }
+    {
+        SimCase c;
+        c.name = "30-in-60 vrr k=2, reconfigure";
+        c.unique = [](int64_t n, double) { return Every2nd(n); };
+        c.detector = Detector::ContentPeriod;
+        c.reconfigureAtSec = 20;
+        c.eventSec = 20;
+        c.seconds = 40;
+        const SimResult r = Simulate(c);
+        const double after = DelayP50In(r, 30, 40), theory = TheoryVrr(2, 2);
+        const bool ok = LatesIn(r, 20, 22) <= 2 && LatesIn(r, 22, 40) == 0 && r.holdsAfterEvent == 0 && r.backwards == 0 && after - theory < 2.5;
+        printf("%-30s late in 2 s after=%zu later=%zu holds after=%llu back=%llu  D p50 after %.2f (theory %.2f)  %s\n", c.name, LatesIn(r, 20, 22),
+               LatesIn(r, 22, 40), (unsigned long long)r.holdsAfterEvent, (unsigned long long)r.backwards, after, theory, Verdict(ok));
+    }
+}
+
+void ReleaseTests() {
+    const double freq = (double)Qpc::Freq();
+    const double period = freq / 59.94, vblank = freq / 165.0;
+    for (double leadMs : {8.0, 11.5, 12.5}) {
+        PacerConfig cfg = TestConfig(PaceMode::Vrr, 2, true);
+        cfg.contentPeriod = 2.0;
+        Pacer pacer;
+        pacer.Configure(cfg, kSignalHz);
+        const int64_t base = (int64_t)(freq * 10);
+        int64_t now = base, fed = 0;
+        auto feed = [&](int64_t until) {
+            for (; base + (int64_t)(fed * period) <= until; fed++) pacer.OnSourceFrame(fed, base + (int64_t)(fed * period), fed % 2 == 0);
+        };
+        uint64_t outputs = 0, gaps = 0;
+        int64_t lastDisplayTime = 0;
+        const int64_t end = base + (int64_t)(freq * 30);
+        const int64_t settled = base + (int64_t)(freq * 5);
+        const double outputStep = period * pacer.ContentPeriod() / pacer.Multiplier();
+        while (now < end) {
+            feed(now);
+            const int64_t displayTime = pacer.NextVrrDisplayTime(now, leadMs);
+            if (!displayTime) { now += (int64_t)(freq * 0.002); continue; }
+            const int64_t start = std::max(now, displayTime - (int64_t)(freq * leadMs / 1000.0));
+            feed(start);
+            const PaceDecision d = pacer.Decide(start, displayTime);
+            if (!d.valid) { now = start + (int64_t)(freq * 0.001); continue; }
+            if (now > settled) {
+                outputs++;
+                if (lastDisplayTime && (double)(displayTime - lastDisplayTime) > 1.5 * outputStep) gaps++;
+            }
+            lastDisplayTime = displayTime;
+            now = (int64_t)(std::ceil((double)displayTime / vblank) * vblank) + (int64_t)(freq * 0.0002);
+        }
+        const double fps = (double)outputs / 25.0;
+        const bool ok = fps > 59.0 && gaps == 0;
+        printf("vrr release at vblank, lead %4.1f   output %.1f fps, 2-step gaps %llu  %s\n", leadMs, fps, (unsigned long long)gaps, Verdict(ok));
+    }
+}
+
+void VblankIndexTests() {
+    const double period = (double)Qpc::Freq() / 60.0;
+    const int64_t base = Qpc::Freq() * 10;
+    auto at = [&](double vblanks) { return base + (int64_t)std::llround(vblanks * period); };
+    LinearClock warming(600);
+    const bool first = VblankIndex(warming, -1, 0, at(0), period) == 0;
+    const bool missedWhileWarming = VblankIndex(warming, 5, at(5), at(7.1), period) == 7;
+    const bool doubleWakeWhileWarming = VblankIndex(warming, 5, at(5), at(5.2), period) == 6;
+    LinearClock fitted(600);
+    for (int n = 0; n < 20; n++) fitted.Add(n, at(n));
+    const bool lateWake = VblankIndex(fitted, 19, at(19), at(20.3), period) == 20;
+    const bool doubleWake = VblankIndex(fitted, 20, at(20.3), at(20.4), period) <= 20;
+    const bool missed = VblankIndex(fitted, 19, at(19), at(22.05), period) == 22;
+    const bool ok = first && missedWhileWarming && doubleWakeWhileWarming && lateWake && doubleWake && missed;
+    printf("%-34s first=%d missed=%d,%d double=%d,%d late=%d  %s\n", "vblank index", first, missedWhileWarming, missed, doubleWakeWhileWarming,
+           doubleWake, lateWake, Verdict(ok));
+}
+
+void MultiplierTests() {
+    MultiplierInputs base;
+    base.fgActive = true;
+    base.vrr = true;
+    base.contentFps = 30;
+    base.requested = 2;
+    base.thresholdFps = 60;
+    base.maxRefreshHz = 165;
+    base.leadMs = 3;
+    base.current = 2;
+    auto choose = [&](auto change) {
+        MultiplierInputs in = base;
+        change(in);
+        return ChooseMultiplier(in);
+    };
+    const MultiplierChoice doubled = choose([](MultiplierInputs&) {});
+    const MultiplierChoice off = choose([](MultiplierInputs& in) { in.fgActive = false; });
+    const MultiplierChoice atThreshold = choose([](MultiplierInputs& in) { in.contentFps = 59.94; });
+    const MultiplierChoice refresh = choose([](MultiplierInputs& in) { in.requested = 4; in.maxRefreshHz = 100; });
+    const MultiplierChoice gpu = choose([](MultiplierInputs& in) { in.requested = 4; in.generatedFrameMs = 7.0; });
+    const MultiplierChoice fixedIgnoresGpu = choose([](MultiplierInputs& in) { in.vrr = false; in.requested = 4; in.generatedFrameMs = 10.0; });
+    const MultiplierChoice raiseNeedsRoom = choose([](MultiplierInputs& in) { in.requested = 3; in.current = 2; in.generatedFrameMs = 10.5; });
+    const MultiplierChoice keepWithLessRoom = choose([](MultiplierInputs& in) { in.requested = 3; in.current = 3; in.generatedFrameMs = 10.5; });
+    const bool ok = doubled.multiplier == 2 && doubled.limit == MultiplierLimit::None && off.multiplier == 1 && off.limit == MultiplierLimit::Off &&
+                    atThreshold.multiplier == 1 && atThreshold.limit == MultiplierLimit::Threshold && refresh.multiplier == 3 &&
+                    refresh.limit == MultiplierLimit::Refresh && gpu.multiplier == 3 && gpu.limit == MultiplierLimit::Gpu &&
+                    fixedIgnoresGpu.multiplier == 4 && raiseNeedsRoom.multiplier == 2 && keepWithLessRoom.multiplier == 3;
+    printf("%-34s x%d off=x%d threshold=x%d refresh=x%d gpu=x%d fixed=x%d raise=x%d keep=x%d  %s\n", "multiplier choice", doubled.multiplier,
+           off.multiplier, atThreshold.multiplier, refresh.multiplier, gpu.multiplier, fixedIgnoresGpu.multiplier, raiseNeedsRoom.multiplier,
+           keepWithLessRoom.multiplier, Verdict(ok));
+}
+
+double RaisedLeadMs(double outputPeriodMs) {
+    LeadController lead(kLeadMs);
+    for (int i = 0; i < 400; i++) lead.OnGpuBusyAtPresent(Qpc::Freq() * 10 + i, outputPeriodMs);
+    return lead.LeadMs();
+}
+
+void LeadTests() {
+    constexpr double kOutputPeriodMs = 1000.0 / 60.0;
+    const int64_t second = Qpc::Freq();
+    {
+        LeadController lead(kLeadMs);
+        for (int i = 0; i < 400; i++) lead.OnGpuBusyAtPresent(second * 10 + i, kOutputPeriodMs);
+        const bool capped = std::abs(lead.LeadMs() - (kOutputPeriodMs - kOutputPeriodHeadroomMs)) < 1e-9;
+        for (int i = 0; i < 200; i++) lead.OnFrameCost(4.0, i % 2 == 0);
+        const bool generatedKnown = lead.GeneratedFrameMs() && std::abs(*lead.GeneratedFrameMs() - 4.75) < 1e-9;
+        for (int s = 1; s <= 600; s++) lead.Relax(second * (10 + 4 * s), kOutputPeriodMs);
+        const bool relaxedToCost = std::abs(lead.LeadMs() - 4.75) < 1e-9;
+        const bool ok = capped && generatedKnown && relaxedToCost;
+        printf("%-34s capped=%d generated=%d relaxed=%.2f ms  %s\n", "render lead", capped, generatedKnown, lead.LeadMs(), Verdict(ok));
+    }
+    {
+        constexpr double kContentFps = 60;
+        const double outputPeriodMs = 1000.0 / (kContentFps * 2);
+        const double ceilingMs = RaisedLeadMs(outputPeriodMs);
+        double largestKeptCostMs = 0;
+        for (double cost = 4.0; cost <= 10.0; cost += 0.01) {
+            MultiplierInputs in;
+            in.fgActive = true;
+            in.vrr = true;
+            in.contentFps = kContentFps;
+            in.requested = 2;
+            in.current = 2;
+            in.maxRefreshHz = 165;
+            in.generatedFrameMs = cost;
+            in.leadMs = std::min(cost, ceilingMs);
+            if (ChooseMultiplier(in).multiplier == 2) largestKeptCostMs = cost;
+        }
+        const double fixedCeilingMs = RaisedLeadMs(1000.0 / 120.0);
+        const bool ok = ceilingMs >= largestKeptCostMs && fixedCeilingMs >= 7.75;
+        printf("%-34s vrr x2 at 60 fps: lead up to %.2f ms, x2 kept up to %.2f ms | fixed 120 Hz: lead up to %.2f ms  %s\n", "render lead covers kept x2",
+               ceilingMs, largestKeptCostMs, fixedCeilingMs, Verdict(ok));
+    }
+}
+
 }
 
 int main() {
-    struct Case { const char* name; PaceMode mode; double hz; int k; double drift; double spike; double expectMaxDelay; };
-    // D is measured from the fitted ready time of a frame to its display time. Theory:
-    //   D = (1 - t_min) * P + lead (3 ms) + ready jitter (1.5 ms, +4 ms spikes) + margin (1 ms)
-    // with t_min = smallest interpolation step that needs the next frame
-    // (fixed refresh: ~eps for non-integer ratios; VRR k-grid: 1/k).
-    const double P = 1000.0 / 60.0;
-    const double base = 3.0 + 1.5 + 1.0 + 1.0;   // lead + jitter + margin + tolerance
-    Case cases[] = {
-        {"fixed 120Hz +80ppm", PaceMode::Fixed, 120.0, 2, 80, 0.01, P + base + 4.0},
-        {"fixed 120Hz -30ppm", PaceMode::Fixed, 119.998, 2, -30, 0.01, P + base + 4.0},
-        {"fixed 144Hz", PaceMode::Fixed, 144.0, 2, 20, 0.01, P + base + 4.0},
-        {"fixed 164Hz (AW2725QF)", PaceMode::Fixed, 164.0, 2, 20, 0.01, P + base + 4.0},
-        {"fixed 164Hz, no spikes", PaceMode::Fixed, 164.0, 2, 20, 0.0, P + base},
-        {"vrr k=2 (120 fps)", PaceMode::Vrr, 1000.0, 2, 40, 0.01, P / 2 + base + 4.0},
-        {"vrr k=2, no spikes", PaceMode::Vrr, 1000.0, 2, 40, 0.0, P / 2 + base},
-        {"vrr k=3 (180 fps)", PaceMode::Vrr, 1000.0, 3, 40, 0.01, 2 * P / 3 + base + 4.0},
-        // 59.94 Hz source while configured for nominal 60 Hz (-1000 ppm).
-        {"vrr k=2, 59.94 Hz source", PaceMode::Vrr, 1000.0, 2, -1000, 0.0, P / 2 + base},
-        {"fixed 164Hz, 59.94 Hz src", PaceMode::Fixed, 164.0, 2, -1000, 0.0, P + base},
-    };
-    int fails = 0;
-    for (auto& c : cases) {
-        Result r = Simulate(c.mode, c.hz, c.k, 60.0, c.drift, 1.5, 60.0, 1234, c.spike);
-        // Allowed lateness: injected 4 ms spikes on 1% of frames (far worse than the ~0.2 ms p99
-        // jitter measured on the real card) may cause up to 20 hitches/min; clean sources: none.
-        bool ok = r.lateAfterWarmup <= (c.spike > 0 ? 20u : 0u) && r.backwards == 0 && r.delayP50 <= c.expectMaxDelay && r.maxSpeedDev < 0.03 &&
-                  (c.mode != PaceMode::Vrr || r.maxGridErr < 0.02);
-        printf("%-24s out=%6llu interp=%6llu late=%2llu back=%llu  D p50=%6.2f max=%6.2f (bound %5.2f) ms  speed dev=%.4f  grid err=%.4f  %s\n",
-               c.name, (unsigned long long)r.outputs, (unsigned long long)r.interpolated, (unsigned long long)r.lateAfterWarmup,
-               (unsigned long long)r.backwards, r.delayP50, r.delayMax, c.expectMaxDelay, r.maxSpeedDev, r.maxGridErr,
-               ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
-    }
-    // Source stall: a 250 ms USB hiccup must not inflate D (it is not a pacing error).
-    for (PaceMode m : {PaceMode::Vrr, PaceMode::Fixed}) {
-        Result r = Simulate(m, m == PaceMode::Vrr ? 1000.0 : 164.0, 2, 60.0, 20, 0.5, 30.0, 99, 0.0, 15.0);
-        bool ok = r.delayMaxAfterStall - r.delayBeforeStall < 3.0 && r.backwards == 0 && r.stalls > 0;
-        printf("%-24s D before %.2f ms, max within 10 s after %.2f ms, stall outputs %llu, late %llu  %s\n",
-               m == PaceMode::Vrr ? "stall 250ms (vrr)" : "stall 250ms (fixed 164)", r.delayBeforeStall, r.delayMaxAfterStall,
-               (unsigned long long)r.stalls, (unsigned long long)r.lateAfterWarmup, ok ? "PASS" : "FAIL");
-        if (!ok) fails++;
-    }
-    fails += CadenceTests();
-    fails += PredictionTests();
-    fails += ContentTests();
-    printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASS");
-    return fails ? 1 : 0;
+    SteadyTests();
+    MultiplierTests();
+    LeadTests();
+    CadenceTests();
+    PredictionTests();
+    ContentTests();
+    StartupPathTests();
+    ReleaseTests();
+    VblankIndexTests();
+    return check::Summary();
 }

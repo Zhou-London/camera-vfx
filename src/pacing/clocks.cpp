@@ -2,124 +2,119 @@
 #include <algorithm>
 #include <cmath>
 
-namespace camss {
+namespace cameravfx {
+
+namespace {
+constexpr size_t kMinObservations = 8;
+constexpr double kOutlierMedianFactor = 4.0;
+constexpr double kOutlierPeriodFraction = 0.02;
+constexpr double kMinMedianAbsResidualTicks = 1.0;
+}
 
 void LinearClock::Add(int64_t n, int64_t t) {
-    if (!obs_.empty() && n <= obs_.back().n) { obs_.clear(); valid_ = false; } // index reset
-    obs_.push_back({n, t});
-    while (obs_.size() > window_) obs_.pop_front();
+    const bool indexRestarted = !observations_.empty() && n <= observations_.back().n;
+    if (indexRestarted) observations_.clear();
+    observations_.push_back({n, t});
+    while (observations_.size() > window_) observations_.pop_front();
     Refit();
-    lastResid_ = valid_ ? (double)t - TimeOf((double)n) : 0.0;
 }
 
 void LinearClock::Refit() {
-    const size_t N = obs_.size();
-    if (N < 8) { valid_ = false; return; }
-    base_n_ = obs_.front().n;
-    base_t_ = obs_.front().t;
-    double sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (auto& o : obs_) {
-        double x = (double)(o.n - base_n_), y = (double)(o.t - base_t_);
-        sx += x; sy += y; sxx += x * x; sxy += x * y;
-    }
-    double den = (double)N * sxx - sx * sx;
-    if (den <= 0) { valid_ = false; return; }
-    double slope = ((double)N * sxy - sx * sy) / den;
-    double icpt = (sy - slope * sx) / (double)N;
-    // One robust pass: drop observations whose residual exceeds 4x the median
-    // absolute residual (e.g. a frame delivered late by a USB hiccup), refit.
-    resid_.resize(N);
+    valid_ = false;
+    const size_t count = observations_.size();
+    if (count < kMinObservations) return;
+    baseIndex_ = observations_.front().n;
+    baseTime_ = observations_.front().t;
+    auto fitLine = [&](auto keep, double& slope, double& intercept) {
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        size_t kept = 0, i = 0;
+        for (const Observation& o : observations_) {
+            if (!keep(i++)) continue;
+            const double x = (double)(o.n - baseIndex_), y = (double)(o.t - baseTime_);
+            sx += x; sy += y; sxx += x * x; sxy += x * y;
+            kept++;
+        }
+        const double den = (double)kept * sxx - sx * sx;
+        if (kept < kMinObservations || den <= 0) return false;
+        slope = ((double)kept * sxy - sx * sy) / den;
+        intercept = (sy - slope * sx) / (double)kept;
+        return true;
+    };
+    double slope = 0, intercept = 0;
+    if (!fitLine([](size_t) { return true; }, slope, intercept)) return;
+    absResiduals_.resize(count);
     size_t i = 0;
-    for (auto& o : obs_) resid_[i++] = std::abs((double)(o.t - base_t_) - (icpt + slope * (double)(o.n - base_n_)));
-    std::vector<double> tmp = resid_;
-    std::nth_element(tmp.begin(), tmp.begin() + N / 2, tmp.end());
-    double mad = std::max(tmp[N / 2], 1.0);
-    sx = sy = sxx = sxy = 0; size_t M = 0; i = 0;
-    for (auto& o : obs_) {
-        if (resid_[i++] > 4.0 * mad + slope * 0.02) continue;
-        double x = (double)(o.n - base_n_), y = (double)(o.t - base_t_);
-        sx += x; sy += y; sxx += x * x; sxy += x * y; M++;
-    }
-    den = (double)M * sxx - sx * sx;
-    if (M >= 8 && den > 0) {
-        slope = ((double)M * sxy - sx * sy) / den;
-        icpt = (sy - slope * sx) / (double)M;
-    }
+    for (const Observation& o : observations_)
+        absResiduals_[i++] = std::abs((double)(o.t - baseTime_) - (intercept + slope * (double)(o.n - baseIndex_)));
+    scratch_.assign(absResiduals_.begin(), absResiduals_.end());
+    std::nth_element(scratch_.begin(), scratch_.begin() + count / 2, scratch_.end());
+    const double medianAbsResidual = std::max(scratch_[count / 2], kMinMedianAbsResidualTicks);
+    const double outlierAbove = kOutlierMedianFactor * medianAbsResidual + kOutlierPeriodFraction * slope;
+    fitLine([&](size_t k) { return absResiduals_[k] <= outlierAbove; }, slope, intercept);
     period_ = slope;
-    intercept_ = icpt;
+    intercept_ = intercept;
     valid_ = period_ > 0;
 }
 
-double LinearClock::ResidualQuantile(double q) const {
-    if (!valid_ || obs_.empty()) return 0;
-    std::vector<double> r;
-    r.reserve(obs_.size());
-    for (auto& o : obs_) r.push_back((double)o.t - TimeOf((double)o.n));
-    size_t k = (size_t)std::clamp(q * (double)(r.size() - 1), 0.0, (double)(r.size() - 1));
-    std::nth_element(r.begin(), r.begin() + k, r.end());
-    return r[k];
+double LinearClock::AbsResidualQuantile(double q) const {
+    if (!valid_) return 0;
+    scratch_.clear();
+    for (const Observation& o : observations_) scratch_.push_back(std::abs((double)o.t - TimeOf((double)o.n)));
+    const auto rank = scratch_.begin() + (ptrdiff_t)(q * (double)(scratch_.size() - 1));
+    std::nth_element(scratch_.begin(), rank, scratch_.end());
+    return *rank;
 }
 
-// ------------------------------------------------------------------ VsyncClock
-bool VsyncClock::Start(IDXGIOutput* output, double nominalHz) {
+int64_t VblankIndex(const LinearClock& clock, int64_t lastIndex, int64_t lastTime, int64_t time, double nominalPeriod) {
+    if (lastIndex < 0) return 0;
+    if (clock.Valid()) return std::llround(clock.IndexAt((double)time));
+    return lastIndex + std::max<int64_t>(1, std::llround((double)(time - lastTime) / nominalPeriod));
+}
+
+void VsyncClock::Start(IDXGIOutput* output, double nominalHz) {
     output_ = output;
-    nominalTicks_ = (double)Qpc::Freq() / nominalHz;
-    clock_.SetNominalPeriod(nominalTicks_);
-    run_ = true;
-    thr_ = std::thread([this] { Run(); });
-    return true;
+    nominalPeriod_ = (double)Qpc::Freq() / nominalHz;
+    clock_.SetNominalPeriod(nominalPeriod_);
+    running_ = true;
+    thread_ = std::thread([this] { Run(); });
 }
 
 void VsyncClock::Stop() {
-    run_ = false;
-    if (thr_.joinable()) thr_.join();
+    running_ = false;
+    if (thread_.joinable()) thread_.join();
 }
 
 void VsyncClock::Run() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    int64_t n = 0;
-    while (run_) {
+    int64_t index = -1;
+    while (running_) {
         if (FAILED(output_->WaitForVBlank())) { Sleep(1); continue; }
-        int64_t t = Qpc::Now();
-        std::lock_guard<std::mutex> lk(m_);
-        // Assign an integer vblank index. Once the fit is valid, index from the fitted line
-        // (not from the jittery previous wake) so one late wake cannot shift all later indices;
-        // a wake that rounds onto an already-used index is a duplicate and is dropped.
-        if (lastT_ != 0) {
-            int64_t idx;
-            if (clock_.Valid()) idx = (int64_t)std::llround(clock_.IndexAt((double)t));
-            else idx = n + std::max<int64_t>(1, (int64_t)std::llround((double)(t - lastT_) / nominalTicks_));
-            if (idx <= n) { lastT_ = t; continue; }
-            n = idx;
-        }
-        lastT_ = t;
-        clock_.Add(n, t);
-        count_++;
+        const int64_t time = Qpc::Now();
+        std::lock_guard<std::mutex> lock(mutex_);
+        const int64_t next = VblankIndex(clock_, index, lastVblankTime_, time, nominalPeriod_);
+        lastVblankTime_ = time;
+        if (next <= index) continue;
+        index = next;
+        clock_.Add(index, time);
     }
 }
 
-bool VsyncClock::Valid() const { std::lock_guard<std::mutex> lk(m_); return clock_.Valid(); }
-
-double VsyncClock::PeriodTicks() const {
-    std::lock_guard<std::mutex> lk(m_);
-    return clock_.Valid() ? clock_.Period() : nominalTicks_;
+double VsyncClock::MeasuredHz() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return (double)Qpc::Freq() / (clock_.Valid() ? clock_.Period() : nominalPeriod_);
 }
 
 double VsyncClock::JitterMs() const {
-    std::lock_guard<std::mutex> lk(m_);
-    double hi = clock_.ResidualQuantile(0.99), lo = clock_.ResidualQuantile(0.01);
-    return Qpc::ToMs((int64_t)std::max(std::abs(hi), std::abs(lo)));
+    std::lock_guard<std::mutex> lock(mutex_);
+    return clock_.JitterMs();
 }
 
 int64_t VsyncClock::NextVblankAfter(int64_t t) const {
-    std::lock_guard<std::mutex> lk(m_);
-    if (!clock_.Valid()) {
-        if (lastT_ == 0) return t + (int64_t)nominalTicks_;
-        double k = std::floor((double)(t - lastT_) / nominalTicks_) + 1;
-        return lastT_ + (int64_t)(k * nominalTicks_);
-    }
-    double idx = std::floor(clock_.IndexAt((double)t)) + 1;
-    return (int64_t)clock_.TimeOf(idx);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (clock_.Valid()) return (int64_t)clock_.TimeOf(std::floor(clock_.IndexAt((double)t)) + 1);
+    if (lastVblankTime_ == 0) return t + (int64_t)nominalPeriod_;
+    const double periodsSinceLast = std::floor((double)(t - lastVblankTime_) / nominalPeriod_) + 1;
+    return lastVblankTime_ + (int64_t)(periodsSinceLast * nominalPeriod_);
 }
 
-} // namespace camss
+}

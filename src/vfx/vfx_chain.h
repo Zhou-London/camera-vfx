@@ -1,49 +1,62 @@
-// NVIDIA Maxine Video Effects (VFX SDK 1.3) chain, fully CUDA-resident:
-//   Video Frame Generation (explicit timestep)  @ source resolution
-//   TrueHDR (SDR RGBA8 -> HDR10 RGB10A2/PQ)     @ source (default) or output resolution
-//   Video Super Resolution                      source -> output resolution
-// D3D11 <-> CUDA interop happens only twice: once per *source* frame (ingest) and
-// once per *output* frame (final transfer into a D3D texture for presentation).
 #pragma once
 #include "../gfx/device.h"
-#include "../interp/interpolator.h"
+#include "../gfx/encoding.h"
+#include "../gfx/source_frame.h"
+#include "../util/stats.h"
+#include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <vector>
-#include <string>
 
-namespace camss {
+namespace cameravfx {
 
 struct VfxImpl;
+
+struct VfxOutput {
+    const Device::Tex* tex = nullptr;
+    Encoding encoding = Encoding::SdrGamma;
+    bool generated = false;
+};
+
+struct VfxTimings {
+    std::optional<double> fgMs, hdrMs, srMs, outMs;
+    double totalMs = 0;
+};
+
+void RecordVfxTimings(StatBook& stats, const VfxTimings& timings);
 
 class VfxChain {
 public:
     struct Config {
-        bool fg = false; int fgMode = 0;
-        bool sr = false; int srQuality = 21; float srStrength = 1.0f;
-        bool hdr = false; bool hdrBeforeSr = true;
-        unsigned hdrPeakNits = 650, hdrContrast = 100, hdrSaturation = 100, hdrMiddleGray = 50;
-        UINT srcW = 0, srcH = 0, outW = 0, outH = 0;
-        std::wstring runtimeDir;   // empty = auto
-        bool profile = true;       // CUDA event timing per stage
+        bool fg = false;
+        int fgQuality = 0;
+        bool sr = false;
+        int srQuality = 0;
+        bool hdr = false;
+        bool hdrAfterSr = false;
+        UINT srcW = 0, srcH = 0;
+        UINT outW = 0, outH = 0;
+        std::function<void(float loadedFraction)> onLoadProgress;
     };
-    VfxChain();
+
+    static std::unique_ptr<VfxChain> Create(Device& dev, const Config& cfg, std::span<SourceFrame> store);
     ~VfxChain();
-    bool Init(Device& dev, const Config& cfg, SourceFrame* store, int storeCount);
-    bool HasFg() const;
-    bool OutputIsPq() const;
-    // Copies a freshly converted source frame (D3D) into its CUDA slot.
-    void Ingest(const SourceFrame& f);
-    // Runs the chain for frame A (and B,t if B != null) and returns the D3D output texture.
-    // `external` (optional): an already interpolated D3D frame (source size, RGBA8) to run
-    // HDR/SR on instead of A (used when a D3D interpolator is combined with VFX SR/HDR).
-    const Device::Tex* Process(const SourceFrame& A, const SourceFrame* B, float t, bool srOn,
-                               const Device::Tex* external = nullptr);
-    bool LastFgRan() const;       // did the last Process() actually generate a frame?
-    bool LastOutputPq() const;    // is the last output HDR10 (PQ) or SDR?
-    // Stage GPU times (ms) of completed frames since the last call.
-    std::vector<std::pair<const char*, double>> PopTimings();
+
+    bool Reload(int fgQuality, int srQuality);
+    bool Loaded() const;
+    int FgQuality() const;
+    int SrQuality() const;
+    double FgLoadMs() const;
+    double SrLoadMs() const;
+
+    void Ingest(const SourceFrame& frame);
+    VfxOutput Process(const SourceFrame& a, const SourceFrame* b, float t, bool srOn);
+    std::vector<VfxTimings> PopTimings();
+
 private:
+    explicit VfxChain(std::unique_ptr<VfxImpl> impl);
     std::unique_ptr<VfxImpl> p_;
 };
 
-} // namespace camss
+}

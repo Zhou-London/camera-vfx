@@ -1,244 +1,327 @@
-// Offline self-test: renders synthetic frames with known motion, runs each frame
-// generator at several time steps and compares against the ground-truth frame
-// rendered at exactly that time (PSNR). Also benchmarks VFX VSR / TrueHDR.
-#include "app.h"
+#include "selftest.h"
+#include "capture/synthetic_source.h"
+#include "capture/timecode.h"
+#include "gfx/blit.h"
+#include "gfx/source_frame.h"
+#include "util/stats.h"
 #include "vfx/vfx_chain.h"
+#include "vfx/vfx_quality.h"
+#include <array>
 #include <cmath>
+#include <format>
+#include <memory>
+#include <string>
 #include <vector>
 
-namespace camss {
+namespace cameravfx {
 
-static bool Readback(Device& dev, ID3D11Texture2D* tex, std::vector<uint8_t>& rgba, UINT& w, UINT& h) {
-    D3D11_TEXTURE2D_DESC d{};
-    tex->GetDesc(&d);
-    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-    ComPtr<ID3D11Texture2D> st;
-    if (FAILED(dev.dev()->CreateTexture2D(&d, nullptr, &st))) return false;
-    dev.ctx()->CopyResource(st.Get(), tex);
-    D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(dev.ctx()->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
-    w = d.Width; h = d.Height;
-    rgba.resize((size_t)w * h * 4);
-    for (UINT y = 0; y < h; y++) memcpy(&rgba[(size_t)y * w * 4], (uint8_t*)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
-    dev.ctx()->Unmap(st.Get(), 0);
-    return true;
+namespace {
+
+constexpr int kStoreFrames = 8;
+constexpr float kTimesteps[] = {0.25f, 0.5f, 0.75f};
+constexpr int kPairs = 12;
+constexpr int64_t kFirstPairFrame = 100;
+constexpr int64_t kPairSpacing = 7;
+constexpr uint32_t kTimecodeSamples = 64;
+constexpr int kBenchmarkFrames = 80;
+constexpr int kBenchmarkWarmUpFrames = 10;
+constexpr int64_t kBenchmarkFirstFrame = 500;
+constexpr int64_t kChannelCheckFrame = 600;
+constexpr FrameSize kBenchmarkOutput{3840, 2160};
+constexpr double kMaxPsnr = 99.0;
+constexpr double kMinMse = 1e-10;
+constexpr double kLimitedBlack = 16.0;
+constexpr double kLimitedSpan = 219.0;
+constexpr double kBt709LumaB = 0.0722, kBt709LumaG = 0.7152, kBt709LumaR = 0.2126;
+constexpr uint8_t kNeutralChroma = 128;
+constexpr uint32_t kTenBitMax = 1023;
+
+using Store = std::array<SourceFrame, kStoreFrames>;
+
+struct Image {
+    std::vector<uint8_t> bytes;
+    UINT width = 0, height = 0;
+    const uint8_t* Pixel(size_t x, size_t y) const { return &bytes[(y * width + x) * 4]; }
+};
+
+Image ReadBack(Device& dev, ID3D11Texture2D* tex) {
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    HR_CHECK(dev.D3dDevice()->CreateTexture2D(&desc, nullptr, &staging));
+    dev.Context()->CopyResource(staging.Get(), tex);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HR_CHECK(dev.Context()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+    Image image{std::vector<uint8_t>((size_t)desc.Width * desc.Height * 4), desc.Width, desc.Height};
+    for (UINT y = 0; y < desc.Height; y++)
+        memcpy(&image.bytes[(size_t)y * desc.Width * 4], (const uint8_t*)mapped.pData + (size_t)y * mapped.RowPitch, (size_t)desc.Width * 4);
+    dev.Context()->Unmap(staging.Get(), 0);
+    return image;
 }
 
-static double Psnr(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
-    double se = 0; size_t n = 0;
-    for (size_t i = 0; i + 3 < a.size() && i + 3 < b.size(); i += 4)
-        for (int c = 0; c < 3; c++) { double d = (double)a[i + c] - (double)b[i + c]; se += d * d; n++; }
-    double mse = se / std::max<size_t>(1, n);
-    return mse <= 1e-10 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
+double Psnr(const Image& a, const Image& b) {
+    double squaredError = 0;
+    size_t samples = 0;
+    for (size_t i = 0; i + 3 < a.bytes.size(); i += 4)
+        for (int c = 0; c < 3; c++) {
+            const double d = (double)a.bytes[i + c] - (double)b.bytes[i + c];
+            squaredError += d * d;
+            samples++;
+        }
+    const double mse = squaredError / (double)samples;
+    return mse <= kMinMse ? kMaxPsnr : 10.0 * std::log10(255.0 * 255.0 / mse);
 }
 
-static void WaitIdle(Device& dev) {
-    D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
-    ComPtr<ID3D11Query> q;
-    dev.dev()->CreateQuery(&qd, &q);
-    dev.ctx()->End(q.Get());
-    BOOL done = FALSE;
-    while (dev.ctx()->GetData(q.Get(), &done, sizeof(done), 0) != S_OK || !done) YieldProcessor();
+std::unique_ptr<Store> MakeStore(Device& dev, UINT w, UINT h) {
+    auto store = std::make_unique<Store>();
+    for (SourceFrame& f : *store) f.rgb = dev.CreateTex(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+    return store;
 }
 
-int RunSelfTest(const Options& o) {
-    Device dev;
-    if (!dev.Create(false)) return 1;
-    const UINT W = o.capW, H = o.capH;
-    const double fps = o.capFps;
-    SyntheticSource synth;
-    synth.Init(dev, W, H);
-    std::array<SourceFrame, 8> store;
-    for (auto& f : store) f.rgb = dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
-    Device::Tex gt = dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
-    Device::Tex out = dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
-    std::vector<uint8_t> bufGt, bufOut, bufA, bufB;
-    UINT rw, rh;
-    const float ts[] = {0.25f, 0.5f, 0.75f};
-    const int pairs = 12;
+struct Pair {
+    SourceFrame& a;
+    SourceFrame& b;
+};
 
-    // Each generator owns its frame store: a D3D texture can be registered with CUDA only once.
-    using Store = std::array<SourceFrame, 8>;
-    auto makeStore = [&] {
-        auto st = std::make_unique<Store>();
-        for (auto& f : *st) f.rgb = dev.CreateTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
-        return st;
-    };
-    struct Gen { std::string name; std::unique_ptr<Store> store; std::unique_ptr<Interpolator> interp; std::unique_ptr<VfxChain> vfx; };  // store first: destroyed last
-    std::vector<Gen> gens;
-    gens.push_back({"blend", makeStore(), CreateBlendInterpolator(), nullptr});
-    for (int q = 0; q <= 2; q++)
-        if (auto f = CreateFlowInterpolator(q)) gens.push_back({"nvof-q" + std::to_string(q), makeStore(), std::move(f), nullptr});
-    for (int mode = 0; mode <= 2; mode++) {
-        Gen g; g.name = "vfx-fg-mode" + std::to_string(mode);
-        g.vfx = std::make_unique<VfxChain>();
-        g.store = makeStore();
-        VfxChain::Config c; c.fg = true; c.fgMode = mode; c.srcW = W; c.srcH = H; c.outW = W; c.outH = H;
-        if (!g.vfx->Init(dev, c, g.store->data(), (int)g.store->size())) { LOGW("VFX mode %d unavailable", mode); continue; }
-        gens.push_back(std::move(g));
-    }
-    for (auto& g : gens) if (g.interp && !g.interp->Init(dev, W, H)) g.interp.reset();
+Pair RenderPair(SyntheticSource& synth, Store& store, int64_t n, double fps) {
+    SourceFrame& a = store[n % kStoreFrames];
+    SourceFrame& b = store[(n + 1) % kStoreFrames];
+    synth.Render(a.rgb, n / fps);
+    a.n = n;
+    synth.Render(b.rgb, (n + 1) / fps);
+    b.n = n + 1;
+    return {a, b};
+}
 
-    printf("\n== Frame generation quality vs ground truth (synthetic %ux%u, %d pairs) ==\n", W, H, pairs);
-    printf("%-16s %8s %8s %8s %10s %12s\n", "generator", "t=0.25", "t=0.50", "t=0.75", "mean dB", "ms/frame");
-    for (auto& g : gens) {
-        if (!g.interp && !g.vfx) continue;
-        double sum[3] = {}, totalMs = 0; int runs = 0;
-        Store& gs = *g.store;
-        for (int p = 0; p < pairs; p++) {
-            int64_t n = 100 + p * 7;
-            SourceFrame& A = gs[n % 8];
-            SourceFrame& B = gs[(n + 1) % 8];
-            synth.Render(A.rgb, n / fps); A.n = n; A.generation++;
-            synth.Render(B.rgb, (n + 1) / fps); B.n = n + 1; B.generation++;
-            if (g.vfx) { g.vfx->Ingest(A); g.vfx->Ingest(B); }
-            if (g.interp) g.interp->Prepare(A, B);
-            WaitIdle(dev);
-            for (int k = 0; k < 3; k++) {
-                float t = ts[k];
-                synth.Render(gt, (n + t) / fps);
-                int64_t t0 = Qpc::Now();
-                ID3D11Texture2D* res = out.tex.Get();
-                if (g.vfx) {
-                    const Device::Tex* o2 = g.vfx->Process(A, &B, t, false);
-                    if (o2) res = o2->tex.Get();
-                } else {
-                    g.interp->Interpolate(A, B, t, out);
+std::string Ms(const std::optional<Percentiles>& p) { return p ? std::format("{:.2f}", p->p50) : std::string("-"); }
+
+uint32_t TimecodeTestValue(uint32_t k) { return 0x9E3779B9u * (k + 1) ^ (k << 7); }
+
+std::vector<uint8_t> AsCapturedYuy2(const Image& bgra, int downscale) {
+    const int w = (int)bgra.width / downscale, h = (int)bgra.height / downscale;
+    std::vector<uint8_t> yuy2((size_t)w * h * 2, kNeutralChroma);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            double luma = 0;
+            for (int dy = 0; dy < downscale; dy++)
+                for (int dx = 0; dx < downscale; dx++) {
+                    const uint8_t* q = bgra.Pixel((size_t)(x * downscale + dx), (size_t)(y * downscale + dy));
+                    luma += kBt709LumaB * q[0] + kBt709LumaG * q[1] + kBt709LumaR * q[2];
                 }
-                WaitIdle(dev);
-                totalMs += Qpc::ToMs(Qpc::Now() - t0); runs++;
-                Readback(dev, res, bufOut, rw, rh);
-                Readback(dev, gt.tex.Get(), bufGt, rw, rh);
-                sum[k] += Psnr(bufOut, bufGt);
-            }
+            luma /= downscale * downscale;
+            yuy2[((size_t)y * w + x) * 2] = (uint8_t)(kLimitedBlack + luma * kLimitedSpan / 255.0 + 0.5);
         }
-        printf("%-16s %8.2f %8.2f %8.2f %10.2f %12.3f\n", g.name.c_str(), sum[0] / pairs, sum[1] / pairs, sum[2] / pairs,
-               (sum[0] + sum[1] + sum[2]) / (3 * pairs), totalMs / runs);
-    }
-    // Reference: how different are consecutive real frames (repeat-frame baseline at t=0.5).
-    {
-        double s = 0;
-        for (int p = 0; p < pairs; p++) {
-            int64_t n = 100 + p * 7;
-            synth.Render(store[0].rgb, n / fps);
-            synth.Render(gt, (n + 0.5) / fps);
-            Readback(dev, store[0].rgb.tex.Get(), bufA, rw, rh);
-            Readback(dev, gt.tex.Get(), bufGt, rw, rh);
-            s += Psnr(bufA, bufGt);
-        }
-        printf("%-16s %8s %8.2f %8s   (repeat previous frame)\n", "repeat", "", s / pairs, "");
-    }
+    return yuy2;
+}
 
-    // ---- Loopback timecode: render the band exactly as the presenter does, then decode it
-    // from a YUY2 / NV12 conversion of the read-back frame (as the capture card would deliver it).
-    {
-        printf("\n== Loopback timecode encode/decode ==\n");
-        Blitter blit;
-        blit.Init(dev);
-        struct TcCase { UINT w, h; int down; const char* name; };
-        TcCase tcs[] = {{1920, 1080, 1, "1080p output -> 1080p capture"}, {3840, 2160, 2, "4K output -> 1080p capture (2x box downscale)"}};
-        for (auto& tc : tcs) {
-            Device::Tex target = dev.CreateTex(tc.w, tc.h, DXGI_FORMAT_B8G8R8A8_UNORM, false, true);
-            int ok = 0, total = 0;
-            for (uint32_t k = 0; k < 64; k++) {
-                uint32_t value = 0x9E3779B9u * (k + 1) ^ (k << 7);
-                BlitParams bp; bp.timecode = true; bp.timecodeValue = value;
-                blit.Draw(store[0].rgb.srv.Get(), W, H, target.rtv.Get(), tc.w, tc.h, bp);
-                std::vector<uint8_t> px; UINT rw2, rh2;
-                Readback(dev, target.tex.Get(), px, rw2, rh2);
-                const int cw = (int)(rw2 / tc.down), ch = (int)(rh2 / tc.down);
-                // BGRA -> limited-range BT.709 luma, packed as YUY2 (Y0 U Y1 V) after box downscale.
-                std::vector<uint8_t> yuy2((size_t)cw * ch * 2, 128);
-                for (int y = 0; y < ch; y++)
-                    for (int x = 0; x < cw; x++) {
-                        double acc = 0;
-                        for (int dy = 0; dy < tc.down; dy++)
-                            for (int dx = 0; dx < tc.down; dx++) {
-                                const uint8_t* q = &px[(((size_t)(y * tc.down + dy)) * rw2 + (x * tc.down + dx)) * 4];
-                                acc += 0.0722 * q[0] + 0.7152 * q[1] + 0.2126 * q[2];
-                            }
-                        acc /= tc.down * tc.down;
-                        yuy2[((size_t)y * cw + x) * 2] = (uint8_t)(16.0 + acc * 219.0 / 255.0 + 0.5);
-                    }
-                uint32_t got = 0;
-                total++;
-                if (DecodeTimecodeFrame(yuy2.data(), (ptrdiff_t)cw * 2, PixFmt::YUY2, cw, ch, &got) && got == value) ok++;
-            }
-            printf("  %-48s decoded %d/%d correctly\n", tc.name, ok, total);
-        }
-    }
-
-    // ---- VSR / TrueHDR benchmarks (VFX), 1080p -> display-size.
-    printf("\n== VFX VSR / TrueHDR timing (GPU, CUDA events) ==\n");
-    struct SrCase { const char* name; bool sr; int q; bool hdr; bool hdrBefore; };
-    SrCase cases[] = {
-        {"VSR q21 (streaming-medium)", true, 21, false, true},
-        {"VSR q23 (streaming-ultra)", true, 23, false, true},
-        {"VSR q1 (low)", true, 1, false, true},
-        {"VSR q4 (ultra)", true, 4, false, true},
-        {"TrueHDR 1080p", false, 0, true, true},
-        {"TrueHDR@1080p + VSR q21 (10-bit)", true, 21, true, true},
-        {"VSR q21 + TrueHDR@4K", true, 21, true, false},
-        {"FG low + TrueHDR + VSR q21", true, 21, true, true},
+bool TestFrameGeneration(Device& dev, SyntheticSource& synth, const CaptureMode& mode) {
+    struct Generator {
+        int fgQuality;
+        std::unique_ptr<Store> store;
+        std::unique_ptr<VfxChain> chain;
     };
-    const UINT OW = o.outW ? o.outW : 3840, OH = o.outH ? o.outH : 2160;
-    gens.clear();   // release CUDA registrations of the generator stores
-    for (auto& c : cases) {
-        auto cstore = makeStore();
-        Store& store = *cstore;
-        VfxChain chain;
+    std::vector<Generator> generators;
+    bool ok = true;
+    for (const QualityLevel& level : FgQualityLevels()) {
+        Generator g{level.value, MakeStore(dev, mode.width, mode.height), nullptr};
+        VfxChain::Config c;
+        c.fg = true;
+        c.fgQuality = level.value;
+        c.srcW = c.outW = mode.width;
+        c.srcH = c.outH = mode.height;
+        g.chain = VfxChain::Create(dev, c, *g.store);
+        if (!g.chain) {
+            LOGE("frame generation %s unavailable", level.name);
+            ok = false;
+            continue;
+        }
+        generators.push_back(std::move(g));
+    }
+    Device::Tex truth = dev.CreateTex(mode.width, mode.height, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+
+    printf("\n== Frame generation quality vs ground truth (synthetic %ux%u, %d pairs) ==\n", mode.width, mode.height, kPairs);
+    printf("%-16s %8s %8s %8s %10s %12s\n", "generator", "t=0.25", "t=0.50", "t=0.75", "mean dB", "ms/frame");
+    for (Generator& g : generators) {
+        double sum[std::size(kTimesteps)] = {}, totalMs = 0;
+        int samples[std::size(kTimesteps)] = {}, runs = 0;
+        for (int p = 0; p < kPairs; p++) {
+            const int64_t n = kFirstPairFrame + p * kPairSpacing;
+            const Pair pair = RenderPair(synth, *g.store, n, mode.rateHz);
+            g.chain->Ingest(pair.a);
+            g.chain->Ingest(pair.b);
+            dev.WaitIdle();
+            for (size_t k = 0; k < std::size(kTimesteps); k++) {
+                synth.Render(truth, (n + kTimesteps[k]) / mode.rateHz);
+                const int64_t t0 = Qpc::Now();
+                const VfxOutput out = g.chain->Process(pair.a, &pair.b, kTimesteps[k], false);
+                dev.WaitIdle();
+                totalMs += Qpc::ToMs(Qpc::Now() - t0);
+                runs++;
+                if (!out.tex) {
+                    LOGE("frame generation %s produced no frame (pair %d, t=%.2f)", FgQualityName(g.fgQuality), p, kTimesteps[k]);
+                    ok = false;
+                    continue;
+                }
+                sum[k] += Psnr(ReadBack(dev, out.tex->tex.Get()), ReadBack(dev, truth.tex.Get()));
+                samples[k]++;
+            }
+        }
+        auto mean = [](double s, int count) { return count ? s / count : 0.0; };
+        const std::string name = std::string("fg-") + FgQualityName(g.fgQuality);
+        printf("%-16s %8.2f %8.2f %8.2f %10.2f %12.3f\n", name.c_str(), mean(sum[0], samples[0]), mean(sum[1], samples[1]), mean(sum[2], samples[2]),
+               mean(sum[0] + sum[1] + sum[2], samples[0] + samples[1] + samples[2]), totalMs / runs);
+    }
+
+    Device::Tex frame = dev.CreateTex(mode.width, mode.height, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+    double repeatSum = 0;
+    for (int p = 0; p < kPairs; p++) {
+        const int64_t n = kFirstPairFrame + p * kPairSpacing;
+        synth.Render(frame, n / mode.rateHz);
+        synth.Render(truth, (n + 0.5) / mode.rateHz);
+        repeatSum += Psnr(ReadBack(dev, frame.tex.Get()), ReadBack(dev, truth.tex.Get()));
+    }
+    printf("%-16s %8s %8.2f %8s   (repeat previous frame)\n", "repeat", "", repeatSum / kPairs, "");
+    return ok;
+}
+
+bool TestTimecode(Device& dev, const CaptureMode& mode) {
+    struct TimecodeCase {
+        UINT width, height;
+        int downscale;
+        const char* name;
+    };
+    constexpr TimecodeCase kCases[] = {{1920, 1080, 1, "1080p output -> 1080p capture"}, {3840, 2160, 2, "4K output -> 1080p capture (2x box downscale)"}};
+    printf("\n== Loopback timecode encode/decode ==\n");
+    Blitter blit;
+    blit.Init(dev);
+    Device::Tex source = dev.CreateTex(mode.width, mode.height, DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+    bool ok = true;
+    for (const TimecodeCase& c : kCases) {
+        Device::Tex target = dev.CreateTex(c.width, c.height, DXGI_FORMAT_B8G8R8A8_UNORM, false, true);
+        uint32_t decoded = 0;
+        for (uint32_t k = 0; k < kTimecodeSamples; k++) {
+            BlitParams bp;
+            bp.timecode = true;
+            bp.timecodeValue = TimecodeTestValue(k);
+            blit.Draw(source.srv.Get(), mode.width, mode.height, target.rtv.Get(), c.width, c.height, bp);
+            const std::vector<uint8_t> yuy2 = AsCapturedYuy2(ReadBack(dev, target.tex.Get()), c.downscale);
+            const int w = (int)c.width / c.downscale, h = (int)c.height / c.downscale;
+            if (DecodeTimecode(yuy2.data(), (ptrdiff_t)w * 2, PixFmt::YUY2, w, h) == bp.timecodeValue) decoded++;
+        }
+        printf("  %-48s decoded %u/%u correctly\n", c.name, decoded, kTimecodeSamples);
+        ok = ok && decoded == kTimecodeSamples;
+    }
+    return ok;
+}
+
+void PrintHdrChannels(Device& dev, const SourceFrame& input, const Device::Tex& output) {
+    const Image in = ReadBack(dev, input.rgb.tex.Get());
+    const Image out = ReadBack(dev, output.tex.Get());
+    auto isYellow = [](const uint8_t* q) { return q[0] > 230 && q[1] > 200 && q[2] < 80; };
+    auto isBlue = [](const uint8_t* q) { return q[0] < 80 && q[1] > 130 && q[1] < 170 && q[2] > 230; };
+    double yellow[3] = {}, blue[3] = {};
+    int yellowCount = 0, blueCount = 0;
+    for (size_t i = 0; i < (size_t)in.width * in.height; i++) {
+        const uint8_t* q = &in.bytes[i * 4];
+        uint32_t packed;
+        memcpy(&packed, &out.bytes[i * 4], 4);
+        const double pq[3] = {(double)(packed & kTenBitMax) / kTenBitMax, (double)((packed >> 10) & kTenBitMax) / kTenBitMax,
+                              (double)((packed >> 20) & kTenBitMax) / kTenBitMax};
+        double* sum = isYellow(q) ? yellow : isBlue(q) ? blue : nullptr;
+        if (!sum) continue;
+        for (int c = 0; c < 3; c++) sum[c] += pq[c];
+        (sum == yellow ? yellowCount : blueCount)++;
+    }
+    auto avg = [](double s, int n) { return n ? s / n : 0.0; };
+    printf("  channel check (PQ codes, R10G10B10A2 unpacked): yellow -> R %.3f G %.3f B %.3f (n=%d) | blue -> R %.3f G %.3f B %.3f (n=%d)\n",
+           avg(yellow[0], yellowCount), avg(yellow[1], yellowCount), avg(yellow[2], yellowCount), yellowCount, avg(blue[0], blueCount),
+           avg(blue[1], blueCount), avg(blue[2], blueCount), blueCount);
+}
+
+bool BenchmarkChains(Device& dev, SyntheticSource& synth, const CaptureMode& mode, FrameSize output) {
+    struct BenchmarkCase {
+        const char* name;
+        bool fg, sr;
+        const char* srQuality;
+        bool hdr, hdrAfterSr;
+    };
+    constexpr BenchmarkCase kCases[] = {
+        {"sr streaming-medium", false, true, "streaming-medium", false, false},
+        {"sr streaming-ultra", false, true, "streaming-ultra", false, false},
+        {"sr low", false, true, "low", false, false},
+        {"sr ultra", false, true, "ultra", false, false},
+        {"hdr at source size", false, false, "streaming-medium", true, false},
+        {"hdr + sr streaming-medium (10-bit)", false, true, "streaming-medium", true, false},
+        {"sr streaming-medium + hdr-after-sr", false, true, "streaming-medium", true, true},
+        {"fg low + hdr + sr streaming-medium", true, true, "streaming-medium", true, false},
+    };
+    printf("\n== SR / TrueHDR timing (GPU, CUDA events) ==\n");
+    bool ok = true;
+    for (const BenchmarkCase& c : kCases) {
+        const std::unique_ptr<Store> store = MakeStore(dev, mode.width, mode.height);
         VfxChain::Config cfg;
-        cfg.fg = strstr(c.name, "FG") != nullptr; cfg.fgMode = 0;
-        cfg.sr = c.sr; cfg.srQuality = c.q; cfg.hdr = c.hdr; cfg.hdrBeforeSr = c.hdrBefore;
-        cfg.srcW = W; cfg.srcH = H; cfg.outW = OW; cfg.outH = OH;
-        if (!chain.Init(dev, cfg, store.data(), (int)store.size())) { printf("%-36s  init failed\n", c.name); continue; }
-        StatBook sb;
-        for (int i = 0; i < 80; i++) {
-            int64_t n = 500 + i;
-            SourceFrame& A = store[n % 8];
-            SourceFrame& B = store[(n + 1) % 8];
-            synth.Render(A.rgb, n / fps); A.n = n; A.generation++;
-            synth.Render(B.rgb, (n + 1) / fps); B.n = n + 1; B.generation++;
-            chain.Ingest(A); chain.Ingest(B);
-            int64_t t0 = Qpc::Now();
-            chain.Process(A, cfg.fg ? &B : nullptr, 0.5f, true);
-            WaitIdle(dev);
-            if (i >= 10) sb.Add("wall", Qpc::ToMs(Qpc::Now() - t0));
-            for (auto& kv : chain.PopTimings()) if (i >= 10) sb.Add(kv.first, kv.second);
+        cfg.fg = c.fg;
+        cfg.sr = c.sr;
+        cfg.srQuality = *FindSrQuality(c.srQuality);
+        cfg.hdr = c.hdr;
+        cfg.hdrAfterSr = c.hdrAfterSr;
+        cfg.srcW = mode.width;
+        cfg.srcH = mode.height;
+        cfg.outW = c.sr ? output.width : mode.width;
+        cfg.outH = c.sr ? output.height : mode.height;
+        const std::unique_ptr<VfxChain> chain = VfxChain::Create(dev, cfg, *store);
+        if (!chain) {
+            printf("%-36s  init failed\n", c.name);
+            ok = false;
+            continue;
+        }
+        StatBook timings;
+        for (int i = 0; i < kBenchmarkFrames; i++) {
+            const Pair pair = RenderPair(synth, *store, kBenchmarkFirstFrame + i, mode.rateHz);
+            chain->Ingest(pair.a);
+            chain->Ingest(pair.b);
+            const int64_t t0 = Qpc::Now();
+            chain->Process(pair.a, c.fg ? &pair.b : nullptr, 0.5f, true);
+            dev.WaitIdle();
+            const bool measured = i >= kBenchmarkWarmUpFrames;
+            if (measured) timings.Add("wall", Qpc::ToMs(Qpc::Now() - t0));
+            for (const VfxTimings& t : chain->PopTimings())
+                if (measured) RecordVfxTimings(timings, t);
         }
         if (c.hdr && !c.sr) {
-            // Channel-order check: average HDR output over yellow (R,G high, B low) and blue input pixels.
-            int64_t n = 600;
-            SourceFrame& A = store[n % 8];
-            synth.Render(A.rgb, n / fps); A.n = n; A.generation++;
-            chain.Ingest(A);
-            const Device::Tex* res = chain.Process(A, nullptr, 0.f, true);
-            WaitIdle(dev);
-            std::vector<uint8_t> in8, outp;
-            UINT w1, h1, w2, h2;
-            Readback(dev, A.rgb.tex.Get(), in8, w1, h1);
-            if (res) {
-                Readback(dev, res->tex.Get(), outp, w2, h2);
-                double yel[3] = {}, blu[3] = {}; int ny = 0, nb = 0;
-                for (size_t i = 0; i < (size_t)w1 * h1; i++) {
-                    const uint8_t* q = &in8[i * 4];
-                    uint32_t v; memcpy(&v, &outp[i * 4], 4);
-                    double ch[3] = {(double)(v & 1023) / 1023, (double)((v >> 10) & 1023) / 1023, (double)((v >> 20) & 1023) / 1023};
-                    if (q[0] > 230 && q[1] > 200 && q[2] < 80) { for (int k = 0; k < 3; k++) yel[k] += ch[k]; ny++; }
-                    if (q[0] < 80 && q[1] > 130 && q[1] < 170 && q[2] > 230) { for (int k = 0; k < 3; k++) blu[k] += ch[k]; nb++; }
-                }
-                printf("  channel check (PQ codes, R10G10B10A2 unpacked): yellow -> R %.3f G %.3f B %.3f (n=%d) | blue -> R %.3f G %.3f B %.3f (n=%d)\n",
-                       ny ? yel[0] / ny : 0, ny ? yel[1] / ny : 0, ny ? yel[2] / ny : 0, ny, nb ? blu[0] / nb : 0, nb ? blu[1] / nb : 0,
-                       nb ? blu[2] / nb : 0, nb);
-            }
+            SourceFrame& frame = (*store)[kChannelCheckFrame % kStoreFrames];
+            synth.Render(frame.rgb, kChannelCheckFrame / mode.rateHz);
+            frame.n = kChannelCheckFrame;
+            chain->Ingest(frame);
+            const VfxOutput out = chain->Process(frame, nullptr, 0.f, true);
+            dev.WaitIdle();
+            if (out.tex) PrintHdrChannels(dev, frame, *out.tex);
         }
-        double fg50, fg99, h50, h99, s50, s99, o50, o99, t50, t99, w50, w99;
-        sb.Get("vfx.fg", fg50, fg99); sb.Get("vfx.hdr", h50, h99); sb.Get("vfx.sr", s50, s99);
-        sb.Get("vfx.out", o50, o99); sb.Get("vfx.gpu_total", t50, t99); sb.Get("wall", w50, w99);
-        printf("%-36s fg %.2f  hdr %.2f  sr %.2f  out %.2f | gpu total p50 %.2f p99 %.2f | wall p50 %.2f ms\n", c.name, fg50, h50,
-               s50, o50, t50, t99, w50);
+        const std::optional<Percentiles> total = timings.Get(stat::kVfxGpuTotal);
+        printf("%-36s fg %s  hdr %s  sr %s  out %s | gpu total p50 %s p99 %s | wall p50 %s ms\n", c.name, Ms(timings.Get(stat::kVfxFg)).c_str(),
+               Ms(timings.Get(stat::kVfxHdr)).c_str(), Ms(timings.Get(stat::kVfxSr)).c_str(), Ms(timings.Get(stat::kVfxOut)).c_str(), Ms(total).c_str(),
+               total ? std::format("{:.2f}", total->p99).c_str() : "-", Ms(timings.Get("wall")).c_str());
     }
-    return 0;
+    return ok;
 }
 
-} // namespace camss
+}
+
+bool RunSelfTest(const Options& o) {
+    Device dev;
+    dev.Create(o.d3dDebug);
+    SyntheticSource synth;
+    synth.Init(dev);
+    const bool fgOk = TestFrameGeneration(dev, synth, o.capture);
+    const bool timecodeOk = TestTimecode(dev, o.capture);
+    const bool benchmarkOk = BenchmarkChains(dev, synth, o.capture, o.out.value_or(kBenchmarkOutput));
+    const bool ok = fgOk && timecodeOk && benchmarkOk;
+    printf("\nselftest: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+}

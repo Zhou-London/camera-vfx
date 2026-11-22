@@ -1,8 +1,3 @@
-// Terminal dashboard: model (live window, 60 s history, per-setting segments for the CSV record),
-// the FTXUI view and the low-priority UI thread. See dashboard.h.
-//
-// FTXUI headers come before <windows.h> (pulled in by dashboard.h): wingdi.h defines an RGB()
-// macro that would break ftxui::Color::RGB. Colours below use the Color(r, g, b) constructor.
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -14,144 +9,117 @@
 #include <ftxui/screen/terminal.hpp>
 
 #include "dashboard.h"
+#include "../util/stats.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstdarg>
 #include <condition_variable>
 #include <csignal>
-#include <cstring>
-#include <ctime>
 #include <deque>
-#include <filesystem>
+#include <format>
+#include <functional>
 #include <iterator>
+#include <map>
+#include <mutex>
+#include <stop_token>
 #include <thread>
+#include <utility>
 #include <vector>
 
-namespace camss {
+namespace cameravfx {
 namespace {
 
 using ftxui::Color;
 using ftxui::Element;
 using ftxui::Elements;
 
-// ------------------------------------------------------------------ constants
-constexpr double kWindowSec = 10.0;        // live statistics window
-constexpr double kBucketSec = 0.25;        // history resolution (4 buckets per second)
-constexpr int kHistBuckets = 240;          // 60 s of history
-constexpr double kSettleSec = 2.0;         // ignored at the start of a segment
-constexpr double kMinSegSec = 3.0;         // shorter segments are not kept / written
+constexpr double kLiveWindowSec = 10.0;
+constexpr size_t kMaxWindowFrames = 20000;
+constexpr double kBucketSec = 0.25;
+constexpr int kHistoryBuckets = 240;
 constexpr size_t kMaxLogLines = 300;
-constexpr double kFpsChange = 0.10;        // content fps change that starts a new segment
-constexpr double kFpsConfirmSec = 1.0;     // ... when it persists this long
+constexpr double kNoFramesSec = 1.0;
+constexpr double kMinFpsSpanSec = 0.2;
+constexpr double kDefaultContentFps = 60.0;
+constexpr double kLatencyMarginMs = 4.0;
+constexpr size_t kLateWarnMinFrames = 100;
+constexpr double kLateWarnFraction = 0.01;
+constexpr double kPausingChangeDebounceMs = 700;
+constexpr auto kRefreshPeriod = std::chrono::milliseconds(100);
 
-// ------------------------------------------------------------------ theme
-// Calm palette in the spirit of Claude Code: default foreground for values, grey labels, one warm
-// accent. RGB colours are mapped to the nearest 256/16-colour entry by FTXUI when the terminal
-// does not do true colour (the mapping happens at construction, hence the lazy static).
-struct Theme {
+struct Palette {
     Color accent, good, warn, bad, muted, line, band;
 };
-const Theme& Th() {
-    static const Theme t{
-        Color(217, 119, 87),   // accent (warm orange)
-        Color(98, 180, 110),   // good
-        Color(214, 163, 56),   // warn (amber, readable on light and dark)
-        Color(224, 88, 78),    // bad
-        Color(136, 136, 136),  // muted labels
-        Color(98, 98, 98),     // borders, axes
-        Color(150, 100, 82),   // p99 band (dim accent)
+const Palette& Colors() {
+    static const Palette p{
+        Color(217, 119, 87),
+        Color(98, 180, 110),
+        Color(214, 163, 56),
+        Color(224, 88, 78),
+        Color(136, 136, 136),
+        Color(98, 98, 98),
+        Color(150, 100, 82),
     };
-    return t;
+    return p;
 }
 
-// ------------------------------------------------------------------ text helpers
-int Wid(const std::string& s) { return ftxui::string_width(s); }
+int DisplayWidth(const std::string& s) { return ftxui::string_width(s); }
 
-std::string Fmt(const char* fmt, ...) {
-    char b[256];
-    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
-    return b;
+bool Known(double v) { return v >= 0 && std::isfinite(v); }
+std::string FormatNumber(double v, int decimals) { return Known(v) ? std::format("{:.{}f}", v, decimals) : "-"; }
+std::string FormatAdaptive(double v) {
+    if (!Known(v)) return "-";
+    if (v < 1) return std::format("{:.2f}", v);
+    if (v < 100) return std::format("{:.1f}", v);
+    return std::format("{:.0f}", v);
 }
-// Number with `prec` decimals, "-" when unknown (negative / NaN).
-std::string Num(double v, int prec = 1) {
-    if (!(v >= 0) || !std::isfinite(v)) return "-";
-    return Fmt("%.*f", prec, v);
+std::string FormatClock(double sec) {
+    const long s = (long)std::max(sec, 0.0);
+    if (s >= 3600) return std::format("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60);
+    return std::format("{}:{:02}", s / 60, s % 60);
 }
-// Adaptive precision for small values (0.21 / 2.2 / 12.8 / 123).
-std::string NumA(double v) {
-    if (!(v >= 0) || !std::isfinite(v)) return "-";
-    if (v < 1) return Fmt("%.2f", v);
-    if (v < 100) return Fmt("%.1f", v);
-    return Fmt("%.0f", v);
+std::string FormatResolution(FrameSize size) {
+    if (!size.width || !size.height) return "-";
+    if (size.width * 9 == size.height * 16) return std::format("{}p", size.height);
+    return std::format("{}x{}", size.width, size.height);
 }
-std::string Clock(double sec) {
-    if (!(sec >= 0)) sec = 0;
-    const long s = (long)sec;
-    if (s >= 3600) return Fmt("%ld:%02ld:%02ld", s / 3600, (s / 60) % 60, s % 60);
-    return Fmt("%ld:%02ld", s / 60, s % 60);
-}
-std::string Res(unsigned w, unsigned h) {
-    if (!w || !h) return "-";
-    if (w * 9 == h * 16) return Fmt("%up", h);
-    return Fmt("%ux%u", w, h);
-}
-std::string Truncate(const std::string& s, int w) {
-    if (w <= 0) return {};
-    if (Wid(s) <= w) return s;
-    std::string out;
-    int cur = 0;
-    for (const auto& g : ftxui::Utf8ToGlyphs(s)) {
-        const int gw = Wid(g);
-        if (cur + gw > w - 1) break;
-        out += g; cur += gw;
-    }
-    return out + "…";
-}
-std::string PadR(const std::string& s, int w) { std::string t = Truncate(s, w); return t + std::string((size_t)std::max(0, w - Wid(t)), ' '); }
-std::string PadL(const std::string& s, int w) { std::string t = Truncate(s, w); return std::string((size_t)std::max(0, w - Wid(t)), ' ') + t; }
 std::string Repeat(const char* s, int n) { std::string r; for (int i = 0; i < n; i++) r += s; return r; }
 
-std::string IsoLocal(time_t t) {
-    tm lt{}; localtime_s(&lt, &t);
-    tm g = lt;
-    const long off = (long)(_mkgmtime(&g) - t);
-    char b[40]; strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%S", &lt);
-    const long a = off < 0 ? -off : off;
-    return std::string(b) + Fmt("%c%02ld:%02ld", off < 0 ? '-' : '+', a / 3600, (a % 3600) / 60);
-}
-// ------------------------------------------------------------------ spans: styled text runs
-enum : uint8_t { kPlain = 0, kBold = 1, kMuted = 2, kColor = 4 };
+struct SpanStyle {
+    static constexpr uint8_t kPlain = 0, kBold = 1, kMuted = 2, kColored = 4;
+};
 struct Span {
     std::string s;
-    uint8_t style = kPlain;
+    uint8_t style = SpanStyle::kPlain;
     Color c{};
 };
 using Spans = std::vector<Span>;
 
-Span S(std::string s) { return {std::move(s), kPlain, {}}; }
-Span B(std::string s) { return {std::move(s), kBold, {}}; }
-Span M(std::string s) { return {std::move(s), kMuted, {}}; }
-Span C(std::string s, Color c) { return {std::move(s), kColor, c}; }
-Span CB(std::string s, Color c) { return {std::move(s), (uint8_t)(kColor | kBold), c}; }
+Span Plain(std::string s) { return {std::move(s), SpanStyle::kPlain, {}}; }
+Span Bold(std::string s) { return {std::move(s), SpanStyle::kBold, {}}; }
+Span Muted(std::string s) { return {std::move(s), SpanStyle::kMuted, {}}; }
+Span Colored(std::string s, Color c) { return {std::move(s), SpanStyle::kColored, c}; }
+Span ColoredBold(std::string s, Color c) { return {std::move(s), (uint8_t)(SpanStyle::kColored | SpanStyle::kBold), c}; }
 
-int Wid(const Spans& v) { int w = 0; for (const auto& s : v) w += Wid(s.s); return w; }
+int DisplayWidth(const Spans& v) { int w = 0; for (const auto& s : v) w += DisplayWidth(s.s); return w; }
 Spans& operator+=(Spans& a, const Spans& b) { a.insert(a.end(), b.begin(), b.end()); return a; }
 
 Spans TruncateSpans(const Spans& in, int w) {
-    if (Wid(in) <= w) return in;
+    if (DisplayWidth(in) <= w) return in;
     Spans out;
     int cur = 0;
     for (const auto& sp : in) {
-        const int sw = Wid(sp.s);
+        const int sw = DisplayWidth(sp.s);
         if (cur + sw <= w - 1) { out.push_back(sp); cur += sw; continue; }
-        Span t = sp; t.s.clear();
+        Span t = sp;
+        t.s.clear();
         for (const auto& g : ftxui::Utf8ToGlyphs(sp.s)) {
-            const int gw = Wid(g);
+            const int gw = DisplayWidth(g);
             if (cur + gw > w - 1) break;
-            t.s += g; cur += gw;
+            t.s += g;
+            cur += gw;
         }
         t.s += "…";
         out.push_back(t);
@@ -160,63 +128,67 @@ Spans TruncateSpans(const Spans& in, int w) {
     return out;
 }
 
-Element ToEl(const Span& sp) {
+std::string Truncate(const std::string& s, int w) {
+    if (w <= 0) return {};
+    const Spans t = TruncateSpans({Plain(s)}, w);
+    return t.empty() ? std::string() : t.front().s;
+}
+std::string PadRight(const std::string& s, int w) { std::string t = Truncate(s, w); return t + std::string((size_t)std::max(0, w - DisplayWidth(t)), ' '); }
+std::string PadLeft(const std::string& s, int w) { std::string t = Truncate(s, w); return std::string((size_t)std::max(0, w - DisplayWidth(t)), ' ') + t; }
+
+Element ToElement(const Span& sp) {
     Element e = ftxui::text(sp.s);
-    if (sp.style & kMuted) e = e | ftxui::color(Th().muted);
-    if (sp.style & kColor) e = e | ftxui::color(sp.c);
-    if (sp.style & kBold) e = e | ftxui::bold;
+    if (sp.style & SpanStyle::kMuted) e = e | ftxui::color(Colors().muted);
+    if (sp.style & SpanStyle::kColored) e = e | ftxui::color(sp.c);
+    if (sp.style & SpanStyle::kBold) e = e | ftxui::bold;
     return e;
 }
-// One line of exactly width w (truncated with an ellipsis, padded with blanks).
 Element Line(const Spans& v, int w) {
     Spans t = TruncateSpans(v, w);
     Elements els;
-    for (const auto& sp : t) els.push_back(ToEl(sp));
-    const int rest = w - Wid(t);
+    for (const auto& sp : t) els.push_back(ToElement(sp));
+    const int rest = w - DisplayWidth(t);
     if (rest > 0) els.push_back(ftxui::text(std::string((size_t)rest, ' ')));
     return ftxui::hbox(std::move(els));
 }
-// Picks the first variant that fits in w (else the last one, truncated).
-Element Fit(const std::vector<Spans>& variants, int w) {
-    for (const auto& v : variants) if (Wid(v) <= w) return Line(v, w);
+Element FirstFitting(const std::vector<Spans>& variants, int w) {
+    for (const auto& v : variants) if (DisplayWidth(v) <= w) return Line(v, w);
     return Line(variants.back(), w);
 }
-// Right-aligned tail on the same line: left part truncated first (at least one blank between).
-Element LineLR(const Spans& left, const Spans& right, int w) {
-    const int rw = Wid(right);
+Element LineLeftRight(const Spans& left, const Spans& right, int w) {
+    const int rw = DisplayWidth(right);
     if (rw + 2 > w) return Line(left, w);
     Elements els{Line(left, w - rw - 1), ftxui::text(" ")};
-    for (const auto& sp : right) els.push_back(ToEl(sp));
+    for (const auto& sp : right) els.push_back(ToElement(sp));
     return ftxui::hbox(std::move(els));
 }
 
-// Rounded panel with a grey border and the title in the top edge. w x h are the outer size; the
-// body gets (w - 4) x (h - 2) and is clipped to it.
+constexpr int kPanelBorderRows = 2;
+constexpr int kPanelBorderColumns = 4;
+
 Element Panel(const Spans& title, Element body, int w, int h) {
-    const Theme& T = Th();
-    Spans tt = TruncateSpans(title, std::max(0, w - 6));
-    const int tw = Wid(tt);
-    Elements top{ftxui::text("╭─ ") | ftxui::color(T.line)};
-    for (const auto& sp : tt) top.push_back(ToEl(sp));
-    top.push_back(ftxui::text(" " + Repeat("─", std::max(0, w - 5 - tw)) + "╮") | ftxui::color(T.line));
-    auto sideBar = [&] {   // a node can only have one parent: build each side separately
+    const Palette& colors = Colors();
+    const Spans shownTitle = TruncateSpans(title, std::max(0, w - 6));
+    Elements top{ftxui::text("╭─ ") | ftxui::color(colors.line)};
+    for (const auto& sp : shownTitle) top.push_back(ToElement(sp));
+    top.push_back(ftxui::text(" " + Repeat("─", std::max(0, w - 5 - DisplayWidth(shownTitle))) + "╮") | ftxui::color(colors.line));
+    auto sideBorder = [&] {
         Elements side;
-        for (int i = 0; i < h - 2; i++) side.push_back(ftxui::text("│"));
-        return ftxui::vbox(std::move(side)) | ftxui::color(T.line);
+        for (int i = 0; i < h - kPanelBorderRows; i++) side.push_back(ftxui::text("│"));
+        return ftxui::vbox(std::move(side)) | ftxui::color(colors.line);
     };
-    Element l = sideBar(), r = sideBar();
     Element mid = ftxui::hbox({
-        l, ftxui::text(" "),
-        body | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, std::max(0, w - 4)) | ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, std::max(0, h - 2)) | ftxui::frame,
-        ftxui::text(" "), r,
+        sideBorder(), ftxui::text(" "),
+        body | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, std::max(0, w - kPanelBorderColumns)) |
+            ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, std::max(0, h - kPanelBorderRows)) | ftxui::frame,
+        ftxui::text(" "), sideBorder(),
     });
-    Element bottom = ftxui::text("╰" + Repeat("─", std::max(0, w - 2)) + "╯") | ftxui::color(T.line);
+    Element bottom = ftxui::text("╰" + Repeat("─", std::max(0, w - 2)) + "╯") | ftxui::color(colors.line);
     return ftxui::vbox({ftxui::hbox(std::move(top)), mid, bottom}) |
            ftxui::size(ftxui::WIDTH, ftxui::EQUAL, w) | ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, h);
 }
-Element Rows(Elements rows, int h) {
-    h = std::max(h, 0);                       // (int)0 > -1 would pop an empty vector
-    while ((int)rows.size() > h) rows.pop_back();
+Element ClipRows(Elements rows, int h) {
+    rows.resize(std::min(rows.size(), (size_t)std::max(h, 0)));
     return ftxui::vbox(std::move(rows));
 }
 Element Blank(int w, int h) {
@@ -225,99 +197,85 @@ Element Blank(int w, int h) {
     return ftxui::vbox(std::move(rows));
 }
 
-// ------------------------------------------------------------------ big digits (3 rows, thin rounded strokes)
-const char* const kBigDigits[10][3] = {
+const char* const kBigDigitGlyphs[10][3] = {
     {"╭─╮", "│ │", "╰─╯"}, {" ╷ ", " │ ", " ╵ "}, {"╶─╮", "╭─╯", "╰─╴"}, {"╶─╮", " ─┤", "╶─╯"},
     {"╷ ╷", "╰─┤", "  ╵"}, {"╭─╴", "╰─╮", "╶─╯"}, {"╭─╴", "├─╮", "╰─╯"}, {"╶─╮", "  │", "  ╵"},
     {"╭─╮", "├─┤", "╰─╯"}, {"╭─╮", "╰─┤", "╶─╯"},
 };
-std::array<std::string, 3> BigText(const std::string& s) {
+std::array<std::string, 3> BigDigits(const std::string& s) {
     std::array<std::string, 3> r;
     for (size_t i = 0; i < s.size(); i++) {
         const char ch = s[i];
+        const bool last = i + 1 == s.size();
         if (ch >= '0' && ch <= '9') {
-            for (int k = 0; k < 3; k++) r[k] += kBigDigits[ch - '0'][k];
-            if (i + 1 < s.size() && s[i + 1] != '.') for (auto& x : r) x += " ";
+            for (int k = 0; k < 3; k++) r[k] += kBigDigitGlyphs[ch - '0'][k];
+            if (!last && s[i + 1] != '.') for (auto& x : r) x += " ";
         } else if (ch == '.') {
             r[0] += "  "; r[1] += "  "; r[2] += "╸ ";
-        } else {   // '-' and anything else
+        } else {
             r[0] += "   "; r[1] += "╶─╴"; r[2] += "   ";
-            if (i + 1 < s.size()) for (auto& x : r) x += " ";
+            if (!last) for (auto& x : r) x += " ";
         }
     }
     return r;
 }
 
-// Eighth blocks (▁▂▃▅▆▇) are missing from the classic console fonts (Consolas, 新宋体): outside
-// Windows Terminal / known modern terminals the graphs use half blocks only (▄ █).
-bool FineBlocks() {
-    static const bool fine = [] {
-        if (const char* e = getenv("CAMSS_TUI_BLOCKS")) return strcmp(e, "half") != 0;
-        return getenv("WT_SESSION") != nullptr || getenv("TERM_PROGRAM") != nullptr;
-    }();
-    return fine;
-}
+bool TerminalHasEighthBlocks() { return getenv("WT_SESSION") != nullptr || getenv("TERM_PROGRAM") != nullptr; }
 
-// ------------------------------------------------------------------ bar graph node
-// Column bars with eighth-block resolution; `lo` drawn in colour a, the band up to `hi` (optional)
-// in colour b. Values above `warnAbove` are drawn in colour w; a dotted reference line at `ref`.
-// The node fills its box; the newest data is at the right edge.
 struct GraphData {
-    std::vector<float> lo, hi;   // per bucket, <0 = no data
+    std::vector<float> lo, hi;
     float vmin = 0, vmax = 1;
-    Color a, b, w;
-    float warnAbove = -1, ref = -1;
+    Color loColor, hiColor, warnColor;
+    float warnAbove = kUnknownMs, reference = kUnknownMs;
 };
 class BarGraph : public ftxui::Node {
 public:
-    BarGraph(GraphData d, bool fineBlocks) : d_(std::move(d)), fineBlocks_(fineBlocks) {}
+    BarGraph(GraphData d, bool eighthBlocks) : d_(std::move(d)), eighthBlocks_(eighthBlocks) {}
     void ComputeRequirement() override {
         requirement_.min_x = 1; requirement_.min_y = 1;
         requirement_.flex_grow_x = 1; requirement_.flex_grow_y = 1;
         requirement_.flex_shrink_x = 1; requirement_.flex_shrink_y = 1;
     }
     void Render(ftxui::Screen& screen) override {
-        static const char* const kEighth[9] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+        static const char* const kEighths[9] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
         const int W = box_.x_max - box_.x_min + 1, H = box_.y_max - box_.y_min + 1;
         if (W <= 0 || H <= 0) return;
-        // The W columns always span the full 60 s timeline (kHistBuckets buckets, newest at the
-        // right edge); column c covers buckets [c*240/W, (c+1)*240/W) of it. The data may cover
-        // only the most recent part of the timeline (shortly after start).
         const int n = (int)d_.lo.size();
-        const int off = kHistBuckets - n;          // timeline position of d_.lo[0]
+        const int firstBucketOnTimeline = kHistoryBuckets - n;
         const float span = std::max(1e-6f, d_.vmax - d_.vmin);
         auto toEighths = [&](float v) { return (int)std::lround(std::clamp((v - d_.vmin) / span, 0.f, 1.f) * (float)(H * 8)); };
-        const int refE = d_.ref >= 0 ? toEighths(d_.ref) : -1;
-        const bool fine = fineBlocks_;
-        auto quant = [&](int e) { return fine || e == 0 ? e : (e <= 4 ? 4 : 8); };
+        const int referenceEighths = Known(d_.reference) ? toEighths(d_.reference) : -1;
+        auto shown = [&](int eighths) { return eighthBlocks_ || eighths == 0 ? eighths : (eighths <= 4 ? 4 : 8); };
         for (int c = 0; c < W; c++) {
-            float lo = -1, hi = -1; int cnt = 0; double sum = 0;
-            const int b0 = (int)((int64_t)c * kHistBuckets / W);
-            const int b1 = std::max(b0 + 1, (int)((int64_t)(c + 1) * kHistBuckets / W));
+            float lo = kUnknownMs, hi = kUnknownMs;
+            int cnt = 0;
+            double sum = 0;
+            const int b0 = (int)((int64_t)c * kHistoryBuckets / W);
+            const int b1 = std::max(b0 + 1, (int)((int64_t)(c + 1) * kHistoryBuckets / W));
             for (int b = b0; b < b1; b++) {
-                const int i = b - off;
+                const int i = b - firstBucketOnTimeline;
                 if (i < 0 || i >= n) continue;
-                if (d_.lo[i] >= 0) { sum += d_.lo[i]; cnt++; }
+                if (Known(d_.lo[i])) { sum += d_.lo[i]; cnt++; }
                 if (i < (int)d_.hi.size() && d_.hi[i] > hi) hi = d_.hi[i];
             }
             if (cnt) lo = (float)(sum / cnt);
-            const int le = lo >= 0 ? std::max(1, toEighths(lo)) : 0;
-            const int he = hi >= 0 ? std::max(le, toEighths(hi)) : 0;
-            const Color ca = (d_.warnAbove >= 0 && lo > d_.warnAbove) ? d_.w : d_.a;
-            for (int r = 0; r < H; r++) {          // r = 0 bottom row
-                const int base = r * 8;
-                const int lf = quant(std::clamp(le - base, 0, 8)), hf = quant(std::clamp(he - base, 0, 8));
-                auto& px = screen.PixelAt(box_.x_min + c, box_.y_max - r);
+            const int loEighths = Known(lo) ? std::max(1, toEighths(lo)) : 0;
+            const int hiEighths = Known(hi) ? std::max(loEighths, toEighths(hi)) : 0;
+            const Color loColor = (Known(d_.warnAbove) && lo > d_.warnAbove) ? d_.warnColor : d_.loColor;
+            for (int row = 0; row < H; row++) {
+                const int base = row * 8;
+                const int lf = shown(std::clamp(loEighths - base, 0, 8)), hf = shown(std::clamp(hiEighths - base, 0, 8));
+                auto& px = screen.PixelAt(box_.x_min + c, box_.y_max - row);
                 if (lf > 0) {
-                    px.character = kEighth[lf];
-                    px.foreground_color = ca;
-                    if (lf < 8 && hf > lf) px.background_color = d_.b;
+                    px.character = kEighths[lf];
+                    px.foreground_color = loColor;
+                    if (lf < 8 && hf > lf) px.background_color = d_.hiColor;
                 } else if (hf > 0) {
-                    px.character = kEighth[hf];
-                    px.foreground_color = d_.b;
-                } else if (refE >= 0 && refE > base && refE <= base + 8) {
+                    px.character = kEighths[hf];
+                    px.foreground_color = d_.hiColor;
+                } else if (referenceEighths > base && referenceEighths <= base + 8) {
                     px.character = "┄";
-                    px.foreground_color = Th().line;
+                    px.foreground_color = Colors().line;
                 } else {
                     px.character = " ";
                 }
@@ -326,124 +284,21 @@ public:
     }
 private:
     GraphData d_;
-    bool fineBlocks_;
+    bool eighthBlocks_;
 };
 
-// ------------------------------------------------------------------ fixed-bin histogram (segment statistics)
-class Hist {
-public:
-    static constexpr double kStep = 0.02;  // ms
-    static constexpr int kBins = 12500;    // 0 .. 250 ms, last bin = overflow
-    void Add(double v) {
-        if (bins_.empty()) bins_.assign(kBins + 1, 0);
-        int i = v <= 0 ? 0 : (int)(v / kStep);
-        if (i > kBins) i = kBins;
-        bins_[i]++; n_++;
-        if (v > max_) max_ = v;
-    }
-    double Q(double q) const {
-        if (!n_) return -1;
-        // Same rank as RollingStat::QuantileOf (k = round(q * (n - 1)), 1-based target k + 1), so the
-        // record table agrees with the status line also for bimodal data (x2 frame generation alternates
-        // between "new frame half shown" and "new frame fully shown").
-        uint64_t target = (uint64_t)std::floor(q * (double)(n_ - 1) + 0.5) + 1;
-        if (target < 1) target = 1;
-        uint64_t c = 0;
-        for (int i = 0; i <= kBins; i++) {
-            c += bins_[i];
-            if (c >= target) return i == kBins ? max_ : std::min(max_, (i + 0.5) * kStep);
-        }
-        return max_;
-    }
-    uint64_t N() const { return n_; }
-    double Max() const { return n_ ? max_ : -1; }
-private:
-    std::vector<uint32_t> bins_;
-    uint64_t n_ = 0;
-    double max_ = 0;
-};
-
-float QuantileOf(std::vector<float>& v, double q) {
-    if (v.empty()) return -1;
-    size_t k = (size_t)std::clamp<double>(q * (double)(v.size() - 1) + 0.5, 0.0, (double)(v.size() - 1));
-    std::nth_element(v.begin(), v.begin() + (ptrdiff_t)k, v.end());
-    return v[k];
-}
-
-// ------------------------------------------------------------------ model types
-struct Settings {
-    uint64_t generation = 0;
-    std::string mode, interp, fgQuality, sr, srQuality, hdr, capture, metric;
-    bool interpOn = false, srOn = false, adaptive = false, vrr = false;
-    int multiplier = 1;
-    double targetFps = 0, contentFps = 0, signalHz = 0, dispHz = 0;
-    unsigned srcW = 0, srcH = 0, outW = 0, outH = 0;
-};
-Settings SettingsOf(const AppStatus& st) {
-    Settings s;
-    s.generation = st.generation; s.mode = st.mode; s.interp = st.interp; s.fgQuality = st.fgQuality;
-    s.sr = st.sr; s.srQuality = st.srQuality; s.hdr = st.hdr; s.capture = st.captureFormat; s.metric = st.latencyMetric;
-    s.interpOn = st.interpOn; s.srOn = st.srOn; s.adaptive = st.adaptive; s.vrr = st.vrrActive;
-    s.multiplier = st.multiplier; s.targetFps = st.targetFps; s.contentFps = st.contentFps;
-    s.signalHz = st.signalHz; s.dispHz = st.dispHz;
-    s.srcW = st.srcW; s.srcH = st.srcH; s.outW = st.outW; s.outH = st.outH;
-    return s;
-}
-bool FgActive(const Settings& s) { return s.interpOn && !s.interp.empty() && s.interp != "none"; }
-bool SrActive(const Settings& s) { return s.srOn && !s.sr.empty() && s.sr != "none"; }
-std::string Q(const std::string& q) { return (q.empty() || q == "-") ? std::string() : " " + q; }
-std::string FgText(const Settings& s) {
-    if (s.interp.empty() || s.interp == "none") return "-";
-    if (!s.interpOn) return "关";
-    std::string r = s.interp + Q(s.fgQuality);
-    if (s.targetFps > 0) r += Fmt(" →%.0f", s.targetFps);
-    else if (s.multiplier > 1) r += Fmt(" ×%d", s.multiplier);
-    return r;
-}
-std::string SrText(const Settings& s) {
-    if (s.sr.empty() || s.sr == "none") return "-";
-    if (!s.srOn) return "关";
-    return s.sr + Q(s.srQuality);
-}
-// Output fps the setting is supposed to deliver (for the "best" mark); 0 = unknown.
-double TargetFps(const Settings& s) {
-    double t;
-    if (s.mode.rfind("fixed", 0) == 0) t = s.dispHz;
-    else if (FgActive(s)) t = s.targetFps > 0 ? s.targetFps : s.contentFps * std::max(1, s.multiplier);
-    else t = s.contentFps;
-    if (s.dispHz > 0 && t > s.dispHz) t = s.dispHz;
-    return t;
-}
-
-struct SegRow {
-    Settings s;
-    time_t startT = 0, endT = 0;
-    double durSec = 0, measSec = 0;
-    uint64_t frames = 0, late = 0, hold = 0;
-    double outFps = -1, latP50 = -1, latP99 = -1, latMax = -1, contP50 = -1, dP50 = -1, gpuP50 = -1, gpuP99 = -1;
-};
-
-struct SegAcc {
-    bool active = false;
-    Settings s;
-    int64_t startQpc = 0, settleUntil = 0;
-    time_t startT = 0;
-    int64_t prevQpc = 0, activeTicks = 0;
-    uint64_t frames = 0, runs = 0, late = 0, hold = 0;
-    Hist lat, cont, d, gpu;
-    bool paused = false;
-    int64_t fpsPendingSince = 0;
-};
+float QuantileOrUnknown(std::vector<float>& v, double q) { return v.empty() ? kUnknownMs : Quantile(v, q); }
 
 struct Bucket {
-    float p50 = -1, p99 = -1, d = -1, gpu = -1, fps = -1;
+    float p50 = kUnknownMs, p99 = kUnknownMs, delay = kUnknownMs, gpu = kUnknownMs;
 };
 
-struct WinStats {
-    size_t n = 0;
-    double fps = 0;               // over the window
-    double fpsNow = 0;            // over the last second
-    float latP50 = -1, latP99 = -1, latMax = -1, contP50 = -1, contP99 = -1, dP50 = -1, gpuP50 = -1, gpuP99 = -1;
+struct WindowStats {
+    size_t frames = 0;
+    double fps = 0;
+    double fpsLastSecond = 0;
+    float latencyP50 = kUnknownMs, latencyP99 = kUnknownMs, contentLatencyP50 = kUnknownMs, contentLatencyP99 = kUnknownMs;
+    float gpuP50 = kUnknownMs, gpuP99 = kUnknownMs;
     uint64_t late = 0, hold = 0;
 };
 
@@ -453,628 +308,520 @@ struct LogLine {
     std::string text;
 };
 
-// ------------------------------------------------------------------ CSV
-std::string Csv(const std::string& s) {
-    if (s.find_first_of(",\"\r\n") == std::string::npos) return s;
-    std::string r = "\"";
-    for (char c : s) { if (c == '"') r += '"'; r += c; }
-    return r + "\"";
+struct Popup {
+    bool open = false;
+    int cursor = 0;
+    struct Pending { int value; int64_t changedAt; bool sent; };
+    std::map<SettingId, Pending> pending;
+    int Value(const SettingItem& it) const {
+        auto p = pending.find(it.id);
+        return p != pending.end() ? p->second.value : it.value;
+    }
+    bool Waiting(const SettingItem& it) const {
+        auto p = pending.find(it.id);
+        return p != pending.end() && !p->second.sent;
+    }
+};
+
+struct BarSegment { std::string name; double v; Color c; };
+
+void SegmentBar(const std::vector<BarSegment>& segments, double scale, int barWidth, const Spans& lead, const Spans& tail,
+                Elements& rows, int iw) {
+    const Palette& colors = Colors();
+    Spans bar = lead, labels{Plain(std::string((size_t)DisplayWidth(lead), ' '))};
+    int filled = 0, labelsEnd = 0;
+    double acc = 0;
+    const int labelLimit = barWidth + DisplayWidth(tail);
+    for (const auto& g : segments) {
+        if (g.v <= 0) continue;
+        const int x0 = (int)std::lround(acc / scale * barWidth);
+        acc += g.v;
+        const int x1 = std::min(barWidth, (int)std::lround(acc / scale * barWidth));
+        if (x1 > x0) bar.push_back(Colored(Repeat("█", x1 - x0), g.c));
+        filled = std::max(filled, x1);
+        const int labelWidth = DisplayWidth(g.name + " " + FormatAdaptive(g.v));
+        const int at = std::min(x0, labelLimit - labelWidth - 1);
+        if (x1 > x0 && at >= labelsEnd) {
+            if (at > labelsEnd) labels.push_back(Plain(std::string((size_t)(at - labelsEnd), ' ')));
+            labels.push_back(Colored(g.name + " ", colors.muted));
+            labels.push_back(Plain(FormatAdaptive(g.v)));
+            labels.push_back(Plain(" "));
+            labelsEnd = at + labelWidth + 1;
+        }
+    }
+    if (filled < barWidth) bar.push_back(Colored(Repeat("░", barWidth - filled), colors.line));
+    bar += tail;
+    rows.push_back(Line(bar, iw));
+    rows.push_back(Line(labels, iw));
 }
-std::string CsvNum(double v, int prec = 3) { return v >= 0 && std::isfinite(v) ? Fmt("%.*f", prec, v) : std::string(); }
 
-const char* kCsvHeader =
-    "start,end,duration_s,measured_s,frames,out_fps,target_fps,lat_p50_ms,lat_p99_ms,lat_max_ms,content_p50_ms,"
-    "d_p50_ms,gpu_p50_ms,gpu_p99_ms,late,hold,mode,vrr,interp,fg_quality,interp_on,multiplier,fg_target_fps,"
-    "adaptive,sr,sr_quality,sr_on,hdr,content_fps,signal_hz,display_hz,capture,src,out,latency_metric,generation\n";
-
-bool AppendCsv(const std::string& path, const SegRow& r) {
-    if (path.empty()) return true;
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    const fs::path p(Utf8ToWide(path.c_str()));
-    if (p.has_parent_path()) fs::create_directories(p.parent_path(), ec);
-    const bool isNew = !fs::exists(p, ec) || fs::file_size(p, ec) == 0;
-    FILE* f = _wfopen(p.c_str(), L"ab");
-    if (!f) return false;
-    std::string line;
-    // UTF-8 BOM on a new file: Excel (zh-CN) otherwise decodes device names / "→" as GBK
-    if (isNew) line += "\xEF\xBB\xBF" + std::string(kCsvHeader);
-    const Settings& s = r.s;
-    line += IsoLocal(r.startT) + "," + IsoLocal(r.endT) + "," + CsvNum(r.durSec, 1) + "," + CsvNum(r.measSec, 1) + "," +
-            std::to_string(r.frames) + "," + CsvNum(r.outFps, 2) + "," + CsvNum(TargetFps(s), 2) + "," +
-            CsvNum(r.latP50) + "," + CsvNum(r.latP99) + "," + CsvNum(r.latMax) + "," + CsvNum(r.contP50) + "," +
-            CsvNum(r.dP50) + "," + CsvNum(r.gpuP50) + "," + CsvNum(r.gpuP99) + "," +
-            std::to_string(r.late) + "," + std::to_string(r.hold) + "," +
-            Csv(s.mode) + "," + (s.vrr ? "1" : "0") + "," + Csv(s.interp) + "," + Csv(s.fgQuality) + "," +
-            (s.interpOn ? "1" : "0") + "," + std::to_string(s.multiplier) + "," + CsvNum(s.targetFps, 2) + "," +
-            (s.adaptive ? "1" : "0") + "," + Csv(s.sr) + "," + Csv(s.srQuality) + "," + (s.srOn ? "1" : "0") + "," +
-            Csv(s.hdr) + "," + CsvNum(s.contentFps, 3) + "," + CsvNum(s.signalHz, 3) + "," + CsvNum(s.dispHz, 3) + "," +
-            Csv(s.capture) + "," + Fmt("%ux%u", s.srcW, s.srcH) + "," + Fmt("%ux%u", s.outW, s.outH) + "," +
-            Csv(s.metric) + "," + std::to_string(s.generation) + "\n";
-    const bool ok = fwrite(line.data(), 1, line.size(), f) == line.size();
-    fclose(f);
-    return ok;
-}
-
-// ------------------------------------------------------------------ the model
 class Model {
 public:
-    void SetOptions(const DashboardOptions& o) { opt_ = o; }
-    void SetFineBlocks(bool fine) { fineBlocks_ = fine; }
+    void SetEighthBlocks(bool on) { eighthBlocks_ = on; }
 
-    // UI thread: drain telemetry, update statistics.
-    // boostStatusRead: Status() copies the struct under the mutex that the render thread
-    // (THREAD_PRIORITY_HIGHEST) takes in PublishStatus. A below-normal thread preempted while
-    // holding it would make the render thread wait for a scheduler slot (priority inversion;
-    // SRW locks do not boost the owner), so the UI thread runs at HIGHEST for that copy.
-    void Update(Telemetry* tel, int64_t now, bool boostStatusRead = false) {
-        const int64_t t0 = Qpc::Now();
-        uint64_t seq = 0;
-        const HANDLE self = GetCurrentThread();
-        const int prio = boostStatusRead ? GetThreadPriority(self) : 0;
-        const bool boost = boostStatusRead && prio != THREAD_PRIORITY_ERROR_RETURN && prio < THREAD_PRIORITY_HIGHEST;
-        if (boost) SetThreadPriority(self, THREAD_PRIORITY_HIGHEST);
-        AppStatus st = tel->Status(&seq);
-        if (boost) SetThreadPriority(self, prio);
-        if (seq) { st_ = std::move(st); haveStatus_ = true; SegmentCheck(now); }
+    void Update(Telemetry* tel, int64_t now) {
+        now_ = now;
+        const uint64_t epoch = status_.statsEpoch;
+        const bool hadStatus = HaveStatus();
+        if (tel->Status(statusSeq_, status_) && hadStatus && status_.statsEpoch != epoch) ResetWindow();
+        if (tel->Settings(settingsSeq_, settings_)) settingsChanged_ = true;
         FrameSample f;
         while (tel->PopFrame(f)) {
-            if (!f.qpc) f.qpc = now;
-            if (!firstQpc_) firstQpc_ = f.qpc;
-            lastQpc_ = std::max(lastQpc_, f.qpc);
-            if (f.qpc >= winStart_) win_.push_back(f);   // not frames queued before a window reset
-            AddBucket(f);
-            AddSeg(f);
-            framesSeenLocal_++;
+            lastFrameQpc_ = std::max(lastFrameQpc_, f.qpc);
+            if (f.qpc >= windowStart_) window_.push_back(f);
+            AddToBucket(f);
         }
-        const int64_t wt = Qpc::FromMs(kWindowSec * 1000);
-        while (!win_.empty() && win_.front().qpc < now - wt) win_.pop_front();
-        while (win_.size() > 20000) win_.pop_front();
+        const int64_t windowTicks = Qpc::FromMs(kLiveWindowSec * 1000);
+        while (!window_.empty() && window_.front().qpc < now - windowTicks) window_.pop_front();
+        while (window_.size() > kMaxWindowFrames) window_.pop_front();
         AdvanceBuckets(now);
         ComputeWindow(now);
-        ringDropped_ = tel->DroppedFrames();
-        now_ = now;
-        const double ms = Qpc::ToMs(Qpc::Now() - t0);
-        refreshes_.fetch_add(1, std::memory_order_relaxed);
-        framesSeen_.store(framesSeenLocal_, std::memory_order_relaxed);
-        updMsSum_.store(updMsSum_.load(std::memory_order_relaxed) + ms, std::memory_order_relaxed);
-        if (ms > updMsMax_.load(std::memory_order_relaxed)) updMsMax_.store(ms, std::memory_order_relaxed);
     }
-    // Ends the current segment (Stop / test).
-    void Finish(int64_t now) {
-        if (seg_.active) EndSeg(now);
-    }
-    void ResetWindow() { win_.clear(); winStart_ = now_; }
+    const std::vector<SettingItem>& SettingsList() const { return settings_; }
+    bool TakeSettingsChanged() { return std::exchange(settingsChanged_, false); }
 
-    // ---- view (UI thread)
-    Element Build(int W, int H, const std::vector<LogLine>& logs, bool help, bool quitting) const;
-
-    // perf counters (read by Dashboard::Perf from any thread)
-    std::atomic<uint64_t> refreshes_{0}, framesSeen_{0};
-    std::atomic<double> updMsSum_{0}, updMsMax_{0};
+    Element Build(int W, int H, const std::vector<LogLine>& logs, const Popup& popup, bool quitting) const;
 
 private:
-    // ---------- segments
-    void BeginSeg(const AppStatus& st, int64_t at) {
-        seg_ = SegAcc{};
-        seg_.active = true;
-        seg_.s = SettingsOf(st);
-        seg_.startQpc = at;
-        seg_.settleUntil = at + Qpc::FromMs(kSettleSec * 1000);
-        seg_.startT = WallAt(at);
-    }
-    void EndSeg(int64_t at) {
-        const SegRow r = RowOf(seg_, at);
-        seg_.active = false;
-        if (r.durSec >= kMinSegSec && r.frames > 0) AppendCsv(opt_.historyPath, r);
-    }
-    void SegmentCheck(int64_t now) {
-        const AppStatus& st = st_;
-        if (!st.warmupDone) { if (seg_.active) EndSeg(now); return; }
-        if (!seg_.active) { BeginSeg(st, now); return; }
-        if (st.generation != seg_.s.generation) {
-            // new settings: the live numbers restart so they describe the new setting only
-            EndSeg(now); BeginSeg(st, now);
-            win_.clear(); winStart_ = now;
-            return;
-        }
-        // content frame rate: static / missing content pauses the statistics, a lasting change
-        // of more than 10 % starts a new segment (back-dated to when it was first seen)
-        const double cur = st.contentFps, ref = seg_.s.contentFps;
-        if (st.contentStatic || cur < 1) { seg_.paused = true; seg_.fpsPendingSince = 0; return; }
-        if (ref < 1) { seg_.s.contentFps = cur; seg_.paused = false; return; }
-        if (std::fabs(cur - ref) > kFpsChange * ref) {
-            if (!seg_.fpsPendingSince) seg_.fpsPendingSince = now;
-            seg_.paused = true;
-            if (now - seg_.fpsPendingSince >= Qpc::FromMs(kFpsConfirmSec * 1000)) {
-                const int64_t at = seg_.fpsPendingSince;
-                EndSeg(at);
-                BeginSeg(st, at);
-            }
-        } else {
-            seg_.fpsPendingSince = 0;
-            seg_.paused = false;
-        }
-    }
-    void AddSeg(const FrameSample& f) {
-        SegAcc& s = seg_;
-        if (!s.active || s.paused || f.qpc < s.settleUntil) { s.prevQpc = 0; return; }
-        if (s.prevQpc && f.qpc > s.prevQpc && f.qpc - s.prevQpc < Qpc::FromMs(500)) s.activeTicks += f.qpc - s.prevQpc;
-        else s.runs++;
-        s.prevQpc = f.qpc;
-        s.frames++;
-        const bool hold = (f.flags & FrameSample::kHold) != 0;
-        if (f.flags & FrameSample::kLate) s.late++;
-        if (hold) s.hold++;
-        if (!hold && f.latencyMs >= 0) s.lat.Add(f.latencyMs);
-        if (!hold && f.contentMs >= 0) s.cont.Add(f.contentMs);
-        s.d.Add(f.delayMs);
-        if (f.gpuMs > 0) s.gpu.Add(f.gpuMs);
-    }
-    SegRow RowOf(const SegAcc& s, int64_t at) const {
-        SegRow r;
-        r.s = s.s;
-        r.startT = s.startT; r.endT = WallAt(at);
-        r.durSec = std::max(0.0, Qpc::ToSec(at - s.startQpc));
-        r.measSec = Qpc::ToSec(s.activeTicks);
-        r.frames = s.frames; r.late = s.late; r.hold = s.hold;
-        if (r.measSec > 0 && s.frames > s.runs) r.outFps = (double)(s.frames - s.runs) / r.measSec;
-        r.latP50 = s.lat.Q(0.5); r.latP99 = s.lat.Q(0.99); r.latMax = s.lat.Max();
-        r.contP50 = s.cont.Q(0.5); r.dP50 = s.d.Q(0.5);
-        r.gpuP50 = s.gpu.Q(0.5); r.gpuP99 = s.gpu.Q(0.99);
-        return r;
-    }
-    // Wall clock of a QPC time (QPC times may be simulated: relative to the real "now").
-    time_t WallAt(int64_t qpc) const {
-        const int64_t realNow = Qpc::Now();
-        return time(nullptr) - (time_t)std::llround(Qpc::ToSec(realNow - qpc));
-    }
+    bool HaveStatus() const { return statusSeq_ != 0; }
+    void ResetWindow() { window_.clear(); windowStart_ = now_; }
 
-    // ---------- history buckets
-    void AddBucket(const FrameSample& f) {
-        const int64_t bt = Qpc::FromMs(kBucketSec * 1000);
-        const int64_t idx = f.qpc / bt;
-        if (curIdx_ < 0) curIdx_ = idx;
-        if (idx > curIdx_) {
+    void AddToBucket(const FrameSample& f) {
+        const int64_t index = f.qpc / Qpc::FromMs(kBucketSec * 1000);
+        if (bucketIndex_ < 0) bucketIndex_ = index;
+        if (index > bucketIndex_) {
             FinishBucket();
-            PushEmpty(idx - curIdx_ - 1);
-            curIdx_ = idx;
+            PushEmptyBuckets(index - bucketIndex_ - 1);
+            bucketIndex_ = index;
         }
-        bN_++;
-        if (!(f.flags & FrameSample::kHold) && f.latencyMs >= 0) bLat_.push_back(f.latencyMs);
-        bD_.push_back(f.delayMs);
-        if (f.gpuMs > 0) bGpu_.push_back(f.gpuMs);
+        if (!(f.flags & FrameSample::kHold) && Known(f.latencyMs)) bucketLat_.push_back(f.latencyMs);
+        bucketDelay_.push_back(f.delayMs);
+        if (f.gpuMs > 0) bucketGpu_.push_back(f.gpuMs);
     }
     void AdvanceBuckets(int64_t now) {
-        const int64_t bt = Qpc::FromMs(kBucketSec * 1000);
-        const int64_t nowIdx = now / bt;
-        if (curIdx_ < 0) { curIdx_ = nowIdx; return; }
-        if (nowIdx > curIdx_ + 1) {            // current bucket is complete (> 250 ms ago)
+        const int64_t nowIndex = now / Qpc::FromMs(kBucketSec * 1000);
+        if (bucketIndex_ < 0) { bucketIndex_ = nowIndex; return; }
+        if (nowIndex > bucketIndex_ + 1) {
             FinishBucket();
-            PushEmpty(nowIdx - curIdx_ - 2);
-            curIdx_ = nowIdx - 1;
+            PushEmptyBuckets(nowIndex - bucketIndex_ - 2);
+            bucketIndex_ = nowIndex - 1;
         }
     }
     void FinishBucket() {
         Bucket b;
-        if (bN_ > 0) {
-            b.fps = (float)(bN_ / kBucketSec);
-            b.p50 = QuantileOf(bLat_, 0.5);
-            b.p99 = QuantileOf(bLat_, 0.99);
-            if (!bD_.empty()) { double s = 0; for (float v : bD_) s += v; b.d = (float)(s / bD_.size()); }
-            b.gpu = QuantileOf(bGpu_, 0.5);
+        if (!bucketDelay_.empty()) {
+            b.p50 = QuantileOrUnknown(bucketLat_, 0.5);
+            b.p99 = QuantileOrUnknown(bucketLat_, 0.99);
+            double sum = 0;
+            for (float v : bucketDelay_) sum += v;
+            b.delay = (float)(sum / bucketDelay_.size());
+            b.gpu = QuantileOrUnknown(bucketGpu_, 0.5);
         }
-        hist_.push_back(b);
-        while (hist_.size() > (size_t)kHistBuckets) hist_.pop_front();
-        bN_ = 0; bLat_.clear(); bD_.clear(); bGpu_.clear();
+        history_.push_back(b);
+        while (history_.size() > (size_t)kHistoryBuckets) history_.pop_front();
+        bucketLat_.clear(); bucketDelay_.clear(); bucketGpu_.clear();
     }
-    void PushEmpty(int64_t n) {
-        n = std::min<int64_t>(n, kHistBuckets);
-        for (int64_t i = 0; i < n; i++) hist_.push_back(Bucket{});
-        while (hist_.size() > (size_t)kHistBuckets) hist_.pop_front();
+    void PushEmptyBuckets(int64_t n) {
+        n = std::min<int64_t>(n, kHistoryBuckets);
+        for (int64_t i = 0; i < n; i++) history_.push_back(Bucket{});
+        while (history_.size() > (size_t)kHistoryBuckets) history_.pop_front();
     }
 
-    // ---------- live window
     void ComputeWindow(int64_t now) {
-        WinStats w;
-        sLat_.clear(); sCont_.clear(); sD_.clear(); sGpu_.clear();
-        for (const auto& f : win_) {
+        WindowStats w;
+        winLat_.clear(); winCont_.clear(); winGpu_.clear();
+        for (const auto& f : window_) {
             const bool hold = (f.flags & FrameSample::kHold) != 0;
             if (f.flags & FrameSample::kLate) w.late++;
             if (hold) w.hold++;
-            if (!hold && f.latencyMs >= 0) sLat_.push_back(f.latencyMs);
-            if (!hold && f.contentMs >= 0) sCont_.push_back(f.contentMs);
-            sD_.push_back(f.delayMs);
-            if (f.gpuMs > 0) sGpu_.push_back(f.gpuMs);
+            if (!hold && Known(f.latencyMs)) winLat_.push_back(f.latencyMs);
+            if (!hold && Known(f.contentMs)) winCont_.push_back(f.contentMs);
+            if (f.gpuMs > 0) winGpu_.push_back(f.gpuMs);
         }
-        w.n = win_.size();
-        if (!sLat_.empty()) w.latMax = *std::max_element(sLat_.begin(), sLat_.end());
-        w.latP50 = QuantileOf(sLat_, 0.5); w.latP99 = QuantileOf(sLat_, 0.99);
-        w.contP50 = QuantileOf(sCont_, 0.5); w.contP99 = QuantileOf(sCont_, 0.99); w.dP50 = QuantileOf(sD_, 0.5);
-        w.gpuP50 = QuantileOf(sGpu_, 0.5); w.gpuP99 = QuantileOf(sGpu_, 0.99);
-        if (firstQpc_) {
-            const double span = std::min(kWindowSec, Qpc::ToSec(now - std::max(firstQpc_, winStart_)));
-            if (span > 0.2) w.fps = (double)w.n / span;
-            const int64_t oneSec = now - Qpc::Freq();
-            size_t n1 = 0;
-            for (auto it = win_.rbegin(); it != win_.rend() && it->qpc >= oneSec; ++it) n1++;
-            const double span1 = std::min(1.0, Qpc::ToSec(now - std::max(firstQpc_, winStart_)));
-            if (span1 > 0.2) w.fpsNow = (double)n1 / span1;
+        w.frames = window_.size();
+        w.latencyP50 = QuantileOrUnknown(winLat_, 0.5); w.latencyP99 = QuantileOrUnknown(winLat_, 0.99);
+        w.contentLatencyP50 = QuantileOrUnknown(winCont_, 0.5); w.contentLatencyP99 = QuantileOrUnknown(winCont_, 0.99);
+        w.gpuP50 = QuantileOrUnknown(winGpu_, 0.5); w.gpuP99 = QuantileOrUnknown(winGpu_, 0.99);
+        if (window_.size() >= 2 && Qpc::ToSec(now - window_.back().qpc) < kNoFramesSec) {
+            const int64_t last = window_.back().qpc;
+            const double span = Qpc::ToSec(last - window_.front().qpc);
+            if (span > kMinFpsSpanSec) w.fps = (double)(window_.size() - 1) / span;
+            size_t framesLastSecond = 0;
+            int64_t firstLastSecond = last;
+            for (auto it = window_.rbegin(); it != window_.rend() && it->qpc > last - Qpc::Freq(); ++it) {
+                framesLastSecond++;
+                firstLastSecond = it->qpc;
+            }
+            const double spanLastSecond = Qpc::ToSec(last - firstLastSecond);
+            if (framesLastSecond >= 2 && spanLastSecond > kMinFpsSpanSec) w.fpsLastSecond = (double)(framesLastSecond - 1) / spanLastSecond;
         }
-        ws_ = w;
+        windowStats_ = w;
     }
 
-    // ---------- view helpers (view.cpp-like section below)
-    struct Health { Color c; std::string label; int level; };
+    struct Health { Color c; std::string label; };
+    struct Headline { double p50, p99; };
     Health HealthOf() const;
+    Headline HeadlineLatency() const;
+    double CaptureMs() const;
+    Color HeadlineColor(double v) const;
+    Spans FgDescription() const;
+    Spans SrDescription() const;
+    void InfoRows(int iw, Elements& rows) const;
     Element Header(int W) const;
     Elements LatencyRows(int iw, bool compact) const;
+    void LatencyComposition(double total, int iw, Elements& rows) const;
+    void GpuComposition(int iw, Elements& rows) const;
+    void ProblemRows(int iw, Elements& rows) const;
     Elements SettingsRows(int iw, bool compact) const;
     Element HistoryPanel(int w, int h) const;
+    Element TimeAxis(int gutter, int graphWidth, int iw) const;
+    int TopPanels(int W, int avail, bool compact, Elements& rows) const;
+    void BottomPanels(int W, int rem, const std::vector<LogLine>& logs, Elements& rows) const;
     Element LogPanel(int w, int h, const std::vector<LogLine>& logs) const;
     Element Footer(int W, bool quitting) const;
     Element Compact(int W, int h) const;
-    Element Help(int W, int H) const;
-    Color LatColor(double v) const;
-    double ContentPeriodMs() const { return st_.contentFps > 1 ? 1000.0 / st_.contentFps : 1000.0 / 60.0; }
+    Element SettingsPopup(int W, int H, const Popup& popup) const;
+    Color LatencyColor(double v) const;
+    double ContentPeriodMs() const { return 1000.0 / (status_.contentFps > 1 ? status_.contentFps : kDefaultContentFps); }
 
-    DashboardOptions opt_;
-    bool fineBlocks_ = true;
-    AppStatus st_;
-    bool haveStatus_ = false;
-    int64_t now_ = 0, firstQpc_ = 0, lastQpc_ = 0;
-    uint64_t ringDropped_ = 0, framesSeenLocal_ = 0;
+    bool eighthBlocks_ = true;
+    AppStatus status_;
+    uint64_t statusSeq_ = 0;
+    int64_t now_ = 0, lastFrameQpc_ = 0;
 
-    std::deque<FrameSample> win_;
-    WinStats ws_;
-    int64_t winStart_ = 0;
-    std::vector<float> sLat_, sCont_, sD_, sGpu_;
+    std::deque<FrameSample> window_;
+    WindowStats windowStats_;
+    int64_t windowStart_ = 0;
+    std::vector<float> winLat_, winCont_, winGpu_;
 
-    std::deque<Bucket> hist_;
-    int64_t curIdx_ = -1;
-    int bN_ = 0;
-    std::vector<float> bLat_, bD_, bGpu_;
+    std::deque<Bucket> history_;
+    int64_t bucketIndex_ = -1;
+    std::vector<float> bucketLat_, bucketDelay_, bucketGpu_;
 
-    SegAcc seg_;
+    std::vector<SettingItem> settings_;
+    uint64_t settingsSeq_ = 0;
+    bool settingsChanged_ = false;
 };
 
-// ------------------------------------------------------------------ view
 Model::Health Model::HealthOf() const {
-    const Theme& T = Th();
-    if (!haveStatus_) return {T.warn, "等待状态", 1};
-    const double age = lastQpc_ ? Qpc::ToSec(now_ - lastQpc_) : 1e9;
-    if (st_.warmupDone && age > 1.0) return {T.bad, "无画面", 2};
-    if (st_.gpuBudgetMs > 0 && ws_.gpuP50 > st_.gpuBudgetMs) return {T.bad, "GPU 超预算", 2};
-    if (!st_.warmupDone) return {T.warn, "预热中", 1};
-    if (st_.mode.find("prob") != std::string::npos) return {T.warn, "探测中", 1};
-    if (ws_.n > 100 && ws_.late * 100 > ws_.n) return {T.warn, "迟到偏多", 1};
-    return {T.good, "运行中", 0};
+    const Palette& colors = Colors();
+    if (!HaveStatus()) return {colors.warn, "等待状态"};
+    if (!status_.loading.empty()) return {colors.warn, "正在加载 " + status_.loading + "，暂停播放"};
+    const double sinceLastFrame = lastFrameQpc_ ? Qpc::ToSec(now_ - lastFrameQpc_) : kNoFramesSec + 1;
+    if (status_.warmupDone && sinceLastFrame > kNoFramesSec) return {colors.bad, "无画面"};
+    if (status_.gpuBudgetMs > 0 && windowStats_.gpuP50 > status_.gpuBudgetMs) return {colors.bad, "GPU 超预算"};
+    if (!status_.warmupDone) return {colors.warn, "预热中"};
+    if (status_.probing) return {colors.warn, "探测中"};
+    if (windowStats_.frames > kLateWarnMinFrames && (double)windowStats_.late > kLateWarnFraction * (double)windowStats_.frames) return {colors.warn, "迟到偏多"};
+    return {colors.good, "运行中"};
 }
 
-Color Model::LatColor(double v) const {
-    const Theme& T = Th();
-    if (v < 0) return T.muted;
-    const double p = ContentPeriodMs();
-    if (v <= p + 4) return T.good;
-    if (v <= 2 * p + 4) return T.warn;
-    return T.bad;
+Model::Headline Model::HeadlineLatency() const {
+    const WindowStats& w = windowStats_;
+    if (Known(w.contentLatencyP50)) return {w.contentLatencyP50, w.contentLatencyP99};
+    return {w.latencyP50, w.latencyP99};
 }
+
+double Model::CaptureMs() const { return std::max(status_.stages.captureMs, 0.0) + std::max(status_.stages.uploadMs, 0.0); }
+
+Color Model::HeadlineColor(double v) const { return Known(v) ? LatencyColor(v - CaptureMs()) : Colors().muted; }
+
+Spans Model::FgDescription() const {
+    const Palette& colors = Colors();
+    if (!status_.fg) return {Plain("未配置")};
+    Spans w{Plain(status_.fgQuality)};
+    if (status_.fgLoading) {
+        w.push_back(Colored("  加载中…", colors.warn));
+        return w;
+    }
+    w.push_back(Plain(std::format(" · ×{}", std::max(1, status_.fgMultiplier))));
+    const MultiplierLimit limit = status_.fgMultiplierLimit;
+    if (limit == MultiplierLimit::Threshold) w.push_back(Muted(std::format("（到门槛 {:.0f}）", status_.fgThresholdFps)));
+    else if (limit == MultiplierLimit::Refresh) w.push_back(Colored(std::format("（刷新率限制，要求 ×{}）", status_.fgMultiplierRequested), colors.warn));
+    else if (limit == MultiplierLimit::Gpu) w.push_back(Colored(std::format("（GPU 限制，要求 ×{}）", status_.fgMultiplierRequested), colors.warn));
+    else if (status_.fgThresholdFps > 0) w.push_back(Muted(std::format(" · 门槛 {:.0f}", status_.fgThresholdFps)));
+    if (status_.detectRepeats) w.push_back(Plain(" · 识别重复帧"));
+    return w;
+}
+
+Spans Model::SrDescription() const {
+    Spans w{Plain(status_.sr ? status_.srQuality : "未配置")};
+    if (status_.srLoading) w.push_back(Colored("  加载中…", Colors().warn));
+    return w;
+}
+
+Color Model::LatencyColor(double v) const {
+    const Palette& colors = Colors();
+    if (v < 0) return colors.muted;
+    const double period = ContentPeriodMs();
+    if (v <= period + kLatencyMarginMs) return colors.good;
+    if (v <= 2 * period + kLatencyMarginMs) return colors.warn;
+    return colors.bad;
+}
+
 Element Model::Header(int W) const {
-    const Theme& T = Th();
+    const Palette& colors = Colors();
     const Health h = HealthOf();
-    Spans brand{C(" ✻ ", T.accent), CB("camss", T.accent), S("  "), C("●", h.c), S(" " + h.label)};
-    const double out = ws_.fpsNow > 0 ? ws_.fpsNow : st_.outFps;
+    const Spans brand{Colored(" ✻ ", colors.accent), ColoredBold("CameraVFX", colors.accent), Plain("  "), Colored("●", h.c), Plain(" " + h.label)};
+    const double out = windowStats_.fpsLastSecond > 0 ? windowStats_.fpsLastSecond : status_.outFps;
+    const std::string content = status_.contentStatic ? "静止" : FormatNumber(status_.contentFps, 1);
+    Spans multiplierMark;
+    if (status_.fgActive && status_.fgMultiplier > 1) multiplierMark.push_back(Colored(std::format(" ×{}", status_.fgMultiplier), colors.accent));
     Spans rates;
-    if (st_.signalHz > 0) { rates.push_back(M("输入 ")); rates.push_back(S(Fmt("%.2f Hz", st_.signalHz))); rates.push_back(M(" → ")); }
-    rates.push_back(M("内容 ")); rates.push_back(S(st_.contentStatic ? "静止" : Num(st_.contentFps, 1) + " fps"));
-    rates.push_back(M(" → 输出 ")); rates.push_back(S(Num(out, 1) + " fps"));
-    const Settings s = SettingsOf(st_);
-    if (FgActive(s)) {
-        if (s.targetFps > 0) rates.push_back(C(Fmt(" →%.0f", s.targetFps), T.accent));
-        else if (s.multiplier > 1) rates.push_back(C(Fmt(" ×%d", s.multiplier), T.accent));
+    if (status_.signalHz > 0) rates += {Muted("输入 "), Plain(std::format("{:.2f} Hz", status_.signalHz)), Muted(" → ")};
+    rates += {Muted("内容 "), Plain(status_.contentStatic ? content : content + " fps"), Muted(" → 输出 "), Plain(FormatNumber(out, 1) + " fps")};
+    rates += multiplierMark;
+    Spans shortRates{Muted("内容 "), Plain(content), Muted(" → 输出 "), Plain(FormatNumber(out, 1) + " fps")};
+    shortRates += multiplierMark;
+    Spans resolution;
+    if (status_.sourceSize.height) {
+        resolution.push_back(Plain(FormatResolution(status_.sourceSize)));
+        if (status_.outputSize.height && status_.outputSize.height != status_.sourceSize.height) resolution += {Muted(" → "), Plain(FormatResolution(status_.outputSize))};
+        if (status_.hdr) resolution.push_back(Colored(" HDR", colors.accent));
     }
-    Spans res;
-    if (st_.srcH) {
-        res.push_back(S(Res(st_.srcW, st_.srcH)));
-        if (st_.outH && st_.outH != st_.srcH) { res.push_back(M(" → ")); res.push_back(S(Res(st_.outW, st_.outH))); }
-        if (!st_.hdr.empty() && st_.hdr != "none") res.push_back(C(" HDR", T.accent));
-    }
-    const Spans right{M("up "), S(Clock(st_.uptimeSec)), S(" ")};
+    const Spans right{Muted("up "), Plain(FormatClock(status_.uptimeSec)), Plain(" ")};
 
     auto join = [&](std::initializer_list<const Spans*> parts) {
         Spans r = brand;
-        for (const Spans* p : parts) if (!p->empty()) { r.push_back(M("   ")); r += *p; }
+        for (const Spans* p : parts) if (!p->empty()) { r.push_back(Muted("   ")); r += *p; }
         return r;
     };
-    Spans shortRates{M("内容 "), S(st_.contentStatic ? "静止" : Num(st_.contentFps, 1)), M(" → 输出 "), S(Num(out, 1) + " fps")};
-    if (rates.size() && rates.back().style & kColor) shortRates.push_back(rates.back());
-    std::vector<Spans> v{join({&rates, &res}), join({&rates}), join({&shortRates}), brand};
-    for (auto& x : v) if (Wid(x) + Wid(right) + 2 <= W) return LineLR(x, right, W);
+    for (const Spans& x : {join({&rates, &resolution}), join({&rates}), join({&shortRates}), brand})
+        if (DisplayWidth(x) + DisplayWidth(right) + 2 <= W) return LineLeftRight(x, right, W);
     return Line(brand, W);
 }
 
-// Latency panel. The big number is capture card -> screen (content latency, p50); the bar under it
-// shows what it is made of, the second bar the GPU time per output frame against its budget.
-// Counters appear only when something went wrong.
-namespace {
-struct BarSeg { std::string name; double v; Color c; };
-
-// One proportional bar (`scale` ms = bw columns) and, under it, each segment's name and value
-// starting at the segment (skipped when it would collide with the previous label).
-void SegBar(const std::vector<BarSeg>& segs, double scale, int bw, const Spans& lead, const Spans& tail, const Theme& T,
-            Elements& rows, int iw) {
-    Spans bar = lead, lab{S(std::string((size_t)Wid(lead), ' '))};
-    int col = 0, labEnd = 0;
-    double acc = 0;
-    for (const auto& g : segs) {
-        if (g.v <= 0) continue;
-        const int x0 = (int)std::lround(acc / scale * bw);
-        acc += g.v;
-        const int x1 = std::min(bw, (int)std::lround(acc / scale * bw));
-        if (x1 > x0) bar.push_back(C(Repeat("█", x1 - x0), g.c));
-        col = std::max(col, x1);
-        const std::string t = g.name + " " + NumA(g.v);
-        // under the segment; a short segment near the end gets its label right-aligned to the bar
-        int at = x0;
-        if (at + Wid(t) + 1 > bw + Wid(tail)) at = bw + Wid(tail) - Wid(t) - 1;
-        if (x1 > x0 && at >= labEnd) {
-            if (at > labEnd) lab.push_back(S(std::string((size_t)(at - labEnd), ' ')));
-            const int x0 = at;
-            lab.push_back(C(g.name + " ", T.muted));
-            lab.push_back(S(NumA(g.v)));
-            labEnd = x0 + Wid(t) + 1;
-            lab.push_back(S(" "));
-        }
-    }
-    if (col < bw) bar.push_back(C(Repeat("░", bw - col), T.line));
-    bar += tail;
-    rows.push_back(Line(bar, iw));
-    rows.push_back(Line(lab, iw));
-}
-} // namespace
-
 Elements Model::LatencyRows(int iw, bool compact) const {
-    const Theme& T = Th();
     Elements rows;
-    const double cap = (st_.captureMs > 0 ? st_.captureMs : 0) + (st_.uploadMs > 0 ? st_.uploadMs : 0);
-    const double total = ws_.contP50 >= 0 ? ws_.contP50 : ws_.latP50;
-    const double p99 = ws_.contP50 >= 0 ? ws_.contP99 : ws_.latP99;
-    const Color ct = total < 0 ? T.muted : LatColor(total - cap);
-    {   // big p50 + small p99
-        auto big = BigText(NumA(total));
-        for (int k = 0; k < 3; k++) {
-            Spans l{CB(big[k], ct)};
-            if (k == 2) l.push_back(M(" ms"));
-            Spans r;
-            if (k == 1 && p99 >= 0) { r.push_back(M("p99 ")); r.push_back(CB(NumA(p99), LatColor(p99 - cap))); }
-            rows.push_back(LineLR(l, r, iw));
-        }
-    }
-    if (!compact) rows.push_back(Line({}, iw));
-    if (total > 0) {   // composition: capture card | waiting for the next frame | GPU | margin
-        const double lead = std::max(0.0, st_.leadMs);
-        const double gpu = ws_.gpuP50 > 0 ? std::min((double)ws_.gpuP50, lead) : 0;
-        const double wait = std::max(0.0, total - cap - lead);
-        std::vector<BarSeg> segs{{"采集", cap, T.muted}, {"等待", wait, T.band}};
-        if (gpu > 0) { segs.push_back({"GPU", gpu, T.good}); segs.push_back({"余量", std::max(0.0, lead - gpu), T.line}); }
-        else segs.push_back({"渲染", lead, T.good});
-        double sum = 0;
-        for (auto& g : segs) sum += g.v;
-        SegBar(segs, std::max(sum, total), iw, {}, {}, T, rows, iw);
-    }
-    if (!compact) rows.push_back(Line({}, iw));
-    if (ws_.gpuP50 > 0) {   // GPU per output frame, split by stage, against the frame budget
-        const double g50 = ws_.gpuP50, budget = st_.gpuBudgetMs;
-        const bool over = budget > 0 && g50 > budget;
-        std::vector<BarSeg> segs;
-        double known = 0;
-        auto add = [&](const char* n, double v, Color c) { if (v > 0) { segs.push_back({n, v, c}); known += v; } };
-        add("补帧", st_.fgMs, T.accent);
-        add("超分", st_.srMs, T.good);
-        add("HDR", st_.hdrMs, T.warn);
-        if (g50 - known > 0.05) segs.push_back({"其他", g50 - known, T.muted});
-        Spans lead{M("GPU ")};
-        Spans tail{S(" "), over ? CB(NumA(g50), T.bad) : S(NumA(g50))};
-        if (budget > 0) { tail.push_back(M(" / ")); tail.push_back(S(NumA(budget))); }
-        tail.push_back(M(" ms"));
-        const int bw = std::max(4, iw - Wid(lead) - Wid(tail));
-        SegBar(segs, budget > 0 ? std::max(budget, g50) : g50, bw, lead, tail, T, rows, iw);
-    }
-    {   // only what went wrong
+    const auto [total, p99] = HeadlineLatency();
+    const Color totalColor = HeadlineColor(total);
+    const auto big = BigDigits(FormatAdaptive(total));
+    for (int k = 0; k < 3; k++) {
+        Spans l{ColoredBold(big[k], totalColor)};
+        if (k == 2) l.push_back(Muted(" ms"));
         Spans r;
-        auto add = [&](const char* n, uint64_t v) {
-            if (!v) return;
-            if (!r.empty()) r.push_back(M(" · "));
-            r.push_back(M(std::string(n) + " "));
-            r.push_back(C(std::to_string(v), T.warn));
-        };
-        add("迟到", st_.late); add("丢帧", st_.drops); add("错过", st_.missed);
-        if (!r.empty()) rows.push_back(Line(r, iw));
+        if (k == 1 && Known(p99)) r = {Muted("p99 "), ColoredBold(FormatAdaptive(p99), HeadlineColor(p99))};
+        rows.push_back(LineLeftRight(l, r, iw));
     }
+    if (!compact) rows.push_back(Line({}, iw));
+    if (total > 0) LatencyComposition(total, iw, rows);
+    if (!compact) rows.push_back(Line({}, iw));
+    if (windowStats_.gpuP50 > 0) GpuComposition(iw, rows);
+    ProblemRows(iw, rows);
     return rows;
 }
 
-// Settings panel. The switches come first, one per row in a fixed grid: key, name, state, what
-// is switched and, on the right, the key that tunes it. Below a rule: the read-only facts.
-// compact = no rule (short terminals).
+void Model::LatencyComposition(double total, int iw, Elements& rows) const {
+    const Palette& colors = Colors();
+    const double capture = CaptureMs();
+    const double lead = std::max(0.0, status_.leadMs);
+    const double gpu = windowStats_.gpuP50 > 0 ? std::min((double)windowStats_.gpuP50, lead) : 0;
+    const double wait = std::max(0.0, total - capture - lead);
+    std::vector<BarSegment> segments{{"采集", capture, colors.muted}, {"等待", wait, colors.band}};
+    if (gpu > 0) { segments.push_back({"GPU", gpu, colors.good}); segments.push_back({"余量", std::max(0.0, lead - gpu), colors.line}); }
+    else segments.push_back({"渲染", lead, colors.good});
+    double sum = 0;
+    for (const auto& g : segments) sum += g.v;
+    SegmentBar(segments, std::max(sum, total), iw, {}, {}, rows, iw);
+}
+
+void Model::GpuComposition(int iw, Elements& rows) const {
+    const Palette& colors = Colors();
+    const double gpu50 = windowStats_.gpuP50, budget = status_.gpuBudgetMs;
+    const bool over = budget > 0 && gpu50 > budget;
+    std::vector<BarSegment> segments;
+    double known = 0;
+    auto add = [&](const char* name, double v, Color c) { if (v > 0) { segments.push_back({name, v, c}); known += v; } };
+    add("补帧", status_.stages.fgMs, colors.accent);
+    add("超分", status_.stages.srMs, colors.good);
+    add("HDR", status_.stages.hdrMs, colors.warn);
+    if (gpu50 - known > 0.05) segments.push_back({"其他", gpu50 - known, colors.muted});
+    const Spans lead{Muted("GPU ")};
+    Spans tail{Plain(" "), over ? ColoredBold(FormatAdaptive(gpu50), colors.bad) : Plain(FormatAdaptive(gpu50))};
+    if (budget > 0) tail += {Muted(" / "), Plain(FormatAdaptive(budget))};
+    tail.push_back(Muted(" ms"));
+    const int barWidth = std::max(4, iw - DisplayWidth(lead) - DisplayWidth(tail));
+    SegmentBar(segments, budget > 0 ? std::max(budget, gpu50) : gpu50, barWidth, lead, tail, rows, iw);
+}
+
+void Model::ProblemRows(int iw, Elements& rows) const {
+    const Palette& colors = Colors();
+    Spans problems;
+    auto addProblem = [&](const char* name, uint64_t v) {
+        if (!v) return;
+        if (!problems.empty()) problems.push_back(Muted(" · "));
+        problems += {Muted(std::string(name) + " "), Colored(std::to_string(v), colors.warn)};
+    };
+    addProblem("迟到", status_.late);
+    addProblem("丢帧", status_.drops);
+    addProblem("错过", status_.missed);
+    if (!problems.empty()) rows.push_back(Line(problems, iw));
+    if (!status_.notice.empty()) rows.push_back(Line({Colored("! " + status_.notice, colors.warn)}, iw));
+}
+
+enum class SwitchState { Unavailable, Off, On };
+
 Elements Model::SettingsRows(int iw, bool compact) const {
-    const Theme& T = Th();
-    const Settings s = SettingsOf(st_);
+    const Palette& colors = Colors();
+    constexpr int kNameColumns = 8;
+    constexpr int kMinDescriptionColumns = 8;
     Elements rows;
-    enum { kNa = -1, kOff = 0, kOn = 1 };
-    auto toggle = [&](const char* key, const char* name, int state, Spans what, const char* key2 = nullptr,
-                      const char* what2 = nullptr) {
-        Spans l{CB(PadR(key, 3), T.accent), S(PadR(name, 7))};
-        if (state == kOn) l.push_back(C("● 开   ", T.good));
-        else if (state == kOff) l.push_back(M("○ 关   "));
-        else l.push_back(M("-      "));
-        const int fixed = Wid(l);
-        if (state != kOn) for (auto& sp : what) if (!(sp.style & kColor)) sp.style = kMuted;
+    auto switchRow = [&](const char* name, SwitchState state, Spans what, const char* key = nullptr, const char* keyAction = nullptr) {
+        Spans l{Plain(" "), Plain(PadRight(name, kNameColumns))};
+        if (state == SwitchState::On) l.push_back(Colored("● 开   ", colors.good));
+        else if (state == SwitchState::Off) l.push_back(Muted("○ 关   "));
+        else l.push_back(Muted("-      "));
+        const int fixedWidth = DisplayWidth(l);
+        if (state != SwitchState::On) for (auto& sp : what) if (!(sp.style & SpanStyle::kColored)) sp.style = SpanStyle::kMuted;
         l += what;
         Spans r;
-        if (key2) r = {CB(key2, T.accent), M(std::string(" ") + what2)};
-        // the tuning key stays visible; the description is shortened first
-        if (!r.empty() && fixed + 8 + 2 + Wid(r) <= iw) rows.push_back(LineLR(l, r, iw));
+        if (key) r = {ColoredBold(key, colors.accent), Muted(std::string(" ") + keyAction)};
+        if (!r.empty() && fixedWidth + kMinDescriptionColumns + 2 + DisplayWidth(r) <= iw) rows.push_back(LineLeftRight(l, r, iw));
         else rows.push_back(Line(l, iw));
     };
-    {
-        const bool avail = !s.interp.empty() && s.interp != "none";
-        Spans w;
-        if (!avail) w.push_back(S("未配置"));
-        else {
-            w.push_back(S(s.interp + Q(s.fgQuality)));
-            if (s.targetFps > 0) w.push_back(S(Fmt(" · 目标 %.0f fps", s.targetFps)));
-            else w.push_back(S(Fmt(" · ×%d", std::max(1, s.multiplier))));
-            if (s.adaptive) w.push_back(S(" · 自适应"));
-        }
-        toggle("i", "补帧", avail ? (s.interpOn ? kOn : kOff) : kNa, w, avail && !Q(s.fgQuality).empty() ? "f" : nullptr, "档位");
-    }
-    {
-        const bool avail = !s.sr.empty() && s.sr != "none";
-        toggle("s", "超分", avail ? (s.srOn ? kOn : kOff) : kNa, {S(avail ? s.sr + Q(s.srQuality) : "未配置")},
-               avail && !Q(s.srQuality).empty() ? "q" : nullptr, "档位");
-    }
-    if (!st_.audioEnabled) toggle("m", "声音", kNa, {S("未启用")});
-    else if (!st_.audioRunning) toggle("m", "声音", st_.audioMuted ? kOff : kOn, {C("设备未就绪", T.warn)}, "+/-", "音量");
-    else toggle("m", "声音", st_.audioMuted ? kOff : kOn, {S(Fmt("音量 %.0f%%", st_.audioVolume * 100))}, "+/-", "音量");
-    toggle("t", "时间码", st_.timecode ? kOn : kOff, {S("回环测延迟用")});
+    auto stateOf = [](bool available, bool on) { return !available ? SwitchState::Unavailable : on ? SwitchState::On : SwitchState::Off; };
+    switchRow("补帧", stateOf(status_.fg, status_.fgOn), FgDescription());
+    switchRow("超分", stateOf(status_.sr, status_.srOn), SrDescription());
+    const SwitchState audio = stateOf(status_.audioEnabled, !status_.audioMuted);
+    if (!status_.audioEnabled) switchRow("声音", audio, {Plain("未启用")});
+    else if (!status_.audioRunning) switchRow("声音", audio, {Colored("设备未就绪", colors.warn)}, "m", "静音");
+    else switchRow("声音", audio, {Plain(std::format("音量 {:.0f}%", status_.audioVolume * 100))}, "m", "静音");
+    switchRow("时间码", stateOf(true, status_.timecode), {Plain("回环测延迟用")});
 
-    if (!compact) rows.push_back(Line({C(Repeat("─", iw), T.line)}, iw));
-    auto info = [&](const char* label, Spans v) {
-        Spans l{S("   "), M(PadR(label, 7))};
+    if (!compact) rows.push_back(Line({Colored(Repeat("─", iw), colors.line)}, iw));
+    InfoRows(iw, rows);
+    return rows;
+}
+
+void Model::InfoRows(int iw, Elements& rows) const {
+    const Palette& colors = Colors();
+    constexpr int kNameColumns = 8;
+    auto info = [&](const char* label, const Spans& v) {
+        Spans l{Plain(" "), Muted(PadRight(label, kNameColumns))};
         l += v;
         rows.push_back(Line(l, iw));
     };
     {
-        Spans v{S(st_.mode.empty() ? "-" : st_.mode)};
-        if (st_.vrrActive) { v.push_back(M(" · ")); v.push_back(C("VRR 生效", T.good)); }
-        if (st_.dispW) { v.push_back(M(" · ")); v.push_back(S(Fmt("%ux%u @ %.0f Hz", st_.dispW, st_.dispH, st_.dispHz))); }
-        if (!st_.hdr.empty() && st_.hdr != "none") { v.push_back(M(" · HDR ")); v.push_back(S(st_.hdr)); }
+        Spans v{Plain(status_.mode.empty() ? "-" : status_.mode)};
+        if (status_.vrrActive) v += {Muted(" · "), Colored("VRR 生效", colors.good)};
+        if (status_.displaySize.width) v += {Muted(" · "), Plain(std::format("{}x{} @ {:.0f} Hz", status_.displaySize.width, status_.displaySize.height, status_.displayHz))};
+        if (status_.hdr) v += {Muted(" · "), Plain("HDR")};
         info("输出", v);
     }
     {
-        Spans v{S(st_.captureName.empty() ? "-" : st_.captureName)};
-        if (!st_.captureFormat.empty()) { v.push_back(M(" · ")); v.push_back(S(st_.captureFormat)); }
+        Spans v{Plain(status_.captureName.empty() ? "-" : status_.captureName)};
+        if (!status_.captureFormat.empty()) v += {Muted(" · "), Plain(status_.captureFormat)};
         info("采集", v);
     }
-    if (st_.audioEnabled) {
-        Spans v{S(st_.audioIn.empty() ? "-" : st_.audioIn), M(" → "), S(st_.audioOut.empty() ? "-" : st_.audioOut)};
-        v.push_back(M(" · 延迟 ")); v.push_back(S(Num(st_.audioLatencyMs, 0))); v.push_back(M(" ms"));
-        v.push_back(M(" · 同步 ")); v.push_back(S(Fmt("%+.0f", st_.audioSyncMs)));
-        if (st_.audioUnderruns) { v.push_back(M(" · 欠载 ")); v.push_back(C(std::to_string(st_.audioUnderruns), T.warn)); }
+    if (status_.audioEnabled) {
+        Spans v{Plain(status_.audioIn.empty() ? "-" : status_.audioIn), Muted(" → "), Plain(status_.audioOut.empty() ? "-" : status_.audioOut)};
+        v += {Muted(" · 延迟 "), Plain(FormatNumber(status_.audioLatencyMs, 0)), Muted(" ms")};
+        v += {Muted(" · 同步 "), Plain(std::format("{:+.0f}", status_.audioSyncMs))};
+        if (status_.audioUnderruns) v += {Muted(" · 欠载 "), Colored(std::to_string(status_.audioUnderruns), colors.warn)};
         info("音频", v);
     }
-    info("配置", {S(st_.configPath.empty() ? "-" : st_.configPath)});
-    return rows;
+    info("配置", {Plain(status_.configPath.empty() ? "-" : status_.configPath)});
 }
 
 Element Model::HistoryPanel(int w, int h) const {
-    const Theme& T = Th();
-    const int iw = w - 4, ih = h - 2;
-    std::vector<float> p50, p99, gpu, d;
-    for (const auto& b : hist_) { p50.push_back(b.p50); p99.push_back(b.p99); gpu.push_back(b.gpu); d.push_back(b.d); }
-    auto range = [](const std::vector<float>& a, const std::vector<float>& b, float& mn, float& mx) {
-        mn = 1e9f; mx = -1;
-        for (float v : a) if (v >= 0) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        for (float v : b) if (v >= 0) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        return mx >= 0;
+    const Palette& colors = Colors();
+    constexpr int kGutter = 6;
+    const int iw = w - kPanelBorderColumns, ih = h - kPanelBorderRows;
+    std::vector<float> p50, p99, gpu, delay;
+    for (const auto& b : history_) { p50.push_back(b.p50); p99.push_back(b.p99); gpu.push_back(b.gpu); delay.push_back(b.delay); }
+    auto range = [](std::initializer_list<const std::vector<float>*> series, float& mn, float& mx) {
+        mn = 1e9f; mx = kUnknownMs;
+        for (const auto* s : series) for (float v : *s) if (Known(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        return Known(mx);
     };
     const bool haveGpu = std::any_of(gpu.begin(), gpu.end(), [](float v) { return v > 0; });
-    const int gutter = 6;
-    const int gw = std::max(1, iw - gutter);
-    // rows: [title, graph x gh] x 2 + axis
-    const bool two = ih >= 5;
-    const int axis = ih >= 7 ? 1 : 0;
-    const int ghAll = std::max(1, two ? ih - 2 - axis : ih - 1 - axis);
-    const int gh1 = two ? std::max(1, (ghAll + 1) / 2) : ghAll, gh2 = std::max(1, ghAll - gh1);   // latency gets the odd row
+    const int graphWidth = std::max(1, iw - kGutter);
+    const bool twoGraphs = ih >= 5;
+    const int axisRows = ih >= 7 ? 1 : 0;
+    const int graphRows = std::max(1, (twoGraphs ? ih - 2 : ih - 1) - axisRows);
+    const int latencyRows = twoGraphs ? std::max(1, (graphRows + 1) / 2) : graphRows, secondRows = std::max(1, graphRows - latencyRows);
     Elements rows;
     auto graph = [&](GraphData g, const std::string& top, const std::string& bottom, int rowsN) {
-        Elements lab;
+        Elements labels;
         for (int i = 0; i < rowsN; i++) {
-            std::string t = i == 0 ? top : (i == rowsN - 1 ? bottom : "");
-            lab.push_back(ftxui::text(PadL(t, gutter - 1) + " ") | ftxui::color(T.muted));
+            const std::string t = i == 0 ? top : (i == rowsN - 1 ? bottom : "");
+            labels.push_back(ftxui::text(PadLeft(t, kGutter - 1) + " ") | ftxui::color(colors.muted));
         }
-        Element ge = std::make_shared<BarGraph>(std::move(g), fineBlocks_) | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, gw) |
+        Element ge = std::make_shared<BarGraph>(std::move(g), eighthBlocks_) | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, graphWidth) |
                      ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, rowsN);
-        return ftxui::hbox({ftxui::vbox(std::move(lab)), ge});
+        return ftxui::hbox({ftxui::vbox(std::move(labels)), ge});
     };
-    {   // latency p50 + p99 band
+    auto minMax = [](float mn, float mx) { return Spans{Muted("min "), Plain(FormatAdaptive(mn)), Muted("  max "), Plain(FormatAdaptive(mx))}; };
+    {
         float mn, mx;
-        const bool ok = range(p50, p99, mn, mx);
+        const bool ok = range({&p50, &p99}, mn, mx);
         float lo = 0, hi = 1;
         if (ok) { const float pad = std::max(0.5f, (mx - mn) * 0.15f); lo = std::max(0.f, mn - pad); hi = mx + pad * 0.3f; }
-        Spans t{B("延迟"), M(" ms  "), C("█", T.accent), M(" p50  "), C("█", T.band), M(" p99")};
-        Spans rt;
-        if (ok) rt = {M("min "), S(NumA(mn)), M("  max "), S(NumA(mx))};
-        rows.push_back(LineLR(t, rt, iw));
-        GraphData g{p50, p99, lo, hi, T.accent, T.band, T.bad, -1, -1};
-        rows.push_back(graph(std::move(g), ok ? NumA(hi) : "", ok ? (lo > 0 ? NumA(lo) : "0") : "", gh1));
+        rows.push_back(LineLeftRight({Bold("延迟"), Muted(" ms  "), Colored("█", colors.accent), Muted(" p50  "), Colored("█", colors.band), Muted(" p99")},
+                                     ok ? minMax(mn, mx) : Spans{}, iw));
+        GraphData g{p50, p99, lo, hi, colors.accent, colors.band, colors.bad};
+        rows.push_back(graph(std::move(g), ok ? FormatAdaptive(hi) : "", ok ? (lo > 0 ? FormatAdaptive(lo) : "0") : "", latencyRows));
     }
-    if (two) {
-        if (haveGpu) {
-            float mn, mx;
-            range(gpu, {}, mn, mx);
-            const float budget = (float)st_.gpuBudgetMs;
-            const float hi = std::max(budget > 0 ? budget * 1.15f : 0.f, mx * 1.1f);
-            Spans t{B("GPU"), M(" ms  "), C("█", T.good), M(" p50")};
-            if (budget > 0) { t.push_back(M("  ┄ 预算 ")); t.push_back(S(NumA(budget))); }
-            Spans rt{M("min "), S(NumA(mn)), M("  max "), S(NumA(mx))};
-            rows.push_back(LineLR(t, rt, iw));
-            GraphData g{gpu, {}, 0, hi, T.good, T.band, T.bad, budget > 0 ? budget : -1, budget > 0 ? budget : -1};
-            rows.push_back(graph(std::move(g), NumA(hi), "0", gh2));
-        } else {
-            float mn, mx;
-            const bool ok = range(d, {}, mn, mx);
-            const float hi = ok ? mx * 1.15f + 0.1f : 1;
-            Spans t{B("D"), M(" ms")};
-            Spans rt;
-            if (ok) rt = {M("min "), S(NumA(mn)), M("  max "), S(NumA(mx))};
-            rows.push_back(LineLR(t, rt, iw));
-            GraphData g{d, {}, 0, hi, T.good, T.band, T.bad, -1, -1};
-            rows.push_back(graph(std::move(g), ok ? NumA(hi) : "", "0", gh2));
-        }
+    if (twoGraphs && haveGpu) {
+        float mn, mx;
+        range({&gpu}, mn, mx);
+        const float budget = (float)status_.gpuBudgetMs;
+        const float hi = std::max(budget > 0 ? budget * 1.15f : 0.f, mx * 1.1f);
+        Spans t{Bold("GPU"), Muted(" ms  "), Colored("█", colors.good), Muted(" p50")};
+        if (budget > 0) t += {Muted("  ┄ 预算 "), Plain(FormatAdaptive(budget))};
+        rows.push_back(LineLeftRight(t, minMax(mn, mx), iw));
+        const float budgetLine = budget > 0 ? budget : kUnknownMs;
+        GraphData g{gpu, {}, 0, hi, colors.good, colors.band, colors.bad, budgetLine, budgetLine};
+        rows.push_back(graph(std::move(g), FormatAdaptive(hi), "0", secondRows));
+    } else if (twoGraphs) {
+        float mn, mx;
+        const bool ok = range({&delay}, mn, mx);
+        const float hi = ok ? mx * 1.15f + 0.1f : 1;
+        rows.push_back(LineLeftRight({Bold("D"), Muted(" ms")}, ok ? minMax(mn, mx) : Spans{}, iw));
+        GraphData g{delay, {}, 0, hi, colors.good, colors.band, colors.bad};
+        rows.push_back(graph(std::move(g), ok ? FormatAdaptive(hi) : "", "0", secondRows));
     }
-    if (axis) {
-        std::string ax(gutter, ' ');
-        const int seconds = (int)std::lround(kHistBuckets * kBucketSec);   // the graphs always span the full history
-        std::string l = "-" + std::to_string(seconds) + "s", mid = "-" + std::to_string(seconds / 2) + "s", r = "现在";
-        std::string line = l;
-        const int midPos = gw / 2 - Wid(mid) / 2;
-        line += std::string((size_t)std::max(1, midPos - Wid(line)), ' ') + mid;
-        line += std::string((size_t)std::max(1, gw - Wid(line) - Wid(r)), ' ') + r;
-        rows.push_back(Line({M(ax + line)}, iw));
-    }
-    return Panel({B("历史")}, Rows(std::move(rows), ih), w, h);
+    if (axisRows) rows.push_back(TimeAxis(kGutter, graphWidth, iw));
+    return Panel({Bold("历史")}, ClipRows(std::move(rows), ih), w, h);
+}
+
+Element Model::TimeAxis(int gutter, int graphWidth, int iw) const {
+    const int seconds = (int)std::lround(kHistoryBuckets * kBucketSec);
+    const std::string mid = "-" + std::to_string(seconds / 2) + "s", now = "现在";
+    std::string line = "-" + std::to_string(seconds) + "s";
+    const int midPos = graphWidth / 2 - DisplayWidth(mid) / 2;
+    line += std::string((size_t)std::max(1, midPos - DisplayWidth(line)), ' ') + mid;
+    line += std::string((size_t)std::max(1, graphWidth - DisplayWidth(line) - DisplayWidth(now)), ' ') + now;
+    return Line({Muted(std::string(gutter, ' ') + line)}, iw);
 }
 
 Element Model::LogPanel(int w, int h, const std::vector<LogLine>& logs) const {
-    const Theme& T = Th();
-    const int iw = w - 4, ih = h - 2;
+    const Palette& colors = Colors();
+    const int iw = w - kPanelBorderColumns, ih = h - kPanelBorderRows;
     Elements rows;
-    const int first = std::max(0, (int)logs.size() - ih);
-    for (int i = first; i < (int)logs.size(); i++) {
+    for (int i = std::max(0, (int)logs.size() - ih); i < (int)logs.size(); i++) {
         const LogLine& l = logs[i];
-        Spans r{M(PadL(Clock(l.t), 5) + Fmt(".%d ", (int)(std::fmod(std::max(0.0, l.t), 1.0) * 10)))};
-        if (l.lvl == LogLevel::Error) r.push_back(C(l.text, T.bad));
-        else if (l.lvl == LogLevel::Warn) r.push_back(C(l.text, T.warn));
-        else if (l.lvl == LogLevel::Debug) r.push_back(M(l.text));
-        else r.push_back(S(l.text));
+        const int tenths = (int)(std::fmod(std::max(0.0, l.t), 1.0) * 10);
+        Spans r{Muted(PadLeft(FormatClock(l.t), 5) + std::format(".{} ", tenths))};
+        if (l.lvl == LogLevel::Error) r.push_back(Colored(l.text, colors.bad));
+        else if (l.lvl == LogLevel::Warn) r.push_back(Colored(l.text, colors.warn));
+        else if (l.lvl == LogLevel::Debug) r.push_back(Muted(l.text));
+        else r.push_back(Plain(l.text));
         rows.push_back(Line(r, iw));
     }
-    return Panel({B("日志")}, Rows(std::move(rows), ih), w, h);
+    return Panel({Bold("日志")}, ClipRows(std::move(rows), ih), w, h);
 }
 
 Element Model::Footer(int W, bool quitting) const {
-    const Theme& T = Th();
-    static const char* const kHints[][2] = {{"esc", "退出"}, {"l", "打印统计"}, {"r", "重置统计"}, {"?", "全部按键"}};
-    Spans r{S(" ")};
-    if (quitting) { r.push_back(C("正在退出…", T.accent)); return Line(r, W); }
+    const Palette& colors = Colors();
+    static const char* const kHints[][2] = {{"s", "设置"}, {"m", "静音"}, {"esc", "退出"}};
+    Spans r{Plain(" ")};
+    if (quitting) { r.push_back(Colored("正在退出…", colors.accent)); return Line(r, W); }
     for (size_t i = 0; i < std::size(kHints); i++) {
         Spans item;
-        if (i) item.push_back(M(" · "));
-        item.push_back(CB(kHints[i][0], T.accent));
-        item.push_back(M(std::string(" ") + kHints[i][1]));
-        if (Wid(r) + Wid(item) > W) break;
+        if (i) item.push_back(Muted(" · "));
+        item += {ColoredBold(kHints[i][0], colors.accent), Muted(std::string(" ") + kHints[i][1])};
+        if (DisplayWidth(r) + DisplayWidth(item) > W) break;
         r += item;
     }
     return Line(r, W);
@@ -1082,113 +829,165 @@ Element Model::Footer(int W, bool quitting) const {
 
 Element Model::Compact(int W, int h) const {
     Elements rows;
-    const Color c50 = LatColor(ws_.latP50);
-    const bool cont = ws_.contP50 >= 0;
-    rows.push_back(Line({S(" "), M("延迟 "), CB(NumA(cont ? ws_.contP50 : ws_.latP50), c50), M("  p99 "),
-                         S(NumA(cont ? ws_.contP99 : ws_.latP99)), M(" ms")}, W));
-    rows.push_back(Line({S(" "), M("GPU "), S(NumA(ws_.gpuP50)), M(" / "), S(NumA(st_.gpuBudgetMs)), M(" ms")}, W));
-    rows.push_back(Line({S(" "), M("补帧 "), S(FgText(SettingsOf(st_))), M("  超分 "), S(SrText(SettingsOf(st_)))}, W));
-    rows.push_back(Line({S(" "), M("迟到 "), S(std::to_string(ws_.late)), M("  保持 "), S(std::to_string(ws_.hold)), M("  "), S(Num(ws_.fps, 1)), M(" fps")}, W));
+    const auto [total, p99] = HeadlineLatency();
+    rows.push_back(Line({Plain(" "), Muted("延迟 "), ColoredBold(FormatAdaptive(total), HeadlineColor(total)), Muted("  p99 "), Plain(FormatAdaptive(p99)),
+                         Muted(" ms")}, W));
+    rows.push_back(Line({Plain(" "), Muted("GPU "), Plain(FormatAdaptive(windowStats_.gpuP50)), Muted(" / "), Plain(FormatAdaptive(status_.gpuBudgetMs)), Muted(" ms")}, W));
+    auto summary = [](bool available, bool on, Spans description) { return !available ? Spans{Plain("-")} : !on ? Spans{Plain("关")} : description; };
+    Spans fg{Plain(" "), Muted("补帧 ")}, sr{Plain(" "), Muted("超分 ")};
+    fg += summary(status_.fg, status_.fgOn, FgDescription());
+    sr += summary(status_.sr, status_.srOn, SrDescription());
+    rows.push_back(Line(fg, W));
+    rows.push_back(Line(sr, W));
+    rows.push_back(Line({Plain(" "), Muted("迟到 "), Plain(std::to_string(windowStats_.late)), Muted("  保持 "), Plain(std::to_string(windowStats_.hold)), Muted("  "),
+                         Plain(FormatNumber(windowStats_.fps, 1)), Muted(" fps")}, W));
     while ((int)rows.size() < h) rows.push_back(Line({}, W));
-    return Rows(std::move(rows), h);
+    return ClipRows(std::move(rows), h);
 }
 
-Element Model::Help(int W, int H) const {
-    const Theme& T = Th();
-    struct Group { const char* name; std::vector<std::array<const char*, 2>> keys; };
-    static const Group kGroups[] = {
-        {"开关", {{"i", "补帧"}, {"s", "超分"}, {"m", "静音"}, {"t", "时间码"}}},
-        {"调节", {{"f", "补帧档位 low / medium / high"}, {"q", "超分档位"}, {"+ / -", "音量"}}},
-        {"其他", {{"l", "打印详细统计到日志"}, {"r", "重置统计"}, {"? / h", "关闭本帮助"}, {"esc", "退出"}}},
-    };
-    const int w = std::min(W, 46);
-    Elements rows;
-    for (const auto& g : kGroups) {
-        if (!rows.empty()) rows.push_back(Line({}, w - 4));
-        for (size_t i = 0; i < g.keys.size(); i++)
-            rows.push_back(Line({M(PadR(i ? "" : g.name, 6)), CB(PadR(g.keys[i][0], 7), T.accent), S(g.keys[i][1])}, w - 4));
+Element Model::SettingsPopup(int W, int H, const Popup& popup) const {
+    const Palette& colors = Colors();
+    constexpr int kMaxWidth = 84, kGroupColumns = 6, kLabelColumns = 12, kChromeRows = 4, kMinHeight = 5;
+    const int w = std::min(W, kMaxWidth), iw = w - kPanelBorderColumns;
+    Elements body;
+    int cursorRow = 0;
+    int groups = 0;
+    for (int i = 0; i < (int)settings_.size(); i++) groups += i == 0 || settings_[i - 1].group != settings_[i].group;
+    const bool gapsBetweenGroups = (int)settings_.size() + groups - 1 + kChromeRows <= H - kPanelBorderRows;
+    for (int i = 0; i < (int)settings_.size(); i++) {
+        const SettingItem& it = settings_[i];
+        const bool firstOfGroup = i == 0 || settings_[i - 1].group != it.group;
+        if (firstOfGroup && i && gapsBetweenGroups) body.push_back(Line({}, iw));
+        const bool selected = i == popup.cursor, disabled = !it.enabled;
+        const int v = popup.Value(it);
+        Spans l{firstOfGroup ? ColoredBold(PadRight(it.group, kGroupColumns), colors.accent) : Plain(std::string(kGroupColumns, ' ')),
+                selected ? ColoredBold("› ", colors.accent) : Plain("  ")};
+        const std::string label = PadRight(it.label, kLabelColumns);
+        l.push_back(disabled ? Muted(label) : selected ? Bold(label) : Plain(label));
+        std::string note = it.note;
+        if (it.kind == SettingItem::Kind::Toggle) {
+            l.push_back(disabled ? Muted(v ? "● 开" : "○ 关") : v ? Colored("● 开", colors.good) : Muted("○ 关"));
+        } else if (it.kind == SettingItem::Kind::Choice && !it.choices.empty()) {
+            const int k = std::clamp(v, 0, (int)it.choices.size() - 1);
+            const std::string& c = it.choices[k];
+            l.push_back(Muted(k > 0 && !disabled ? "‹ " : "  "));
+            if (disabled) l.push_back(Muted(c));
+            else if (popup.Waiting(it)) l.push_back(ColoredBold(c, colors.warn));
+            else l.push_back(selected ? Bold(c) : Plain(c));
+            l.push_back(Muted(k + 1 < (int)it.choices.size() && !disabled ? " ›" : "  "));
+            if (k < (int)it.choiceNotes.size() && !it.choiceNotes[k].empty()) note = it.choiceNotes[k];
+        } else if (it.kind == SettingItem::Kind::Action) {
+            l.push_back(selected ? Colored("⏎ 执行", colors.accent) : Muted("⏎"));
+        }
+        if (selected) cursorRow = (int)body.size();
+        body.push_back(note.empty() ? Line(l, iw) : LineLeftRight(l, {Muted(note)}, iw));
     }
-    const int h = std::min(H, (int)rows.size() + 2);
-    return Panel({B("按键")}, Rows(std::move(rows), h - 2), w, h) | ftxui::clear_under;
+    if (settings_.empty()) body.push_back(Line({Muted("  等待程序发布可调项…")}, iw));
+    Spans hint;
+    auto key = [&](const char* k, const char* what) {
+        if (!hint.empty()) hint.push_back(Muted(" · "));
+        hint += {ColoredBold(k, colors.accent), Muted(std::string(" ") + what)};
+    };
+    key("j/k", "移动"); key("h/l", "改值"); key("空格", "开关"); key("⏎", "执行"); key("s/esc", "关闭");
+    const Spans shortHint{ColoredBold("j/k", colors.accent), Muted(" "), ColoredBold("h/l", colors.accent), Muted(" "),
+                          ColoredBold("空格", colors.accent), Muted(" "), ColoredBold("s", colors.accent)};
+    const int h = std::max(kMinHeight, std::min(H - kPanelBorderRows, (int)body.size() + kChromeRows));
+    const int visibleRows = h - kChromeRows;
+    const int total = (int)body.size();
+    const int first = total > visibleRows ? std::clamp(cursorRow - visibleRows / 2, 0, total - visibleRows) : 0;
+    Elements rows(std::make_move_iterator(body.begin() + first), std::make_move_iterator(body.begin() + std::min(total, first + visibleRows)));
+    while ((int)rows.size() < visibleRows) rows.push_back(Line({}, iw));
+    rows.push_back(Line({Colored(Repeat("─", iw), colors.line)}, iw));
+    rows.push_back(FirstFitting({hint, shortHint}, iw));
+    Spans title{Bold("设置")};
+    if (total > visibleRows) title.push_back(Muted(std::format(" · {}/{}", std::min(total, first + visibleRows), total)));
+    return Panel(title, ftxui::vbox(std::move(rows)), w, h) | ftxui::clear_under;
 }
 
-Element Model::Build(int W, int H, const std::vector<LogLine>& logs, bool help, bool quitting) const {
-    W = std::max(W, 1); H = std::max(H, 1);
-    const Theme& T = Th();
+Element Model::Build(int W, int H, const std::vector<LogLine>& logs, const Popup& popup, bool quitting) const {
+    constexpr int kHeaderRows = 1, kFooterRows = 1;
+    constexpr int kMinFullWidth = 44, kMinFullHeight = 9, kRoomyHeight = 30;
+    W = std::max(W, 1);
+    H = std::max(H, 1);
     Elements rows;
     rows.push_back(Header(W));
-    int avail = H - 1 - 1;
-    if (avail < 0) avail = 0;
-    // Height budget, by priority: header, footer (always), latency, settings, history, record, log.
-    if (W < 44 || avail < 9) {
+    const int avail = std::max(0, H - kHeaderRows - kFooterRows);
+    if (W < kMinFullWidth || avail < kMinFullHeight) {
         rows.push_back(Compact(W, avail));
     } else {
-        int used = 0;
-        const bool side = W >= 76, wide = W >= 100;
-        const bool compact = H < 30;           // denser top panels on short terminals
-        if (side) {
-            const int lw = W / 2, rw = W - lw;
-            Elements lat = LatencyRows(lw - 4, compact), set = SettingsRows(rw - 4, compact);
-            const int topH = std::min(avail, 2 + (int)std::max(lat.size(), set.size()));
-            rows.push_back(ftxui::hbox({
-                Panel({B("延迟")}, Rows(std::move(lat), topH - 2), lw, topH),
-                Panel({B("设置")}, Rows(std::move(set), topH - 2), rw, topH),
-            }));
-            used += topH;
-        } else {
-            Elements lat = LatencyRows(W - 4, compact);
-            const int latH = std::min(avail, 2 + (int)lat.size());
-            rows.push_back(Panel({B("延迟")}, Rows(std::move(lat), latH - 2), W, latH));
-            used += latH;
-            Elements set = SettingsRows(W - 4, false);
-            if (avail - used < 2 + (int)set.size()) set = SettingsRows(W - 4, true);
-            const int setH = 2 + (int)set.size();
-            if (avail - used >= setH) {
-                rows.push_back(Panel({B("设置")}, Rows(std::move(set), setH - 2), W, setH));
-                used += setH;
-            }
-        }
-        int rem = avail - used;
-        // history graphs (with the log beside them when wide), else history then log stacked
-        const int histMin = 7, histMax = 2 + 2 + 2 * 8 + 1, logMin = 4;
-        int histH = 0, logH = 0;
-        if (rem >= histMin) {
-            if (wide) { histH = rem; rem = 0; }
-            else {
-                histH = std::min(rem, histMax);
-                rem -= histH;
-                if (rem >= logMin) { logH = rem; rem = 0; }
-                else { histH += rem; rem = 0; }
-            }
-        }
-        if (histH) {
-            if (wide) {
-                const int hw = (W * 3) / 5, lw = W - hw;
-                rows.push_back(ftxui::hbox({HistoryPanel(hw, histH), LogPanel(lw, histH, logs)}));
-            } else {
-                rows.push_back(HistoryPanel(W, histH));
-            }
-        }
-        if (logH) rows.push_back(LogPanel(W, logH, logs));
-        const int left = avail - used - histH - logH;
-        if (left > 0) rows.push_back(Blank(W, left));
+        const int used = TopPanels(W, avail, H < kRoomyHeight, rows);
+        BottomPanels(W, avail - used, logs, rows);
     }
     rows.push_back(Footer(W, quitting));
     Element root = ftxui::vbox(std::move(rows));
-    if (help) root = ftxui::dbox({root, Help(W, H) | ftxui::center});
+    if (popup.open) root = ftxui::dbox({root, SettingsPopup(W, H, popup) | ftxui::center});
     return root | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, W) | ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, H);
+}
+
+int Model::TopPanels(int W, int avail, bool compact, Elements& rows) const {
+    constexpr int kSideBySideWidth = 76;
+    const Palette& colors = Colors();
+    const Spans settingsTitle{Bold("设置"), Muted(" · "), ColoredBold("s", colors.accent), Muted(" 调整")};
+    int used = 0;
+    if (W >= kSideBySideWidth) {
+        const int lw = W / 2, rw = W - lw;
+        Elements lat = LatencyRows(lw - kPanelBorderColumns, compact), set = SettingsRows(rw - kPanelBorderColumns, compact);
+        const int topH = std::min(avail, kPanelBorderRows + (int)std::max(lat.size(), set.size()));
+        rows.push_back(ftxui::hbox({
+            Panel({Bold("延迟")}, ClipRows(std::move(lat), topH - kPanelBorderRows), lw, topH),
+            Panel(settingsTitle, ClipRows(std::move(set), topH - kPanelBorderRows), rw, topH),
+        }));
+        used += topH;
+    } else {
+        Elements lat = LatencyRows(W - kPanelBorderColumns, compact);
+        const int latH = std::min(avail, kPanelBorderRows + (int)lat.size());
+        rows.push_back(Panel({Bold("延迟")}, ClipRows(std::move(lat), latH - kPanelBorderRows), W, latH));
+        used += latH;
+        Elements set = SettingsRows(W - kPanelBorderColumns, false);
+        if (avail - used < kPanelBorderRows + (int)set.size()) set = SettingsRows(W - kPanelBorderColumns, true);
+        const int setH = kPanelBorderRows + (int)set.size();
+        if (avail - used >= setH) {
+            rows.push_back(Panel(settingsTitle, ClipRows(std::move(set), setH - kPanelBorderRows), W, setH));
+            used += setH;
+        }
+    }
+    return used;
+}
+
+void Model::BottomPanels(int W, int rem, const std::vector<LogLine>& logs, Elements& rows) const {
+    constexpr int kWideWidth = 100;
+    constexpr int kHistoryMinRows = 7, kHistoryMaxRows = kPanelBorderRows + 2 * (1 + 8) + 1, kLogMinRows = 4;
+    const bool wide = W >= kWideWidth;
+    int histH = 0, logH = 0;
+    if (rem >= kHistoryMinRows) {
+        if (wide) histH = rem;
+        else {
+            histH = std::min(rem, kHistoryMaxRows);
+            if (rem - histH >= kLogMinRows) logH = rem - histH;
+            else histH = rem;
+        }
+    }
+    if (histH && wide) {
+        const int hw = (W * 3) / 5;
+        rows.push_back(ftxui::hbox({HistoryPanel(hw, histH), LogPanel(W - hw, histH, logs)}));
+    } else if (histH) {
+        rows.push_back(HistoryPanel(W, histH));
+    }
+    if (logH) rows.push_back(LogPanel(W, logH, logs));
+    const int left = rem - histH - logH;
+    if (left > 0) rows.push_back(Blank(W, left));
 }
 
 std::string PlainText(const ftxui::Screen& s) {
     std::string out;
     for (int y = 0; y < s.dimy(); y++) {
         std::string line;
-        bool skip = false;
+        bool coveredByWideGlyph = false;
         for (int x = 0; x < s.dimx(); x++) {
             const auto& px = s.PixelAt(x, y);
-            if (skip) { skip = false; continue; }
+            if (coveredByWideGlyph) { coveredByWideGlyph = false; continue; }
             line += px.character.empty() ? std::string(" ") : px.character;
-            skip = Wid(px.character) == 2;
+            coveredByWideGlyph = DisplayWidth(px.character) == 2;
         }
         while (!line.empty() && line.back() == ' ') line.pop_back();
         out += line + "\n";
@@ -1196,354 +995,267 @@ std::string PlainText(const ftxui::Screen& s) {
     return out;
 }
 
-} // namespace
+constexpr unsigned kFullWidthFirst = 0xFF01, kFullWidthLast = 0xFF5E, kFullWidthToAscii = 0xFEE0;
 
-// ------------------------------------------------------------------ shared state / UI thread
-struct DashShared {
+char TypedAscii(const ftxui::Event& e) {
+    if (!e.is_character()) return 0;
+    const std::string& c = e.character();
+    if (c.size() == 1) return (unsigned char)c[0] < 0x80 ? c[0] : 0;
+    if (c.size() == 3) {
+        const unsigned cp = (((unsigned char)c[0] & 0x0F) << 12) | (((unsigned char)c[1] & 0x3F) << 6) | ((unsigned char)c[2] & 0x3F);
+        if (cp >= kFullWidthFirst && cp <= kFullWidthLast) return (char)(cp - kFullWidthToAscii);
+    }
+    return 0;
+}
+
+}
+
+struct DashboardState {
     Telemetry* tel = nullptr;
-    DashboardOptions opt;
     Model model;
 
-    mutable std::mutex logM;
+    std::mutex logM;
     std::deque<LogLine> logs;
 
-    std::atomic<bool> stopReq{false}, done{false}, tuiActive{false};
-    std::mutex wakeM;
-    std::condition_variable wakeCv;   // record-only refresh / timer wakeups / done
-    bool kick = false;
-
-    std::mutex postM;                 // guards screen / loopAlive (Post from other threads)
+    std::atomic<bool> stopRequested{false};
+    std::mutex screenM;
     ftxui::ScreenInteractive* screen = nullptr;
-    bool loopAlive = false;
 
-    // UI-thread only
-    bool help = false, quitting = false;
+    bool quitting = false;
+    Popup popup;
 
-    // perf (written by the UI thread)
-    std::atomic<uint64_t> draws{0}, cycles{0};
-    std::atomic<double> buildMsSum{0}, buildMsMax{0};
-
-    std::vector<LogLine> LogSnapshot() const {
+    std::vector<LogLine> LogSnapshot() {
         std::lock_guard<std::mutex> lk(logM);
         return {logs.begin(), logs.end()};
     }
-    void Update() {
-        model.Update(tel, Qpc::Now(), /*boostStatusRead*/ true);
-        uint64_t c = 0;
-        QueryThreadCycleTime(GetCurrentThread(), &c);
-        cycles.store(c, std::memory_order_relaxed);
+    void SetScreen(ftxui::ScreenInteractive* s) {
+        std::lock_guard<std::mutex> lk(screenM);
+        screen = s;
     }
-};
+    void PostRefresh() {
+        std::lock_guard<std::mutex> lk(screenM);
+        if (screen) screen->PostEvent(ftxui::Event::Custom);
+    }
+    void Update() {
+        const int64_t now = Qpc::Now();
+        model.Update(tel, now);
+        if (model.TakeSettingsChanged()) {
+            std::erase_if(popup.pending, [](const auto& p) { return p.second.sent; });
+            const int n = (int)model.SettingsList().size();
+            popup.cursor = std::clamp(popup.cursor, 0, std::max(0, n - 1));
+            if (n && !model.SettingsList()[popup.cursor].enabled) Move(+1);
+        }
+        FlushPending(now, false);
+    }
 
-struct DashboardImpl {
-    std::shared_ptr<DashShared> sh = std::make_shared<DashShared>();
-    std::thread th;
-    bool started = false, joined = true;
+    void Move(int dir) {
+        const auto& items = model.SettingsList();
+        for (int k = popup.cursor + dir; k >= 0 && k < (int)items.size(); k += dir)
+            if (items[k].enabled) { popup.cursor = k; return; }
+    }
+    const SettingItem* Current() const {
+        const auto& items = model.SettingsList();
+        return popup.cursor < (int)items.size() && items[popup.cursor].enabled ? &items[popup.cursor] : nullptr;
+    }
+    void Set(const SettingItem& it, int v) {
+        if (v == popup.Value(it)) return;
+        popup.pending[it.id] = {v, Qpc::Now(), false};
+        if (!it.pausesPlayback) FlushPending(Qpc::Now(), true);
+    }
+    void Change(int delta) {
+        const SettingItem* it = Current();
+        if (!it) return;
+        if (it->kind == SettingItem::Kind::Toggle) Set(*it, delta > 0 ? 1 : 0);
+        else if (it->kind == SettingItem::Kind::Choice && !it->choices.empty())
+            Set(*it, std::clamp(popup.Value(*it) + delta, 0, (int)it->choices.size() - 1));
+    }
+    void Activate() {
+        const SettingItem* it = Current();
+        if (!it) return;
+        if (it->kind == SettingItem::Kind::Toggle) Set(*it, popup.Value(*it) ? 0 : 1);
+        else if (it->kind == SettingItem::Kind::Action) tel->PushSetting({it->id, 0});
+        else FlushPending(Qpc::Now(), true);
+    }
+    void FlushPending(int64_t now, bool force) {
+        for (auto& [id, p] : popup.pending) {
+            if (p.sent || (!force && Qpc::ToMs(now - p.changedAt) < kPausingChangeDebounceMs)) continue;
+            tel->PushSetting({id, p.value});
+            p.sent = true;
+        }
+    }
+    void Quit() {
+        tel->PushKey(VK_ESCAPE);
+        quitting = true;
+    }
 };
 
 namespace {
 
-bool ConsoleInteractive() {
-    DWORD m;
-    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &m) && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &m);
-}
-
-void RecordLoop(DashShared& s) {
-    const auto period = std::chrono::duration<double>(1.0 / std::max(0.5, s.opt.refreshHz));
-    while (!s.stopReq.load()) {
-        {
-            std::unique_lock<std::mutex> lk(s.wakeM);
-            s.wakeCv.wait_for(lk, std::chrono::duration_cast<std::chrono::nanoseconds>(period), [&] { return s.stopReq.load(); });
-        }
-        if (s.stopReq.load()) break;
-        s.Update();
+bool HandleKey(DashboardState& s, const ftxui::Event& e) {
+    using ftxui::Event;
+    if (e == Event::CtrlC) { s.Quit(); return true; }
+    const char a = (char)tolower((unsigned char)TypedAscii(e));
+    if (s.popup.open) {
+        if (e == Event::Escape || a == 's') { s.popup.open = false; s.FlushPending(Qpc::Now(), true); }
+        else if (a == 'j' || e == Event::ArrowDown) s.Move(+1);
+        else if (a == 'k' || e == Event::ArrowUp) s.Move(-1);
+        else if (a == 'h' || e == Event::ArrowLeft) s.Change(-1);
+        else if (a == 'l' || e == Event::ArrowRight) s.Change(+1);
+        else if (a == ' ' || e == Event::Return) s.Activate();
+        return true;
     }
+    if (e == Event::Escape) { s.Quit(); return true; }
+    if (a == 's') { s.popup.open = true; if (!s.Current()) s.Move(+1); return true; }
+    if (a == 'm') { s.tel->PushKey('M'); return true; }
+    return e.is_character();
 }
 
-// The typed character as ASCII; full-width forms (U+FF01..U+FF5E, e.g. '？' '＋' 'ｆ' typed with a
-// Chinese IME in full-width / Chinese-punctuation mode) map to their ASCII counterparts. 0 = other.
-char AsciiOf(const ftxui::Event& e) {
-    if (!e.is_character()) return 0;
-    const std::string& c = e.character();
-    if (c.size() == 1) return (unsigned char)c[0] < 0x80 ? c[0] : 0;
-    if (c.size() == 3 && (unsigned char)c[0] == 0xEF) {
-        const unsigned cp = (((unsigned char)c[0] & 0x0F) << 12) | (((unsigned char)c[1] & 0x3F) << 6) | ((unsigned char)c[2] & 0x3F);
-        if (cp >= 0xFF01 && cp <= 0xFF5E) return (char)(cp - 0xFEE0);
-    }
-    return 0;
-}
-
-int KeyFor(const ftxui::Event& e) {
-    const char ch = (char)toupper((unsigned char)AsciiOf(e));
-    if (!ch) return 0;
-    switch (ch) {
-    case 'I': case 'F': case 'S': case 'Q': case 'M': case 'L': case 'R': case 'T': return ch;
-    case '+': case '=': return VK_OEM_PLUS;
-    case '-': case '_': return VK_OEM_MINUS;
-    }
-    return 0;
-}
-
-// Returns true when the loop ended because of a stop request (false = user quit / error).
-bool TuiLoop(DashShared& s) {
+bool RunTerminalLoop(DashboardState& s) {
     using namespace ftxui;
     auto screen = ScreenInteractive::Fullscreen();
     screen.TrackMouse(false);
     screen.ForceHandleCtrlC(false);
-    bool registered = false;
-    // FTXUI's Install() routes SIGINT to its own exit path (the loop would end behind our back,
-    // racing the timer's PostEvent with ExitNow). Keyboard Ctrl+C is a key here anyway; a
-    // CTRL_C_EVENT sent by another process should reach the app's console control handler (it
-    // quits cleanly through Stop()), so the previous SIGINT handler is put back after Install
-    // (FTXUI restores the same one on exit).
-    using SigFn = void (*)(int);
-    const SigFn prevInt = std::signal(SIGINT, SIG_DFL);
-    if (prevInt != SIG_ERR) std::signal(SIGINT, prevInt);
+    using SignalHandler = void (*)(int);
+    const SignalHandler appSigint = std::signal(SIGINT, SIG_DFL);
+    if (appSigint != SIG_ERR) std::signal(SIGINT, appSigint);
+    bool loopRunning = false;
 
     auto renderer = Renderer([&] {
-        if (!registered) {     // first draw: the loop is installed, Post() works from now on
-            if (prevInt != SIG_ERR) std::signal(SIGINT, prevInt);
-            std::lock_guard<std::mutex> lk(s.postM);
-            s.screen = &screen; s.loopAlive = true; registered = true;
+        if (!loopRunning) {
+            loopRunning = true;
+            if (appSigint != SIG_ERR) std::signal(SIGINT, appSigint);
+            s.SetScreen(&screen);
         }
-        const int64_t t0 = Qpc::Now();
         const Dimensions d = Terminal::Size();
-        Element e;
-        try {
-            e = s.model.Build(d.dimx, d.dimy, s.LogSnapshot(), s.help, s.quitting);
-        } catch (const std::exception& ex) {   // a view bug must not take the TUI (or the app) down
-            e = text(std::string(" dashboard: ") + ex.what());
-        } catch (...) {
-            e = text(" dashboard: render error");
-        }
-        const double ms = Qpc::ToMs(Qpc::Now() - t0);
-        s.draws.fetch_add(1, std::memory_order_relaxed);
-        s.buildMsSum.store(s.buildMsSum.load() + ms, std::memory_order_relaxed);
-        if (ms > s.buildMsMax.load()) s.buildMsMax.store(ms, std::memory_order_relaxed);
-        return e;
+        return s.model.Build(d.dimx, d.dimy, s.LogSnapshot(), s.popup, s.quitting);
     });
-    auto exitLoop = [&] {
-        { std::lock_guard<std::mutex> lk(s.postM); s.loopAlive = false; s.screen = nullptr; }
-        screen.Exit();
-    };
-    auto comp = CatchEvent(renderer, [&](Event e) {
-        if (e == Event::Custom) {
-            if (s.stopReq.load()) { exitLoop(); return true; }
-            try { s.Update(); } catch (...) {}   // e.g. bad_alloc: skip this refresh, keep the TUI
+    auto component = CatchEvent(renderer, [&](Event e) {
+        if (s.stopRequested.load()) {
+            if (e == Event::Custom) { s.SetScreen(nullptr); screen.Exit(); }
             return true;
         }
-        if (s.stopReq.load()) return true;      // stopping: the app may already be gone
-        if (e == Event::CtrlC) { s.tel->PushKey(VK_ESCAPE); s.quitting = true; return true; }
-        if (e == Event::Escape) {
-            if (s.help) s.help = false;
-            else { s.tel->PushKey(VK_ESCAPE); s.quitting = true; }
-            return true;
-        }
-        if (const char a = AsciiOf(e); a == '?' || a == 'h' || a == 'H') { s.help = !s.help; return true; }
-        if (const int vk = KeyFor(e)) {
-            s.tel->PushKey(vk);
-            if (vk == 'R') s.model.ResetWindow();
-            return true;
-        }
-        return e.is_character();   // swallow other characters
+        if (e == Event::Custom) { s.Update(); return true; }
+        return HandleKey(s, e);
     });
-
-    // refresh timer: posts a custom event at refreshHz (only while the loop accepts posts)
-    bool timerStop = false;
-    std::thread timer([&] {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::duration<double>(1.0 / std::max(0.5, s.opt.refreshHz)));
-        std::unique_lock<std::mutex> lk(s.wakeM);
-        while (!timerStop) {
-            s.wakeCv.wait_for(lk, period, [&] { return timerStop || s.kick; });
-            if (timerStop) break;
-            s.kick = false;
-            lk.unlock();
-            {
-                std::lock_guard<std::mutex> plk(s.postM);
-                if (s.loopAlive && s.screen) s.screen->PostEvent(Event::Custom);
-            }
-            lk.lock();
-        }
-    });
-    struct TimerJoin {
-        DashShared& s; bool& stop; std::thread& t;
-        ~TimerJoin() {
-            { std::lock_guard<std::mutex> lk(s.wakeM); stop = true; }
-            s.wakeCv.notify_all();
-            if (t.joinable()) t.join();
-            std::lock_guard<std::mutex> plk(s.postM);
-            s.loopAlive = false; s.screen = nullptr;
-        }
-    } timerJoin{s, timerStop, timer};
-
-    screen.Loop(comp);
-    return s.stopReq.load();
-}
-
-void UiMain(std::shared_ptr<DashShared> sp) {
-    DashShared& s = *sp;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    SetThreadDescription(GetCurrentThread(), L"camss ui");
-    if (s.tuiActive.load()) {
-        HANDLE hin = GetStdHandle(STD_INPUT_HANDLE), hout = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD inMode = 0, outMode = 0;
-        const bool haveIn = GetConsoleMode(hin, &inMode) != 0, haveOut = GetConsoleMode(hout, &outMode) != 0;
-        const UINT cpOut = GetConsoleOutputCP(), cpIn = GetConsoleCP();
-        // Ctrl+C arrives as a key (forwarded as ESC) instead of a console control event / SIGINT.
-        // Quick-edit off: in conhost a stray click would start a selection, which blocks every
-        // console write (the UI thread, and Stop() would then time out). Restored below
-        // (ENABLE_EXTENDED_FLAGS makes SetConsoleMode apply the quick-edit / insert bits).
-        if (haveIn)
-            SetConsoleMode(hin, (inMode | ENABLE_EXTENDED_FLAGS) & ~(DWORD)(ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE));
-        bool stopped = false, threw = false;
-        std::string what;
-        try {
-            stopped = TuiLoop(s);
-        } catch (const std::exception& e) {
-            threw = true; what = e.what();
-        } catch (...) {
-            threw = true;
-        }
-        if (threw) {   // FTXUI's loop already restored its state while unwinding; make sure
-            static const char kReset[] = "\x1b[0m\x1b[?1049l\x1b[?25h\x1b[?7h\r\n";
-            fwrite(kReset, 1, sizeof(kReset) - 1, stdout);
-            fflush(stdout);
-        }
-        if (haveIn) SetConsoleMode(hin, inMode | ENABLE_EXTENDED_FLAGS);
-        if (haveOut) SetConsoleMode(hout, outMode);
-        SetConsoleOutputCP(cpOut);
-        SetConsoleCP(cpIn);
-        s.tuiActive.store(false);
-        if (!stopped && !s.stopReq.load()) {
-            if (threw) {
-                // A dashboard error must not end the video session: keep recording, tell the
-                // user (TuiActive() is false from now on; the app may re-enable console output).
-                const std::string m = "\r\ncamss: terminal dashboard stopped (" + (what.empty() ? std::string("error") : what) +
-                                      "); video keeps running, Ctrl+C or Esc in the video window quits\r\n";
-                fwrite(m.data(), 1, m.size(), stdout);
-                fflush(stdout);
-            } else {
-                // The loop ended on its own without an error (a termination signal): quit the app.
-                s.tel->PushKey(VK_ESCAPE);
-            }
-            RecordLoop(s);
-        }
-    } else {
-        RecordLoop(s);
-    }
-    // End the current segment here (not in Stop()): it is then also written when Stop() timed
-    // out and detached this thread.
-    try { s.model.Finish(Qpc::Now()); } catch (...) {}
     {
-        std::lock_guard<std::mutex> lk(s.wakeM);
-        s.done.store(true);
+        std::jthread refreshTimer([&s](std::stop_token stop) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            std::mutex m;
+            std::condition_variable_any cv;
+            std::unique_lock<std::mutex> lk(m);
+            while (!cv.wait_for(lk, stop, kRefreshPeriod, [&] { return stop.stop_requested(); })) s.PostRefresh();
+        });
+        screen.Loop(component);
+        s.SetScreen(nullptr);
     }
-    s.wakeCv.notify_all();
+    return s.stopRequested.load();
 }
 
-} // namespace
+struct ConsoleModes {
+    HANDLE input, output;
+    DWORD inputMode = 0, outputMode = 0;
+    UINT inputCodePage, outputCodePage;
+};
 
-// ------------------------------------------------------------------ Dashboard
-Dashboard::Dashboard() : p_(std::make_unique<DashboardImpl>()) {}
+ConsoleModes SaveConsoleModes() {
+    ConsoleModes m{GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE)};
+    GetConsoleMode(m.input, &m.inputMode);
+    GetConsoleMode(m.output, &m.outputMode);
+    m.inputCodePage = GetConsoleCP();
+    m.outputCodePage = GetConsoleOutputCP();
+    return m;
+}
+
+void RestoreConsoleModes(const ConsoleModes& m) {
+    SetConsoleMode(m.input, m.inputMode | ENABLE_EXTENDED_FLAGS);
+    SetConsoleMode(m.output, m.outputMode);
+    SetConsoleCP(m.inputCodePage);
+    SetConsoleOutputCP(m.outputCodePage);
+}
+
+void UiThreadMain(DashboardState& s) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    SetThreadDescription(GetCurrentThread(), L"CameraVFX ui");
+    const ConsoleModes saved = SaveConsoleModes();
+    const DWORD ctrlCAsKeyNoQuickEdit = (saved.inputMode | ENABLE_EXTENDED_FLAGS) & ~(DWORD)(ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
+    SetConsoleMode(saved.input, ctrlCAsKeyNoQuickEdit);
+    const bool stoppedByApp = RunTerminalLoop(s);
+    RestoreConsoleModes(saved);
+    if (!stoppedByApp) s.tel->PushKey(VK_ESCAPE);
+}
+
+void ForwardLogToDashboard(void* dashboard, LogLevel lvl, double tSec, const char* msg, size_t len) {
+    static_cast<Dashboard*>(dashboard)->OnLog(lvl, tSec, msg, len);
+}
+
+}
+
+namespace {
+constexpr char kLeaveFullscreenSequence[] = "[?1049l[?25h[0m";
+std::atomic<bool> g_fullscreenActive{false};
+}
+
+void RestoreConsoleAfterCrash() {
+    if (!g_fullscreenActive.load()) return;
+    fputs(kLeaveFullscreenSequence, stdout);
+    fflush(stdout);
+}
+
+Dashboard::Dashboard() : state_(std::make_unique<DashboardState>()) {}
 Dashboard::~Dashboard() { Stop(); }
 
-bool Dashboard::Start(Telemetry* tel, const DashboardOptions& o) {
-    if (p_->started || !tel) return false;
-    DashShared& s = *p_->sh;
-    s.tel = tel;
-    s.opt = o;
-    s.model.SetOptions(o);
-    s.model.SetFineBlocks(FineBlocks());
-    s.stopReq.store(false);
-    s.done.store(false);
-    s.tuiActive.store(o.tui && ConsoleInteractive());
-    p_->th = std::thread(UiMain, p_->sh);
-    p_->started = true;
-    p_->joined = false;
-    return true;
+void Dashboard::Start(Telemetry* tel) {
+    state_->tel = tel;
+    state_->model.SetEighthBlocks(TerminalHasEighthBlocks());
+    LogFlush();
+    SetLogSink(ForwardLogToDashboard, this);
+    SetLogConsole(false);
+    g_fullscreenActive.store(true);
+    uiThread_ = std::thread(UiThreadMain, std::ref(*state_));
 }
 
 void Dashboard::Stop() {
-    if (!p_ || !p_->started || p_->joined) return;
-    DashShared& s = *p_->sh;
-    s.stopReq.store(true);
-    {
-        std::lock_guard<std::mutex> lk(s.wakeM);
-        s.kick = true;
-    }
-    s.wakeCv.notify_all();
-    {
-        std::lock_guard<std::mutex> lk(s.postM);
-        if (s.loopAlive && s.screen) s.screen->PostEvent(ftxui::Event::Custom);
-    }
-    bool finished;
-    {
-        std::unique_lock<std::mutex> lk(s.wakeM);
-        finished = s.wakeCv.wait_for(lk, std::chrono::seconds(3), [&] { return s.done.load(); });
-    }
-    if (finished) {
-        p_->th.join();                // the UI thread ended the current segment and wrote it
-    } else {
-        // The UI thread is stuck (e.g. console output paused by a text selection). It keeps its
-        // own reference to the shared state and exits by itself once the console resumes.
-        p_->th.detach();
-    }
-    p_->joined = true;
+    if (!uiThread_.joinable()) return;
+    state_->stopRequested.store(true);
+    state_->PostRefresh();
+    uiThread_.join();
+    g_fullscreenActive.store(false);
+    SetLogConsole(true);
+    SetLogSink(nullptr, nullptr);
 }
 
-bool Dashboard::Running() const { return p_->started && !p_->joined && !p_->sh->done.load(); }
-bool Dashboard::TuiActive() const { return p_->sh->tuiActive.load(); }
-
 void Dashboard::OnLog(LogLevel lvl, double tSec, const char* msg, size_t len) {
-    // multi-line messages (e.g. the detailed statistics report) become one entry per line
     std::vector<std::string> lines;
-    size_t a = 0;
-    while (a < len) {
+    for (size_t a = 0; a < len;) {
         size_t b = a;
         while (b < len && msg[b] != '\n') b++;
         std::string t(msg + a, b - a);
         while (!t.empty() && (t.back() == '\r' || t.back() == ' ')) t.pop_back();
-        for (char& c : t) if (c == '\r' || c == '\t') c = ' ';
+        std::replace_if(t.begin(), t.end(), [](char c) { return c == '\r' || c == '\t'; }, ' ');
         if (!t.empty()) lines.push_back(std::move(t));
         a = b + 1;
     }
-    DashShared& s = *p_->sh;
-    std::lock_guard<std::mutex> lk(s.logM);
-    for (auto& t : lines) s.logs.push_back({lvl, tSec, std::move(t)});
-    while (s.logs.size() > kMaxLogLines) s.logs.pop_front();
+    std::lock_guard<std::mutex> lk(state_->logM);
+    for (auto& t : lines) state_->logs.push_back({lvl, tSec, std::move(t)});
+    while (state_->logs.size() > kMaxLogLines) state_->logs.pop_front();
 }
 
-DashboardPerf Dashboard::Perf() const {
-    const DashShared& s = *p_->sh;
-    DashboardPerf r;
-    r.refreshes = s.model.refreshes_.load();
-    r.frames = s.model.framesSeen_.load();
-    r.updateMsAvg = r.refreshes ? s.model.updMsSum_.load() / (double)r.refreshes : 0;
-    r.updateMsMax = s.model.updMsMax_.load();
-    r.draws = s.draws.load();
-    r.buildMsAvg = r.draws ? s.buildMsSum.load() / (double)r.draws : 0;
-    r.buildMsMax = s.buildMsMax.load();
-    r.uiCycles = s.cycles.load();
-    return r;
+void Dashboard::Pump(Telemetry* tel, int64_t nowQpc) {
+    state_->tel = tel;
+    state_->model.Update(tel, nowQpc);
 }
 
-void Dashboard::Pump(Telemetry* tel, const DashboardOptions& o, int64_t nowQpc) {
-    DashShared& s = *p_->sh;
-    if (!s.tel) { s.tel = tel; s.opt = o; s.model.SetOptions(o); }
-    s.model.Update(tel, nowQpc);
-}
-
-void Dashboard::Finish(int64_t nowQpc) { p_->sh->model.Finish(nowQpc); }
-
-std::string Dashboard::RenderText(int width, int height, bool ansi, bool help) const {
-    const DashShared& s = *p_->sh;
-    width = std::max(width, 1); height = std::max(height, 1);
-    Element e = s.model.Build(width, height, s.LogSnapshot(), help, false);
+std::string Dashboard::RenderText(int width, int height, bool ansi, bool popupOpen) const {
+    width = std::max(width, 1);
+    height = std::max(height, 1);
+    Popup popup;
+    popup.open = popupOpen;
+    const auto& items = state_->model.SettingsList();
+    while (popup.cursor < (int)items.size() && !items[popup.cursor].enabled) popup.cursor++;
+    Element e = state_->model.Build(width, height, state_->LogSnapshot(), popup, false);
     auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(width), ftxui::Dimension::Fixed(height));
     ftxui::Render(screen, e);
     return ansi ? screen.ToString() + "\n" : PlainText(screen);
 }
 
-} // namespace camss
+}

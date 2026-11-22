@@ -3,310 +3,50 @@
 #include "nvCVImage.h"
 #include "nvTransferD3D11.h"
 #include "videofx_version.h"
+#include <algorithm>
 #include <array>
 #include <filesystem>
-#include <unordered_map>
+#include <optional>
+#include <string_view>
 
-// Used by nvVideoEffectsProxy.cpp to locate the runtime.
 char* g_nvVFXSDKPath = nullptr;
 
-namespace camss {
+namespace cameravfx {
 
-// ---- VFX SDK 1.3 core headers (third_party/nvvfx/include) provide the generic parameters and
-// the RGB10A2 / P32 image formats. The effect selectors and effect-specific parameters are
-// declared in the per-feature headers that come with each feature plugin (installed from NGC);
-// the values below match the 1.3 feature plugins and the SDK samples.
-static const char* kFxFrameGen = "VideoFrameGeneration";
-static const char* kFxVideoSuperRes = "VideoSuperRes";
-static const char* kFxTrueHdr = "TrueHDR";
-static const char* kInputWidth = NVVFX_INPUT_WIDTH;
-static const char* kInputHeight = NVVFX_INPUT_HEIGHT;
-static const char* kQualityLevel = "QualityLevel";
-static const char* kImageEncodingMode = "ImageEncodingMode";
-static const char* kFgMode = NVVFX_MODE;
-static const char* kFgFrameMultiplier = "FrameMultiplier";
-static const char* kFgTimestep = "Timestep";
-static const char* kFgShotChange = "ShotChange";
-static const char* kFgAutoShotChange = "AutomaticShotChangeDetectionEnabled";
-static const NvCVImage_PixelFormat kNVCV_RGB10A2 = NVCV_RGB10A2;
-static const NvCVImage_ComponentType kNVCV_P32 = NVCV_P32;
-static const unsigned kEncRGB8 = 0, kEncRGB10A2 = 1;
+namespace {
 
-#define VFX_CHECK(expr) do { NvCV_Status _s = (expr); if (_s != NVCV_SUCCESS) { \
-    LOGE("%s failed: %d (%s)", #expr, (int)_s, NvCV_GetErrorStringFromCode(_s)); return false; } } while (0)
+constexpr const char* kEffectFrameGeneration = "VideoFrameGeneration";
+constexpr const char* kEffectSuperRes = "VideoSuperRes";
+constexpr const char* kEffectTrueHdr = "TrueHDR";
+constexpr const char* kParamQualityLevel = "QualityLevel";
+constexpr const char* kParamImageEncodingMode = "ImageEncodingMode";
+constexpr const char* kParamFrameMultiplier = "FrameMultiplier";
+constexpr const char* kParamTimestep = "Timestep";
+constexpr const char* kParamShotChange = "ShotChange";
+constexpr const char* kParamAutoShotChange = "AutomaticShotChangeDetectionEnabled";
+constexpr const char* kParamContrast = "Contrast";
+constexpr const char* kParamSaturation = "Saturation";
+constexpr const char* kParamMiddleGray = "MiddleGray";
+constexpr const char* kParamPeakLuminance = "Luminance";
 
-// Minimal CUDA runtime event API, loaded from the VFX runtime's cudart64_12.dll so
-// that we share its context without linking the CUDA toolkit.
-struct CudaRt {
-    typedef int (*EventCreate)(void**);
-    typedef int (*EventRecord)(void*, void*);
-    typedef int (*EventQuery)(void*);
-    typedef int (*EventElapsed)(float*, void*, void*);
-    typedef int (*EventDestroy)(void*);
-    EventCreate create = nullptr; EventRecord record = nullptr; EventQuery query = nullptr;
-    EventElapsed elapsed = nullptr; EventDestroy destroy = nullptr;
-    bool Load(const std::wstring& dir) {
-        HMODULE m = LoadLibraryW((dir + L"\\cudart64_12.dll").c_str());
-        if (!m) return false;
-        create = (EventCreate)GetProcAddress(m, "cudaEventCreate");
-        record = (EventRecord)GetProcAddress(m, "cudaEventRecord");
-        query = (EventQuery)GetProcAddress(m, "cudaEventQuery");
-        elapsed = (EventElapsed)GetProcAddress(m, "cudaEventElapsedTime");
-        destroy = (EventDestroy)GetProcAddress(m, "cudaEventDestroy");
-        return create && record && query && elapsed && destroy;
-    }
-};
+constexpr unsigned kSrEncodingRgba8 = 0, kSrEncodingRgb10a2 = 1;
+constexpr unsigned kFgExplicitTimestepMultiplier = 0;
+constexpr float kSrStrength = 1.0f;
+constexpr unsigned kHdrContrast = 100, kHdrSaturation = 100, kHdrMiddleGray = 50, kHdrPeakNits = 650;
+constexpr float kMinTimestep = 0.001f, kMaxTimestep = 0.999f;
+constexpr unsigned kGpuRowAlignment = 32;
+constexpr UINT kUnpackGroupWidth = 16, kUnpackGroupHeight = 8;
+constexpr double kFailureLogIntervalMs = 2000;
+constexpr int kCudaSuccess = 0;
 
-struct Effect {
-    NvVFX_Handle h = nullptr;
-    ~Effect() { if (h) NvVFX_DestroyEffect(h); }
-};
+constexpr const wchar_t* kRuntimeDirEnvVar = L"CAMERAVFX_VFX_RUNTIME";
+constexpr const wchar_t* kRuntimeDirNextToExe = L"nvvfx_runtime";
+constexpr const wchar_t* kCudaRuntimeDll = L"cudart64_12.dll";
 
-struct VfxImpl {
-    Device* dev = nullptr;
-    VfxChain::Config cfg;
-    CUstream stream = nullptr;
-    SourceFrame* store = nullptr;
-    int storeCount = 0;
-    // D3D views of the source store (registered once) and their CUDA copies.
-    std::vector<NvCVImage> d3dSrc;
-    std::vector<NvCVImage> gpuSrc;
-    std::vector<int64_t> gpuN;
-    NvCVImage tmp;                      // staging for Transfer
-    // Effects and their buffers.
-    Effect fg, hdr, sr;
-    NvCVImage fgOut, hdrOut, srOut;     // GPU
-    NvCVImage* lastSrIn = nullptr;
-    NvCVImage* lastFgA = nullptr; NvCVImage* lastFgB = nullptr;
-    int64_t lastPairA = -1, lastPairB = -1;
-    // Output D3D textures (one per possible final format/size) + interop images.
-    Device::Tex outTex[2];              // [0] = out res, [1] = src res (SR toggled off)
-    NvCVImage outD3d[2];
-    bool outIsPq[2] = {false, false};   // per output texture: HDR10 (PQ) or SDR content
-    Device::Tex packedTex[2];           // R32_UINT interop targets for RGB10A2 output
-    // External D3D inputs (e.g. an NVOF/blend interpolated frame) for SR/HDR-only chains.
-    std::unordered_map<ID3D11Texture2D*, std::unique_ptr<NvCVImage>> extD3d;
-    NvCVImage extGpu;
-    bool lastFgRan = false, lastPq = false;
-    ComPtr<ID3D11ComputeShader> unpackCS;
-    ComPtr<ID3D11Buffer> unpackCB;
-    bool outPq = false;
-    // Timing.
-    CudaRt rt;
-    static constexpr int kEv = 6, kRing = 4;
-    void* ev[kRing][kEv] = {};
-    bool evPending[kRing] = {};
-    const char* evName[kEv] = {"vfx.start", "vfx.fg", "vfx.hdr", "vfx.sr", "vfx.out", "vfx.end"};
-    int evFrame = 0;
-    std::vector<std::pair<const char*, double>> timings;
-
-    ~VfxImpl() {
-        for (Effect* e : {&fg, &hdr, &sr}) if (e->h) { NvVFX_DestroyEffect(e->h); e->h = nullptr; }
-        // Unregister every CUDA-registered D3D texture while the textures still exist
-        // (members would otherwise be destroyed in an order that frees textures first).
-        for (auto& im : d3dSrc) NvCVImage_Dealloc(&im);
-        for (auto& im : outD3d) NvCVImage_Dealloc(&im);
-        for (auto& kv : extD3d) NvCVImage_Dealloc(kv.second.get());
-        if (rt.destroy) for (auto& f : ev) for (auto& e : f) if (e) rt.destroy(e);
-        if (stream) NvVFX_CudaStreamDestroy(stream);
-    }
-
-    void Record(int stage) {
-        if (!cfg.profile || !ev[evFrame][stage]) return;
-        rt.record(ev[evFrame][stage], stream);
-    }
-    void CollectTimings() {
-        for (int f = 0; f < kRing; f++) {
-            if (!evPending[f]) continue;
-            if (rt.query(ev[f][kEv - 1]) != 0) continue;   // not done
-            evPending[f] = false;
-            float total = 0;
-            for (int s = 1; s < kEv; s++) {
-                float ms = 0;
-                if (rt.elapsed(&ms, ev[f][s - 1], ev[f][s]) == 0) { timings.push_back({evName[s], ms}); total += ms; }
-            }
-            timings.push_back({"vfx.gpu_total", total});
-        }
-    }
-};
-
-static std::wstring ResolveRuntimeDir(const std::wstring& configured) {
-    namespace fs = std::filesystem;
-    std::vector<fs::path> candidates;
-    if (!configured.empty()) candidates.push_back(configured);
-    wchar_t env[MAX_PATH];
-    if (GetEnvironmentVariableW(L"CAMSS_VFX_RUNTIME", env, MAX_PATH)) candidates.push_back(env);
-    wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    fs::path exeDir = fs::path(exe).parent_path();
-    candidates.push_back(exeDir / L"nvvfx_runtime");
-#ifdef CAMSS_VFX_RUNTIME_DIR
-    candidates.push_back(fs::path(CAMSS_VFX_RUNTIME_DIR));
-#endif
-    for (auto& c : candidates)
-        if (fs::exists(c / L"NVVideoEffects.dll") && fs::exists(c / L"nvVFXVideoFrameGeneration.dll")) {
-            // Backslashes + absolute: LOAD_WITH_ALTERED_SEARCH_PATH misbehaves with forward slashes.
-            fs::path p = fs::absolute(c).lexically_normal();
-            p.make_preferred();
-            std::wstring w = p.wstring();
-            while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) w.pop_back();
-            return w;
-        }
-    return {};
-}
-
-// Loads the VFX 1.3 runtime exactly once, before any NvCVImage object exists: the
-// NvCVImage default constructor already calls into NVCVImage.dll through the proxy,
-// which would otherwise bind whatever NVCVImage.dll is first on PATH (e.g. an older
-// 0.7.x install in Program Files that lacks RGB10A2 and the 1.x effects).
-static std::wstring g_runtimeDir;
-static bool LoadVfxRuntime() {
-    static int state = 0;   // 0 = not tried, 1 = ok, -1 = failed
-    if (state) return state > 0;
-    state = -1;
-    std::wstring dir = ResolveRuntimeDir(L"");
-    if (dir.empty()) { LOGE("VFX runtime (NVVideoEffects 1.3 + feature DLLs) not found; set CAMSS_VFX_RUNTIME"); return false; }
-    if (HMODULE pre = GetModuleHandleW(L"NVCVImage.dll")) {
-        wchar_t m[MAX_PATH] = L"?"; GetModuleFileNameW(pre, m, MAX_PATH);
-        LOGW("an NVCVImage.dll is already loaded (%s)", WideToUtf8(m).c_str());
-    }
-    SetDllDirectoryW(dir.c_str());     // feature DLLs (nvVFX*.dll, nvngx_*.dll, cudart) resolve from here
-    AddDllDirectory(dir.c_str());
-    HMODULE hImg = LoadLibraryExW((dir + L"\\NVCVImage.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!hImg) { LOGE("failed to load %s\\NVCVImage.dll (err %lu)", WideToUtf8(dir.c_str()).c_str(), GetLastError()); return false; }
-    HMODULE hVfx = LoadLibraryExW((dir + L"\\NVVideoEffects.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!hVfx) { LOGE("failed to load %s\\NVVideoEffects.dll (err %lu)", WideToUtf8(dir.c_str()).c_str(), GetLastError()); return false; }
-    static std::string dirA = WideToUtf8(dir.c_str());
-    g_nvVFXSDKPath = dirA.data();      // used by NVVideoEffectsProxy.cpp
-    g_runtimeDir = dir;
-    // The proxies resolve "NVCVImage" / "NVVideoEffects" by module name: verify they bind ours.
-    wchar_t m1[MAX_PATH] = L"?";
-    GetModuleFileNameW(GetModuleHandleW(L"NVCVImage.dll"), m1, MAX_PATH);
-    if (_wcsicmp(m1, (dir + L"\\NVCVImage.dll").c_str()) != 0) {
-        LOGE("wrong NVCVImage.dll bound (%s); the VFX 1.3 runtime needs its own copy", WideToUtf8(m1).c_str());
-        return false;
-    }
-    unsigned ver = 0;
-    NvVFX_GetVersion(&ver);
-    LOGI("VFX runtime %u.%u.%u.%u from %s (built with SDK headers %s)", ver >> 24, (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff,
-         dirA.c_str(), NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING);
-    if ((ver >> 24) != NVIDIA_VIDEOEFFECTS_SDK_VERSION_MAJOR || ((ver >> 16) & 0xff) != NVIDIA_VIDEOEFFECTS_SDK_VERSION_MINOR)
-        LOGW("VFX runtime %u.%u does not match the SDK headers %s; effects may fail to load", ver >> 24, (ver >> 16) & 0xff,
-             NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING_MAJOR_MINOR);
-    // Route the SDK's own warnings and errors into the camss log (thread-safe, any thread).
-    NvVFX_ConfigureLogger(NVCV_LOG_WARNING, nullptr, [](void*, const char* msg) {
-        if (!msg) return;
-        std::string m(msg);
-        while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.pop_back();
-        LOGW("VFX SDK: %s", m.c_str());
-    }, nullptr);
-    state = 1;
-    return true;
-}
-
-VfxChain::VfxChain() { LoadVfxRuntime(); p_ = std::make_unique<VfxImpl>(); }
-VfxChain::~VfxChain() = default;
-bool VfxChain::HasFg() const { return p_->fg.h != nullptr; }
-bool VfxChain::OutputIsPq() const { return p_->outPq; }
-
-static bool CreateEffect(const char* sel, Effect& e) {
-    NvCV_Status s = NvVFX_CreateEffect(sel, &e.h);
-    if (s != NVCV_SUCCESS) { LOGE("NvVFX_CreateEffect(%s) failed: %d (%s)", sel, (int)s, NvCV_GetErrorStringFromCode(s)); e.h = nullptr; return false; }
-    return true;
-}
-
-bool VfxChain::Init(Device& dev, const Config& cfg, SourceFrame* store, int storeCount) {
-    VfxImpl& p = *p_;
-    p.dev = &dev; p.cfg = cfg; p.store = store; p.storeCount = storeCount;
-
-    if (!LoadVfxRuntime()) return false;
-    const std::wstring& dir = g_runtimeDir;
-    if (cfg.profile && !p.rt.Load(dir)) { LOGW("cudart events unavailable; VFX GPU timing disabled"); p.cfg.profile = false; }
-
-    VFX_CHECK(NvVFX_CudaStreamCreate(&p.stream));
-    const UINT sw = cfg.srcW, sh = cfg.srcH;
-
-    // Source store: register every D3D texture once; allocate CUDA copies.
-    p.d3dSrc.resize(storeCount);
-    p.gpuSrc.resize(storeCount);
-    p.gpuN.assign(storeCount, -1);
-    for (int i = 0; i < storeCount; i++) {
-        VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.d3dSrc[i], store[i].rgb.tex.Get()));
-        VFX_CHECK(NvCVImage_Alloc(&p.gpuSrc[i], sw, sh, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32));
-    }
-
-    // ---- Video Frame Generation
-    if (cfg.fg) {
-        if (!CreateEffect(kFxFrameGen, p.fg)) return false;
-        VFX_CHECK(NvVFX_SetCudaStream(p.fg.h, NVVFX_CUDA_STREAM, p.stream));
-        VFX_CHECK(NvVFX_SetU32(p.fg.h, kInputWidth, sw));
-        VFX_CHECK(NvVFX_SetU32(p.fg.h, kInputHeight, sh));
-        VFX_CHECK(NvVFX_SetU32(p.fg.h, kFgMode, (unsigned)std::clamp(cfg.fgMode, 0, 2)));
-        VFX_CHECK(NvVFX_SetU32(p.fg.h, kFgAutoShotChange, 1u));
-        int64_t t0 = Qpc::Now();
-        VFX_CHECK(NvVFX_Load(p.fg.h));
-        LOGI("VFX VideoFrameGeneration loaded (mode %d) in %.0f ms", cfg.fgMode, Qpc::ToMs(Qpc::Now() - t0));
-        VFX_CHECK(NvCVImage_Alloc(&p.fgOut, sw, sh, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32));
-        VFX_CHECK(NvVFX_SetImage(p.fg.h, NVVFX_OUTPUT_IMAGE, &p.fgOut));
-        VFX_CHECK(NvVFX_SetU32(p.fg.h, kFgFrameMultiplier, 0u));   // explicit timestep mode
-    }
-
-    // ---- TrueHDR (input RGBA8, output RGB10A2 PQ, same size)
-    const bool hdrAtSrc = cfg.hdr && (cfg.hdrBeforeSr || !cfg.sr);
-    if (cfg.hdr) {
-        UINT hw = hdrAtSrc ? sw : cfg.outW, hh = hdrAtSrc ? sh : cfg.outH;
-        if (!CreateEffect(kFxTrueHdr, p.hdr)) return false;
-        VFX_CHECK(NvVFX_SetCudaStream(p.hdr.h, NVVFX_CUDA_STREAM, p.stream));
-        VFX_CHECK(NvVFX_SetU32(p.hdr.h, "Contrast", cfg.hdrContrast));
-        VFX_CHECK(NvVFX_SetU32(p.hdr.h, "Saturation", cfg.hdrSaturation));
-        VFX_CHECK(NvVFX_SetU32(p.hdr.h, "MiddleGray", cfg.hdrMiddleGray));
-        VFX_CHECK(NvVFX_SetU32(p.hdr.h, "Luminance", cfg.hdrPeakNits));
-        VFX_CHECK(NvCVImage_Alloc(&p.hdrOut, hw, hh, kNVCV_RGB10A2, kNVCV_P32, NVCV_CHUNKY, NVCV_GPU, 32));
-        // TrueHDR needs a representative input bound before Load.
-        NvCVImage* in0 = hdrAtSrc ? &p.gpuSrc[0] : nullptr;
-        static NvCVImage dummyOut;
-        if (!in0) { VFX_CHECK(NvCVImage_Alloc(&dummyOut, hw, hh, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32)); in0 = &dummyOut; }
-        VFX_CHECK(NvVFX_SetImage(p.hdr.h, NVVFX_INPUT_IMAGE, in0));
-        VFX_CHECK(NvVFX_SetImage(p.hdr.h, NVVFX_OUTPUT_IMAGE, &p.hdrOut));
-        int64_t t0 = Qpc::Now();
-        VFX_CHECK(NvVFX_Load(p.hdr.h));
-        LOGI("VFX TrueHDR loaded (%ux%u, peak %u nits) in %.0f ms", hw, hh, cfg.hdrPeakNits, Qpc::ToMs(Qpc::Now() - t0));
-    }
-
-    // ---- Video Super Resolution
-    if (cfg.sr) {
-        const bool tenBit = cfg.hdr && hdrAtSrc;
-        if (!CreateEffect(kFxVideoSuperRes, p.sr)) return false;
-        VFX_CHECK(NvVFX_SetCudaStream(p.sr.h, NVVFX_CUDA_STREAM, p.stream));
-        VFX_CHECK(NvVFX_SetU32(p.sr.h, kImageEncodingMode, tenBit ? kEncRGB10A2 : kEncRGB8));
-        if (tenBit) VFX_CHECK(NvCVImage_Alloc(&p.srOut, cfg.outW, cfg.outH, kNVCV_RGB10A2, kNVCV_P32, NVCV_CHUNKY, NVCV_GPU, 32));
-        else VFX_CHECK(NvCVImage_Alloc(&p.srOut, cfg.outW, cfg.outH, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32));
-        NvCVImage* in0 = tenBit ? &p.hdrOut : &p.gpuSrc[0];
-        VFX_CHECK(NvVFX_SetImage(p.sr.h, NVVFX_INPUT_IMAGE, in0));
-        VFX_CHECK(NvVFX_SetImage(p.sr.h, NVVFX_OUTPUT_IMAGE, &p.srOut));
-        VFX_CHECK(NvVFX_SetU32(p.sr.h, kQualityLevel, (unsigned)cfg.srQuality));
-        VFX_CHECK(NvVFX_SetF32(p.sr.h, NVVFX_STRENGTH, cfg.srStrength));
-        int64_t t0 = Qpc::Now();
-        VFX_CHECK(NvVFX_Load(p.sr.h));
-        p.lastSrIn = in0;
-        LOGI("VFX VideoSuperRes loaded (%ux%u -> %ux%u, quality %d, %s) in %.0f ms", sw, sh, cfg.outW, cfg.outH, cfg.srQuality,
-             tenBit ? "RGB10A2" : "RGBA8", Qpc::ToMs(Qpc::Now() - t0));
-    }
-
-    // ---- Output textures (D3D) the chain writes into.
-    p.outPq = cfg.hdr;
-    DXGI_FORMAT of = p.outPq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
-    UINT ow = cfg.sr ? cfg.outW : sw, oh = cfg.sr ? cfg.outH : sh;
-    // CUDA interop cannot register R10G10B10A2 textures, so HDR output goes through an
-    // R32_UINT texture (identical 32-bit packing, reinterpreted as RGB10A2 for the copy)
-    // and a tiny D3D compute pass unpacks it into R10G10B10A2_UNORM.
-    NvCVImage ref10;
-    if (p.outPq) {
-        VFX_CHECK(NvCVImage_Alloc(&ref10, 16, 16, kNVCV_RGB10A2, kNVCV_P32, NVCV_CHUNKY, NVCV_GPU, 0));
-        static const char* kUnpackCS = R"(
+constexpr const char* kUnpackRgb10a2Cs = R"(
 Texture2D<uint> Src : register(t0);
 RWTexture2D<unorm float4> Dst : register(u0);
-cbuffer CB : register(b0) { uint w; uint h; uint2 pad; };
+cbuffer CB : register(b0) { uint w; uint h; uint2 padding; };
 [numthreads(16, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
@@ -314,161 +54,564 @@ void main(uint3 id : SV_DispatchThreadID) {
     Dst[id.xy] = float4(float(v & 1023u), float((v >> 10) & 1023u), float((v >> 20) & 1023u), 1023.0) / 1023.0;
 }
 )";
-        p.unpackCS = dev.CompileCS(kUnpackCS, "main", "unpack_rgb10a2_cs");
-        p.unpackCB = dev.CreateConstantBuffer(16);
-    }
-    auto makeOut = [&](int i, UINT w, UINT h, bool pq) -> bool {
-        p.outIsPq[i] = pq;
-        p.outTex[i] = dev.CreateTex(w, h, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
-        if (!pq) { VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.outTex[i].tex.Get())); return true; }
-        p.packedTex[i] = dev.CreateTex(w, h, DXGI_FORMAT_R32_UINT, true, false);
-        VFX_CHECK(NvCVImage_InitFromD3D11Texture(&p.outD3d[i], p.packedTex[i].tex.Get()));
-        p.outD3d[i].pixelFormat = ref10.pixelFormat;
-        p.outD3d[i].componentType = ref10.componentType;
-        p.outD3d[i].pixelBytes = ref10.pixelBytes;
-        p.outD3d[i].componentBytes = ref10.componentBytes;
-        p.outD3d[i].numComponents = ref10.numComponents;
-        return true;
-    };
-    // [0]: normal output. [1]: SR toggled off at runtime (source size); with TrueHDR placed
-    // after SR that path carries SDR content, so it gets an SDR texture.
-    if (!makeOut(0, ow, oh, cfg.hdr)) return false;
-    if (cfg.sr && !makeOut(1, sw, sh, cfg.hdr && hdrAtSrc)) return false;
-    (void)of;
-    VFX_CHECK(NvCVImage_Alloc(&p.tmp, ow, oh, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32));
 
-    if (p.cfg.profile)
-        for (auto& f : p.ev) for (auto& e : f) p.rt.create(&e);
+#define VFX_CHECK(expr) do { NvCV_Status _s = (expr); if (_s != NVCV_SUCCESS) { \
+    LOGE("%s failed: %d (%s)", #expr, (int)_s, NvCV_GetErrorStringFromCode(_s)); return false; } } while (0)
+
+enum class Failure { SourceMap, SourceTransfer, FgRun, HdrRun, SrRun, OutputMap, OutputTransfer, Count };
+constexpr const char* kFailureNames[] = {"source map", "source transfer", "VideoFrameGeneration run", "TrueHDR run",
+                                         "VideoSuperRes run", "output map", "output transfer"};
+static_assert(std::size(kFailureNames) == (size_t)Failure::Count);
+
+void LogFailure(Failure what, NvCV_Status s) {
+    static std::array<std::atomic<int64_t>, (size_t)Failure::Count> lastLogged{};
+    if (LogEnabled(LogLevel::Error) && detail::LogRateOk(lastLogged[(size_t)what], kFailureLogIntervalMs))
+        LOGE("VFX %s failed: %d (%s)", kFailureNames[(size_t)what], (int)s, NvCV_GetErrorStringFromCode(s));
+}
+
+struct CudaEvents {
+    using Create = int (*)(void**);
+    using Record = int (*)(void*, void*);
+    using Query = int (*)(void*);
+    using Elapsed = int (*)(float*, void*, void*);
+    using Destroy = int (*)(void*);
+    Create create = nullptr;
+    Record record = nullptr;
+    Query query = nullptr;
+    Elapsed elapsed = nullptr;
+    Destroy destroy = nullptr;
+
+    static std::optional<CudaEvents> Load(const std::filesystem::path& runtimeDir) {
+        HMODULE cudart = LoadLibraryW((runtimeDir / kCudaRuntimeDll).c_str());
+        if (!cudart) return std::nullopt;
+        CudaEvents e;
+        e.create = (Create)GetProcAddress(cudart, "cudaEventCreate");
+        e.record = (Record)GetProcAddress(cudart, "cudaEventRecord");
+        e.query = (Query)GetProcAddress(cudart, "cudaEventQuery");
+        e.elapsed = (Elapsed)GetProcAddress(cudart, "cudaEventElapsedTime");
+        e.destroy = (Destroy)GetProcAddress(cudart, "cudaEventDestroy");
+        if (!e.create || !e.record || !e.query || !e.elapsed || !e.destroy) return std::nullopt;
+        return e;
+    }
+};
+
+struct VfxRuntime {
+    std::string dirUtf8;
+    std::optional<CudaEvents> cudaEvents;
+};
+
+std::filesystem::path RuntimeDirFromEnvironment() {
+    wchar_t buf[MAX_PATH];
+    const DWORD len = GetEnvironmentVariableW(kRuntimeDirEnvVar, buf, MAX_PATH);
+    return len > 0 && len < MAX_PATH ? std::filesystem::path(buf) : std::filesystem::path();
+}
+
+std::filesystem::path RuntimeDirNextToExe() { return std::filesystem::path(ExeDir()) / kRuntimeDirNextToExe; }
+
+std::filesystem::path FindRuntimeDir() {
+    namespace fs = std::filesystem;
+    for (const fs::path& c : {RuntimeDirFromEnvironment(), RuntimeDirNextToExe()}) {
+        if (c.empty() || !fs::exists(c / L"NVVideoEffects.dll") || !fs::exists(c / L"nvVFXVideoFrameGeneration.dll")) continue;
+        fs::path dir = fs::absolute(c).lexically_normal();
+        dir.make_preferred();
+        return dir.has_filename() ? dir : dir.parent_path();
+    }
+    return {};
+}
+
+void ForwardSdkLog(void*, const char* msg) {
+    std::string_view text = msg ? msg : "";
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.remove_suffix(1);
+    LOGW("VFX SDK: %.*s", (int)text.size(), text.data());
+}
+
+std::unique_ptr<VfxRuntime> LoadRuntime() {
+    const std::filesystem::path dir = FindRuntimeDir();
+    if (dir.empty()) {
+        const std::string envVar = WideToUtf8(kRuntimeDirEnvVar);
+        const std::filesystem::path fromEnvironment = RuntimeDirFromEnvironment();
+        LOGE("VFX runtime (NVVideoEffects 1.3 + feature DLLs) not found in %%%s%% (%s) or %s; fetch it with tools/get-vfx-runtime.ps1 and rebuild, "
+             "or set %s to its folder",
+             envVar.c_str(), fromEnvironment.empty() ? "not set" : WideToUtf8(fromEnvironment.c_str()).c_str(),
+             WideToUtf8(RuntimeDirNextToExe().c_str()).c_str(), envVar.c_str());
+        return nullptr;
+    }
+    auto runtime = std::make_unique<VfxRuntime>();
+    runtime->dirUtf8 = WideToUtf8(dir.c_str());
+    SetDllDirectoryW(dir.c_str());
+    for (const wchar_t* dll : {L"NVCVImage.dll", L"NVVideoEffects.dll"}) {
+        if (LoadLibraryExW((dir / dll).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) continue;
+        const DWORD err = GetLastError();
+        LOGE("failed to load %s (err %lu)", WideToUtf8((dir / dll).c_str()).c_str(), err);
+        return nullptr;
+    }
+    wchar_t boundImageDll[MAX_PATH] = L"?";
+    GetModuleFileNameW(GetModuleHandleW(L"NVCVImage.dll"), boundImageDll, MAX_PATH);
+    if (_wcsicmp(boundImageDll, (dir / L"NVCVImage.dll").c_str()) != 0) {
+        LOGE("wrong NVCVImage.dll bound (%s); the VFX 1.3 runtime needs its own copy", WideToUtf8(boundImageDll).c_str());
+        return nullptr;
+    }
+    g_nvVFXSDKPath = runtime->dirUtf8.data();
+    unsigned ver = 0;
+    NvVFX_GetVersion(&ver);
+    const unsigned major = ver >> 24, minor = (ver >> 16) & 0xff;
+    LOGI("VFX runtime %u.%u.%u.%u from %s (built with SDK headers %s)", major, minor, (ver >> 8) & 0xff, ver & 0xff,
+         runtime->dirUtf8.c_str(), NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING);
+    if (major != NVIDIA_VIDEOEFFECTS_SDK_VERSION_MAJOR || minor != NVIDIA_VIDEOEFFECTS_SDK_VERSION_MINOR)
+        LOGW("VFX runtime %u.%u does not match the SDK headers %s; effects may fail to load", major, minor,
+             NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING_MAJOR_MINOR);
+    NvVFX_ConfigureLogger(NVCV_LOG_WARNING, nullptr, ForwardSdkLog, nullptr);
+    runtime->cudaEvents = CudaEvents::Load(dir);
+    if (!runtime->cudaEvents) LOGW("cudart events unavailable; VFX GPU timing disabled");
+    return runtime;
+}
+
+const VfxRuntime* Runtime() {
+    static const std::unique_ptr<VfxRuntime> runtime = LoadRuntime();
+    return runtime.get();
+}
+
+struct CudaStream {
+    CUstream handle = nullptr;
+    CudaStream() = default;
+    CudaStream(const CudaStream&) = delete;
+    CudaStream& operator=(const CudaStream&) = delete;
+    ~CudaStream() {
+        if (handle) NvVFX_CudaStreamDestroy(handle);
+    }
+};
+
+struct Effect {
+    NvVFX_Handle handle = nullptr;
+    Effect() = default;
+    Effect(Effect&& other) noexcept : handle(std::exchange(other.handle, nullptr)) {}
+    Effect& operator=(Effect&& other) noexcept {
+        std::swap(handle, other.handle);
+        return *this;
+    }
+    ~Effect() {
+        if (handle) NvVFX_DestroyEffect(handle);
+    }
+};
+
+bool CreateEffect(const char* selector, Effect& effect) {
+    const NvCV_Status s = NvVFX_CreateEffect(selector, &effect.handle);
+    if (s == NVCV_SUCCESS) return true;
+    LOGE("NvVFX_CreateEffect(%s) failed: %d (%s)", selector, (int)s, NvCV_GetErrorStringFromCode(s));
+    effect.handle = nullptr;
+    return false;
+}
+
+enum class GpuFormat { Rgba8, Rgb10a2 };
+
+NvCV_Status AllocGpuImage(NvCVImage& image, UINT w, UINT h, GpuFormat format) {
+    return format == GpuFormat::Rgb10a2 ? NvCVImage_Alloc(&image, w, h, NVCV_RGB10A2, NVCV_P32, NVCV_CHUNKY, NVCV_GPU, kGpuRowAlignment)
+                                        : NvCVImage_Alloc(&image, w, h, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, kGpuRowAlignment);
+}
+
+NvCV_Status ReinterpretAsRgb10a2(NvCVImage& image) {
+    NvCVImage layout;
+    const NvCV_Status s = NvCVImage_Init(&layout, 1, 1, 4, nullptr, NVCV_RGB10A2, NVCV_P32, NVCV_CHUNKY, NVCV_GPU);
+    image.pixelFormat = layout.pixelFormat;
+    image.componentType = layout.componentType;
+    image.pixelBytes = layout.pixelBytes;
+    image.componentBytes = layout.componentBytes;
+    image.numComponents = layout.numComponents;
+    return s;
+}
+
+enum class Stage { Start, Fg, Hdr, Sr, Out };
+
+class StageTimer {
+public:
+    explicit StageTimer(const CudaEvents* events) : events_(events) {}
+    StageTimer(const StageTimer&) = delete;
+    StageTimer& operator=(const StageTimer&) = delete;
+    ~StageTimer() {
+        if (!events_) return;
+        for (Frame& frame : frames_)
+            for (void* e : frame.events)
+                if (e) events_->destroy(e);
+    }
+
+    void Start(CUstream stream) {
+        stream_ = stream;
+        if (!events_) return;
+        enabled_ = true;
+        for (Frame& frame : frames_)
+            for (void*& e : frame.events) enabled_ = enabled_ && events_->create(&e) == kCudaSuccess;
+    }
+    void Begin() {
+        recording_ = enabled_ && !frames_[current_].pending;
+        frames_[current_].marks = 0;
+        MarkAfter(Stage::Start);
+    }
+    void MarkAfter(Stage stage) {
+        if (!recording_) return;
+        Frame& frame = frames_[current_];
+        events_->record(frame.events[frame.marks], stream_);
+        frame.stages[frame.marks++] = stage;
+    }
+    void End() {
+        if (!recording_) return;
+        MarkAfter(Stage::Out);
+        frames_[current_].pending = true;
+        current_ = (current_ + 1) % kFramesInFlight;
+        recording_ = false;
+    }
+    void Abandon() { recording_ = false; }
+    void Collect(std::vector<VfxTimings>& timings) {
+        if (!enabled_) return;
+        for (Frame& frame : frames_) {
+            if (!frame.pending || events_->query(frame.events[frame.marks - 1]) != kCudaSuccess) continue;
+            frame.pending = false;
+            VfxTimings t;
+            for (int i = 1; i < frame.marks; i++) {
+                float ms = 0;
+                if (events_->elapsed(&ms, frame.events[i - 1], frame.events[i]) != kCudaSuccess) continue;
+                StageMs(t, frame.stages[i]) = ms;
+                t.totalMs += ms;
+            }
+            timings.push_back(t);
+        }
+    }
+
+private:
+    static constexpr int kFramesInFlight = 4;
+    static constexpr int kMaxMarks = 5;
+    struct Frame {
+        std::array<void*, kMaxMarks> events{};
+        std::array<Stage, kMaxMarks> stages{};
+        int marks = 0;
+        bool pending = false;
+    };
+    static std::optional<double>& StageMs(VfxTimings& t, Stage stage) {
+        switch (stage) {
+        case Stage::Fg: return t.fgMs;
+        case Stage::Hdr: return t.hdrMs;
+        case Stage::Sr: return t.srMs;
+        case Stage::Start:
+        case Stage::Out: break;
+        }
+        return t.outMs;
+    }
+    const CudaEvents* events_;
+    CUstream stream_ = nullptr;
+    bool enabled_ = false, recording_ = false;
+    std::array<Frame, kFramesInFlight> frames_{};
+    int current_ = 0;
+};
+
+struct Output {
+    Device::Tex tex;
+    Device::Tex packed;
+    NvCVImage interop;
+    Encoding encoding = Encoding::SdrGamma;
+};
+
+}
+
+struct VfxImpl {
+    VfxImpl(Device& device, const VfxChain::Config& config, std::span<SourceFrame> frames, const VfxRuntime& runtime)
+        : dev(device), cfg(config), hdrAtSource(config.hdr && !(config.sr && config.hdrAfterSr)), store(frames),
+          timer(runtime.cudaEvents ? &*runtime.cudaEvents : nullptr), fgQuality(config.fgQuality), srQuality(config.srQuality) {}
+
+    bool Init();
+    bool LoadFg(int quality);
+    bool LoadSr(int quality);
+    bool LoadHdr();
+    bool ReloadFg(int quality);
+    bool ReloadSr(int quality);
+    bool MakeOutput(Output& output, UINT w, UINT h, Encoding encoding);
+    NvCV_Status RunHdr(NvCVImage* input);
+    void UnpackRgb10a2(const Output& output);
+    VfxOutput Fail(Failure what, NvCV_Status s);
+    int Slot(const SourceFrame& frame) const { return (int)(&frame - store.data()); }
+    NvCVImage* SrLoadInput() { return hdrAtSource ? &hdrOut : &srcCuda[0]; }
+
+    Device& dev;
+    const VfxChain::Config cfg;
+    const bool hdrAtSource;
+    std::span<SourceFrame> store;
+    CudaStream stream;
+    StageTimer timer;
+    std::vector<NvCVImage> srcInterop;
+    std::vector<NvCVImage> srcCuda;
+    std::vector<int64_t> srcCudaFrameN;
+    NvCVImage fgOut, hdrOut, srOut, transferStaging;
+    Output out, srOffOut;
+    ComPtr<ID3D11ComputeShader> unpackCs;
+    ComPtr<ID3D11Buffer> unpackCb;
+    Effect fg, hdr, sr;
+    int fgQuality, srQuality;
+    NvCVImage* srBoundInput = nullptr;
+    static constexpr int kUnbound = -1;
+    int fgBoundSlotA = kUnbound, fgBoundSlotB = kUnbound;
+    double fgLoadMs = 0, srLoadMs = 0;
+    std::vector<VfxTimings> timings;
+};
+
+bool VfxImpl::LoadFg(int quality) {
+    if (!CreateEffect(kEffectFrameGeneration, fg)) return false;
+    VFX_CHECK(NvVFX_SetCudaStream(fg.handle, NVVFX_CUDA_STREAM, stream.handle));
+    VFX_CHECK(NvVFX_SetU32(fg.handle, NVVFX_INPUT_WIDTH, cfg.srcW));
+    VFX_CHECK(NvVFX_SetU32(fg.handle, NVVFX_INPUT_HEIGHT, cfg.srcH));
+    VFX_CHECK(NvVFX_SetU32(fg.handle, NVVFX_MODE, (unsigned)quality));
+    VFX_CHECK(NvVFX_SetU32(fg.handle, kParamAutoShotChange, 1u));
+    const int64_t t0 = Qpc::Now();
+    VFX_CHECK(NvVFX_Load(fg.handle));
+    fgLoadMs = Qpc::ToMs(Qpc::Now() - t0);
+    LOGI("VFX VideoFrameGeneration loaded (quality %d) in %.0f ms", quality, fgLoadMs);
+    VFX_CHECK(NvVFX_SetImage(fg.handle, NVVFX_OUTPUT_IMAGE, &fgOut));
+    VFX_CHECK(NvVFX_SetU32(fg.handle, kParamFrameMultiplier, kFgExplicitTimestepMultiplier));
+    fgQuality = quality;
     return true;
 }
 
-void VfxChain::Ingest(const SourceFrame& f) {
-    VfxImpl& p = *p_;
-    if (f.n < 0) return;
-    int k = (int)(f.n % p.storeCount);
-    p.dev->ctx()->Flush();                       // make the colour conversion visible to CUDA
-    if (NvCVImage_MapResource(&p.d3dSrc[k], p.stream) != NVCV_SUCCESS) { LOGE("VFX map src failed"); return; }
-    NvCV_Status s = NvCVImage_Transfer(&p.d3dSrc[k], &p.gpuSrc[k], 1.f, p.stream, nullptr);
-    NvCVImage_UnmapResource(&p.d3dSrc[k], p.stream);
-    if (s != NVCV_SUCCESS) { LOGE("VFX ingest transfer failed: %d", (int)s); return; }
-    p.gpuN[k] = f.n;
+bool VfxImpl::LoadSr(int quality) {
+    if (!CreateEffect(kEffectSuperRes, sr)) return false;
+    VFX_CHECK(NvVFX_SetCudaStream(sr.handle, NVVFX_CUDA_STREAM, stream.handle));
+    VFX_CHECK(NvVFX_SetU32(sr.handle, kParamImageEncodingMode, hdrAtSource ? kSrEncodingRgb10a2 : kSrEncodingRgba8));
+    VFX_CHECK(NvVFX_SetImage(sr.handle, NVVFX_INPUT_IMAGE, SrLoadInput()));
+    VFX_CHECK(NvVFX_SetImage(sr.handle, NVVFX_OUTPUT_IMAGE, &srOut));
+    VFX_CHECK(NvVFX_SetU32(sr.handle, kParamQualityLevel, (unsigned)quality));
+    VFX_CHECK(NvVFX_SetF32(sr.handle, NVVFX_STRENGTH, kSrStrength));
+    const int64_t t0 = Qpc::Now();
+    VFX_CHECK(NvVFX_Load(sr.handle));
+    srLoadMs = Qpc::ToMs(Qpc::Now() - t0);
+    LOGI("VFX VideoSuperRes loaded (%ux%u -> %ux%u, quality %d, %s) in %.0f ms", cfg.srcW, cfg.srcH, cfg.outW, cfg.outH, quality,
+         hdrAtSource ? "RGB10A2" : "RGBA8", srLoadMs);
+    srBoundInput = SrLoadInput();
+    srQuality = quality;
+    return true;
 }
 
-bool VfxChain::LastFgRan() const { return p_->lastFgRan; }
-bool VfxChain::LastOutputPq() const { return p_->lastPq; }
+bool VfxImpl::LoadHdr() {
+    const UINT w = hdrAtSource ? cfg.srcW : cfg.outW, h = hdrAtSource ? cfg.srcH : cfg.outH;
+    if (!CreateEffect(kEffectTrueHdr, hdr)) return false;
+    VFX_CHECK(NvVFX_SetCudaStream(hdr.handle, NVVFX_CUDA_STREAM, stream.handle));
+    VFX_CHECK(NvVFX_SetU32(hdr.handle, kParamContrast, kHdrContrast));
+    VFX_CHECK(NvVFX_SetU32(hdr.handle, kParamSaturation, kHdrSaturation));
+    VFX_CHECK(NvVFX_SetU32(hdr.handle, kParamMiddleGray, kHdrMiddleGray));
+    VFX_CHECK(NvVFX_SetU32(hdr.handle, kParamPeakLuminance, kHdrPeakNits));
+    VFX_CHECK(AllocGpuImage(hdrOut, w, h, GpuFormat::Rgb10a2));
+    VFX_CHECK(NvVFX_SetImage(hdr.handle, NVVFX_INPUT_IMAGE, hdrAtSource ? &srcCuda[0] : &srOut));
+    VFX_CHECK(NvVFX_SetImage(hdr.handle, NVVFX_OUTPUT_IMAGE, &hdrOut));
+    const int64_t t0 = Qpc::Now();
+    VFX_CHECK(NvVFX_Load(hdr.handle));
+    LOGI("VFX TrueHDR loaded (%ux%u, peak %u nits) in %.0f ms", w, h, kHdrPeakNits, Qpc::ToMs(Qpc::Now() - t0));
+    return true;
+}
 
-const Device::Tex* VfxChain::Process(const SourceFrame& A, const SourceFrame* B, float t, bool srOn, const Device::Tex* external) {
+bool VfxImpl::ReloadFg(int quality) {
+    const int previous = fgQuality;
+    fg = {};
+    fgBoundSlotA = fgBoundSlotB = kUnbound;
+    if (LoadFg(quality)) return true;
+    fg = {};
+    if (!LoadFg(previous)) fg = {};
+    return false;
+}
+
+bool VfxImpl::ReloadSr(int quality) {
+    const int previous = srQuality;
+    sr = {};
+    if (LoadSr(quality)) return true;
+    sr = {};
+    if (!LoadSr(previous)) sr = {};
+    return false;
+}
+
+bool VfxImpl::MakeOutput(Output& output, UINT w, UINT h, Encoding encoding) {
+    const bool pq = encoding == Encoding::Pq;
+    output.encoding = encoding;
+    output.tex = dev.CreateTex(w, h, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM, true, true);
+    if (!pq) {
+        VFX_CHECK(NvCVImage_InitFromD3D11Texture(&output.interop, output.tex.tex.Get()));
+        return true;
+    }
+    output.packed = dev.CreateTex(w, h, DXGI_FORMAT_R32_UINT, true, false);
+    VFX_CHECK(NvCVImage_InitFromD3D11Texture(&output.interop, output.packed.tex.Get()));
+    VFX_CHECK(ReinterpretAsRgb10a2(output.interop));
+    return true;
+}
+
+bool VfxImpl::Init() {
+    VFX_CHECK(NvVFX_CudaStreamCreate(&stream.handle));
+    timer.Start(stream.handle);
+
+    srcInterop.resize(store.size());
+    srcCuda.resize(store.size());
+    srcCudaFrameN.assign(store.size(), -1);
+    for (size_t i = 0; i < store.size(); i++) {
+        VFX_CHECK(NvCVImage_InitFromD3D11Texture(&srcInterop[i], store[i].rgb.tex.Get()));
+        VFX_CHECK(AllocGpuImage(srcCuda[i], cfg.srcW, cfg.srcH, GpuFormat::Rgba8));
+    }
+
+    const int effectCount = (int)cfg.fg + (int)cfg.hdr + (int)cfg.sr;
+    int effectsLoaded = 0;
+    auto reportLoaded = [&] {
+        if (cfg.onLoadProgress) cfg.onLoadProgress((float)++effectsLoaded / (float)effectCount);
+    };
+    if (cfg.fg) {
+        VFX_CHECK(AllocGpuImage(fgOut, cfg.srcW, cfg.srcH, GpuFormat::Rgba8));
+        if (!LoadFg(cfg.fgQuality)) return false;
+        reportLoaded();
+    }
+    if (cfg.sr) VFX_CHECK(AllocGpuImage(srOut, cfg.outW, cfg.outH, hdrAtSource ? GpuFormat::Rgb10a2 : GpuFormat::Rgba8));
+    if (cfg.hdr) {
+        if (!LoadHdr()) return false;
+        reportLoaded();
+    }
+    if (cfg.sr) {
+        if (!LoadSr(cfg.srQuality)) return false;
+        reportLoaded();
+    }
+
+    if (cfg.hdr) {
+        unpackCs = dev.CompileCS(kUnpackRgb10a2Cs, "main", "unpack_rgb10a2_cs");
+        unpackCb = dev.CreateConstantBuffer(16);
+    }
+    if (!MakeOutput(out, cfg.outW, cfg.outH, cfg.hdr ? Encoding::Pq : Encoding::SdrGamma)) return false;
+    if (cfg.sr && !MakeOutput(srOffOut, cfg.srcW, cfg.srcH, hdrAtSource ? Encoding::Pq : Encoding::SdrGamma)) return false;
+    VFX_CHECK(AllocGpuImage(transferStaging, cfg.outW, cfg.outH, GpuFormat::Rgba8));
+    return true;
+}
+
+NvCV_Status VfxImpl::RunHdr(NvCVImage* input) {
+    NvVFX_SetImage(hdr.handle, NVVFX_INPUT_IMAGE, input);
+    return NvVFX_Run(hdr.handle, 0);
+}
+
+void VfxImpl::UnpackRgb10a2(const Output& output) {
+    ID3D11DeviceContext* ctx = dev.Context();
+    const struct { UINT w, h, padding[2]; } constants{output.tex.w, output.tex.h, {0, 0}};
+    dev.UpdateCB(unpackCb.Get(), &constants, sizeof(constants));
+    ctx->CSSetShader(unpackCs.Get(), nullptr, 0);
+    ctx->CSSetShaderResources(0, 1, output.packed.srv.GetAddressOf());
+    ctx->CSSetUnorderedAccessViews(0, 1, output.tex.uav.GetAddressOf(), nullptr);
+    ctx->CSSetConstantBuffers(0, 1, unpackCb.GetAddressOf());
+    ctx->Dispatch((output.tex.w + kUnpackGroupWidth - 1) / kUnpackGroupWidth, (output.tex.h + kUnpackGroupHeight - 1) / kUnpackGroupHeight, 1);
+    dev.ClearCS();
+}
+
+VfxOutput VfxImpl::Fail(Failure what, NvCV_Status s) {
+    timer.Abandon();
+    LogFailure(what, s);
+    return {};
+}
+
+void RecordVfxTimings(StatBook& stats, const VfxTimings& timings) {
+    auto add = [&](std::string_view key, const std::optional<double>& ms) {
+        if (ms) stats.Add(key, *ms);
+    };
+    add(stat::kVfxFg, timings.fgMs);
+    add(stat::kVfxHdr, timings.hdrMs);
+    add(stat::kVfxSr, timings.srMs);
+    add(stat::kVfxOut, timings.outMs);
+    stats.Add(stat::kVfxGpuTotal, timings.totalMs);
+}
+
+std::unique_ptr<VfxChain> VfxChain::Create(Device& dev, const Config& cfg, std::span<SourceFrame> store) {
+    const VfxRuntime* runtime = Runtime();
+    if (!runtime) return nullptr;
+    auto impl = std::make_unique<VfxImpl>(dev, cfg, store, *runtime);
+    if (!impl->Init()) return nullptr;
+    return std::unique_ptr<VfxChain>(new VfxChain(std::move(impl)));
+}
+
+VfxChain::VfxChain(std::unique_ptr<VfxImpl> impl) : p_(std::move(impl)) {}
+VfxChain::~VfxChain() = default;
+bool VfxChain::Loaded() const { return (!p_->cfg.fg || p_->fg.handle) && (!p_->cfg.sr || p_->sr.handle); }
+int VfxChain::FgQuality() const { return p_->fgQuality; }
+int VfxChain::SrQuality() const { return p_->srQuality; }
+double VfxChain::FgLoadMs() const { return p_->fgLoadMs; }
+double VfxChain::SrLoadMs() const { return p_->srLoadMs; }
+
+bool VfxChain::Reload(int fgQuality, int srQuality) {
     VfxImpl& p = *p_;
-    p.lastFgRan = false;
-    p.lastPq = false;
-    if (p.cfg.profile) p.CollectTimings();
-    if (A.n < 0 || (B && B->n < 0)) return nullptr;
-    int ka = (int)(A.n % p.storeCount);
-    NvCVImage* cur = nullptr;
-    if (external) {
-        // An already generated frame from a D3D interpolator: bring it into CUDA once.
-        auto& img = p.extD3d[external->tex.Get()];
-        if (!img) {
-            img = std::make_unique<NvCVImage>();
-            if (NvCVImage_InitFromD3D11Texture(img.get(), external->tex.Get()) != NVCV_SUCCESS ||
-                NvCVImage_Alloc(&p.extGpu, external->w, external->h, NVCV_RGBA, NVCV_U8, NVCV_INTERLEAVED, NVCV_GPU, 32) != NVCV_SUCCESS) {
-                LOGE("VFX: cannot register external input texture");
-                return nullptr;
-            }
-        }
-        p.dev->ctx()->Flush();
-        if (NvCVImage_MapResource(img.get(), p.stream) != NVCV_SUCCESS) return nullptr;
-        NvCV_Status s = NvCVImage_Transfer(img.get(), &p.extGpu, 1.f, p.stream, nullptr);
-        NvCVImage_UnmapResource(img.get(), p.stream);
-        if (s != NVCV_SUCCESS) return nullptr;
-        cur = &p.extGpu;
-    } else {
-        if (p.gpuN[ka] != A.n) return nullptr;
-        cur = &p.gpuSrc[ka];
-    }
-    bool started = false;
-    if (p.cfg.profile && !p.evPending[p.evFrame]) { p.Record(0); started = true; }
+    NvVFX_CudaStreamSynchronize(p.stream.handle);
+    const bool fgOk = !p.cfg.fg || fgQuality == p.fgQuality || p.ReloadFg(fgQuality);
+    const bool srOk = !p.cfg.sr || srQuality == p.srQuality || p.ReloadSr(srQuality);
+    return fgOk && srOk;
+}
 
-    // 1) frame generation at source resolution
-    if (!external && p.fg.h && B && t > 0.f) {
-        int kb = (int)(B->n % p.storeCount);
-        if (p.gpuN[kb] == B->n) {
-            if (A.n != p.lastPairA || B->n != p.lastPairB) {
-                // New pair: both inputs must be (re)bound at the start of every pair.
-                NvVFX_SetImage(p.fg.h, NVVFX_INPUT_IMAGE_0, &p.gpuSrc[ka]);
-                NvVFX_SetImage(p.fg.h, NVVFX_INPUT_IMAGE_1, &p.gpuSrc[kb]);
-                NvVFX_SetU32(p.fg.h, kFgShotChange, 0u);
-                p.lastPairA = A.n; p.lastPairB = B->n;
-            }
-            NvVFX_SetF32(p.fg.h, kFgTimestep, std::clamp(t, 0.001f, 0.999f));
-            NvCV_Status s = NvVFX_Run(p.fg.h, 0);
-            if (s == NVCV_SUCCESS) { cur = &p.fgOut; p.lastFgRan = true; }
-            else LOGW("VideoFrameGeneration run failed: %d (%s)", (int)s, NvCV_GetErrorStringFromCode(s));
-        }
-    }
-    if (started) p.Record(1);
-
-    const bool hdrAtSrc = p.cfg.hdr && (p.cfg.hdrBeforeSr || !p.cfg.sr);
-    bool pq = false;
-    // 2) TrueHDR at source resolution
-    if (p.hdr.h && hdrAtSrc) {
-        NvVFX_SetImage(p.hdr.h, NVVFX_INPUT_IMAGE, cur);
-        if (NvVFX_Run(p.hdr.h, 0) == NVCV_SUCCESS) { cur = &p.hdrOut; pq = true; }
-    }
-    if (started) p.Record(2);
-
-    // 3) super resolution (+ TrueHDR at output resolution when configured after SR)
-    bool scaled = false;
-    if (p.sr.h && srOn) {
-        if (cur != p.lastSrIn) { NvVFX_SetImage(p.sr.h, NVVFX_INPUT_IMAGE, cur); p.lastSrIn = cur; }
-        if (NvVFX_Run(p.sr.h, 0) == NVCV_SUCCESS) { cur = &p.srOut; scaled = true; }
-        if (p.hdr.h && !hdrAtSrc && scaled) {
-            NvVFX_SetImage(p.hdr.h, NVVFX_INPUT_IMAGE, cur);
-            if (NvVFX_Run(p.hdr.h, 0) == NVCV_SUCCESS) { cur = &p.hdrOut; pq = true; }
-        }
-    }
-    if (started) p.Record(3);
-
-    // 4) hand the result to D3D: [0] = configured output, [1] = SR toggled off (source size)
-    const int oi = (p.cfg.sr && !scaled) ? 1 : 0;
-    if (pq != p.outIsPq[oi]) {
-        static int warned = 0;
-        if (warned++ < 3) LOGE("VFX: output encoding mismatch (HDR stage failed?)");
-        if (started) { p.Record(4); p.Record(5); p.evPending[p.evFrame] = true; p.evFrame = (p.evFrame + 1) % VfxImpl::kRing; }
-        return nullptr;
-    }
-    NvCVImage& dst = p.outD3d[oi];
-    if (NvCVImage_MapResource(&dst, p.stream) != NVCV_SUCCESS) { LOGE("VFX map out failed"); return nullptr; }
-    NvCV_Status s = NvCVImage_Transfer(cur, &dst, 1.f, p.stream, &p.tmp);
-    if (started) p.Record(4);
-    NvCVImage_UnmapResource(&dst, p.stream);
-    if (started) { p.Record(5); p.evPending[p.evFrame] = true; p.evFrame = (p.evFrame + 1) % VfxImpl::kRing; }
+void VfxChain::Ingest(const SourceFrame& frame) {
+    VfxImpl& p = *p_;
+    const int slot = p.Slot(frame);
+    p.dev.Context()->Flush();
+    NvCV_Status s = NvCVImage_MapResource(&p.srcInterop[slot], p.stream.handle);
     if (s != NVCV_SUCCESS) {
-        static int warned = 0;
-        if (warned++ < 3) LOGE("VFX output transfer failed: %d (%s)", (int)s, NvCV_GetErrorStringFromCode(s));
-        return nullptr;
+        LogFailure(Failure::SourceMap, s);
+        return;
     }
-    if (pq) {
-        // Unpack the R32_UINT interop texture into R10G10B10A2_UNORM (D3D side, after unmap).
-        auto* ctx = p.dev->ctx();
-        const Device::Tex& o = p.outTex[oi];
-        struct { UINT w, h, pad[2]; } cb{o.w, o.h, {0, 0}};
-        p.dev->UpdateCB(p.unpackCB.Get(), &cb, sizeof(cb));
-        ctx->CSSetShader(p.unpackCS.Get(), nullptr, 0);
-        ctx->CSSetShaderResources(0, 1, p.packedTex[oi].srv.GetAddressOf());
-        ctx->CSSetUnorderedAccessViews(0, 1, o.uav.GetAddressOf(), nullptr);
-        ctx->CSSetConstantBuffers(0, 1, p.unpackCB.GetAddressOf());
-        ctx->Dispatch((o.w + 15) / 16, (o.h + 7) / 8, 1);
-        p.dev->ClearCS();
+    s = NvCVImage_Transfer(&p.srcInterop[slot], &p.srcCuda[slot], 1.f, p.stream.handle, nullptr);
+    NvCVImage_UnmapResource(&p.srcInterop[slot], p.stream.handle);
+    if (s != NVCV_SUCCESS) {
+        LogFailure(Failure::SourceTransfer, s);
+        return;
     }
-    p.lastPq = pq;
-    return &p.outTex[oi];
+    p.srcCudaFrameN[slot] = frame.n;
+    if (slot == p.fgBoundSlotA || slot == p.fgBoundSlotB) p.fgBoundSlotA = p.fgBoundSlotB = VfxImpl::kUnbound;
 }
 
-std::vector<std::pair<const char*, double>> VfxChain::PopTimings() {
-    std::vector<std::pair<const char*, double>> out;
-    out.swap(p_->timings);
-    return out;
+VfxOutput VfxChain::Process(const SourceFrame& a, const SourceFrame* b, float t, bool srOn) {
+    VfxImpl& p = *p_;
+    p.timer.Collect(p.timings);
+    const int slotA = p.Slot(a);
+    if (p.srcCudaFrameN[slotA] != a.n) return {};
+    NvCVImage* cur = &p.srcCuda[slotA];
+    p.timer.Begin();
+
+    bool generated = false;
+    const int slotB = b ? p.Slot(*b) : VfxImpl::kUnbound;
+    if (b && p.cfg.fg && p.srcCudaFrameN[slotB] == b->n) {
+        if (slotA != p.fgBoundSlotA || slotB != p.fgBoundSlotB) {
+            NvVFX_SetImage(p.fg.handle, NVVFX_INPUT_IMAGE_0, cur);
+            NvVFX_SetImage(p.fg.handle, NVVFX_INPUT_IMAGE_1, &p.srcCuda[slotB]);
+            NvVFX_SetU32(p.fg.handle, kParamShotChange, 0u);
+            p.fgBoundSlotA = slotA;
+            p.fgBoundSlotB = slotB;
+        }
+        NvVFX_SetF32(p.fg.handle, kParamTimestep, std::clamp(t, kMinTimestep, kMaxTimestep));
+        if (NvCV_Status s = NvVFX_Run(p.fg.handle, 0); s != NVCV_SUCCESS) return p.Fail(Failure::FgRun, s);
+        cur = &p.fgOut;
+        generated = true;
+        p.timer.MarkAfter(Stage::Fg);
+    }
+
+    if (p.hdrAtSource) {
+        if (NvCV_Status s = p.RunHdr(cur); s != NVCV_SUCCESS) return p.Fail(Failure::HdrRun, s);
+        cur = &p.hdrOut;
+        p.timer.MarkAfter(Stage::Hdr);
+    }
+
+    const bool scaled = p.cfg.sr && srOn;
+    if (scaled) {
+        if (cur != p.srBoundInput) {
+            NvVFX_SetImage(p.sr.handle, NVVFX_INPUT_IMAGE, cur);
+            p.srBoundInput = cur;
+        }
+        if (NvCV_Status s = NvVFX_Run(p.sr.handle, 0); s != NVCV_SUCCESS) return p.Fail(Failure::SrRun, s);
+        cur = &p.srOut;
+        p.timer.MarkAfter(Stage::Sr);
+        if (p.cfg.hdr && !p.hdrAtSource) {
+            if (NvCV_Status s = p.RunHdr(cur); s != NVCV_SUCCESS) return p.Fail(Failure::HdrRun, s);
+            cur = &p.hdrOut;
+            p.timer.MarkAfter(Stage::Hdr);
+        }
+    }
+
+    Output& out = p.cfg.sr && !scaled ? p.srOffOut : p.out;
+    if (NvCV_Status s = NvCVImage_MapResource(&out.interop, p.stream.handle); s != NVCV_SUCCESS) return p.Fail(Failure::OutputMap, s);
+    const NvCV_Status transfer = NvCVImage_Transfer(cur, &out.interop, 1.f, p.stream.handle, &p.transferStaging);
+    NvCVImage_UnmapResource(&out.interop, p.stream.handle);
+    p.timer.End();
+    if (transfer != NVCV_SUCCESS) return p.Fail(Failure::OutputTransfer, transfer);
+    if (out.encoding == Encoding::Pq) p.UnpackRgb10a2(out);
+    return {&out.tex, out.encoding, generated};
 }
 
-} // namespace camss
+std::vector<VfxTimings> VfxChain::PopTimings() { return std::exchange(p_->timings, {}); }
+
+}

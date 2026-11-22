@@ -1,406 +1,398 @@
 #include "mf_capture.h"
-#include <mferror.h>
-#include <shlwapi.h>
-#include <algorithm>
-#include "../gfx/blit.h"
+#include "timecode.h"
 #include <initguid.h>
-// From mfcaptureengine.h: QPC (100 ns) time at which the device captured the frame.
-DEFINE_GUID(CAMSS_MFSampleExtension_DeviceReferenceSystemTime, 0x6523775a, 0xba2d, 0x405f, 0xb2, 0xc5, 0x01, 0xff, 0x88, 0xe2, 0xe8, 0xf6);
+#include <mfcaptureengine.h>
+#include <algorithm>
+#include <cmath>
+#include <shared_mutex>
 
-namespace camss {
+namespace cameravfx {
 
-const char* PixFmtName(PixFmt f) {
-    switch (f) {
-    case PixFmt::YUY2: return "YUY2";
-    case PixFmt::NV12: return "NV12";
-    case PixFmt::P010: return "P010";
-    case PixFmt::RGB24: return "RGB24";
-    case PixFmt::RGB32: return "RGB32";
-    default: return "?";
-    }
+namespace {
+
+constexpr DWORD kVideoStream = (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM;
+constexpr double kHnsPerMs = kHnsPerSecond / 1000.0;
+constexpr double kRequestRateToleranceHz = 0.5;
+constexpr double kPeriodTrackTolerance = 0.1;
+constexpr double kPeriodTrackGain = 0.02;
+constexpr double kGapWarnIntervalMs = 500;
+constexpr size_t kMaxPendingFrames = 64;
+
+bool Succeeded(HRESULT hr, const char* what) {
+    if (SUCCEEDED(hr)) return true;
+    LOGE("capture: %s failed: %s", what, HrToString(hr).c_str());
+    return false;
 }
 
-static PixFmt FromSubtype(const GUID& g) {
+std::optional<PixFmt> FromSubtype(const GUID& g) {
     if (g == MFVideoFormat_YUY2) return PixFmt::YUY2;
     if (g == MFVideoFormat_NV12) return PixFmt::NV12;
     if (g == MFVideoFormat_P010) return PixFmt::P010;
     if (g == MFVideoFormat_RGB24) return PixFmt::RGB24;
     if (g == MFVideoFormat_RGB32 || g == MFVideoFormat_ARGB32) return PixFmt::RGB32;
-    return PixFmt::Unknown;
+    return std::nullopt;
 }
 
-struct DeviceList {
-    IMFActivate** devs = nullptr;
-    UINT32 count = 0;
-    DeviceList() {
-        ComPtr<IMFAttributes> a;
-        MFCreateAttributes(&a, 1);
-        a->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
-        MFEnumDeviceSources(a.Get(), &devs, &count);
-    }
-    ~DeviceList() {
-        for (UINT32 i = 0; i < count; i++) devs[i]->Release();
-        CoTaskMemFree(devs);
-    }
-    std::wstring Str(UINT32 i, const GUID& key) {
-        WCHAR* n = nullptr; UINT32 len = 0;
-        devs[i]->GetAllocatedString(key, &n, &len);
-        std::wstring s = n ? n : L"";
-        CoTaskMemFree(n);
-        return s;
-    }
-    std::wstring Name(UINT32 i) { return Str(i, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME); }
+bool MatchesRequest(const CaptureMode& offered, const CaptureMode& wanted) {
+    return offered.format == wanted.format && SameSize(offered, wanted) && std::abs(offered.rateHz - wanted.rateHz) < kRequestRateToleranceHz;
+}
+
+struct NativeType {
+    ComPtr<IMFMediaType> type;
+    CaptureMode mode;
+    int stride;
 };
 
-void MfCapture::ListDevices() {
-    DeviceList dl;
-    for (UINT32 i = 0; i < dl.count; i++) {
-        LOGI("capture device [%u] %s", i, WideToUtf8(dl.Name(i).c_str()).c_str());
-        ComPtr<IMFMediaSource> src;
-        if (FAILED(dl.devs[i]->ActivateObject(IID_PPV_ARGS(&src)))) continue;
-        ComPtr<IMFAttributes> ra;
-        MFCreateAttributes(&ra, 1);
-        ra->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
-        ComPtr<IMFSourceReader> rd;
-        if (SUCCEEDED(MFCreateSourceReaderFromMediaSource(src.Get(), ra.Get(), &rd))) {
-            for (DWORD k = 0;; k++) {
-                ComPtr<IMFMediaType> mt;
-                if (FAILED(rd->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, k, &mt))) break;
-                GUID sub{}; mt->GetGUID(MF_MT_SUBTYPE, &sub);
-                UINT32 w = 0, h = 0, fn = 0, fd = 1;
-                MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &w, &h);
-                MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &fn, &fd);
-                PixFmt pf = FromSubtype(sub);
-                if (pf == PixFmt::Unknown) continue;
-                LOGI("    %-5s %ux%u @ %.3f", PixFmtName(pf), w, h, fd ? (double)fn / fd : 0.0);
-            }
+std::vector<NativeType> NativeTypes(IMFSourceReader* reader) {
+    std::vector<NativeType> types;
+    for (DWORD k = 0;; k++) {
+        ComPtr<IMFMediaType> type;
+        if (FAILED(reader->GetNativeMediaType(kVideoStream, k, &type))) break;
+        GUID subtype{};
+        UINT32 w = 0, h = 0, fpsNum = 0, fpsDen = 0, stride = 0;
+        type->GetGUID(MF_MT_SUBTYPE, &subtype);
+        MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h);
+        MFGetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
+        const std::optional<PixFmt> format = FromSubtype(subtype);
+        if (!format || !fpsDen || FAILED(type->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride))) continue;
+        const CaptureMode mode{*format, w, h, (double)fpsNum / fpsDen};
+        if (std::none_of(types.begin(), types.end(), [&](const NativeType& t) { return SameMode(t.mode, mode); }))
+            types.push_back({type, mode, (int)(INT32)stride});
+    }
+    return types;
+}
+
+ColorOptions ReadColorTags(IMFMediaType* type) {
+    ColorOptions tags;
+    UINT32 v = 0;
+    if (SUCCEEDED(type->GetUINT32(MF_MT_YUV_MATRIX, &v))) {
+        if (v == MFVideoTransferMatrix_BT709) tags.matrix = ColorMatrix::Bt709;
+        else if (v == MFVideoTransferMatrix_BT601) tags.matrix = ColorMatrix::Bt601;
+        else if (v == MFVideoTransferMatrix_BT2020_10 || v == MFVideoTransferMatrix_BT2020_12) tags.matrix = ColorMatrix::Bt2020;
+    }
+    if (SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &v))) {
+        if (v == MFNominalRange_0_255) tags.fullRange = true;
+        else if (v == MFNominalRange_16_235) tags.fullRange = false;
+    }
+    return tags;
+}
+
+class DeviceList {
+public:
+    DeviceList() {
+        ComPtr<IMFAttributes> filter;
+        MFCreateAttributes(&filter, 1);
+        filter->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+        MFEnumDeviceSources(filter.Get(), &devices_, &count_);
+    }
+    ~DeviceList() {
+        for (UINT32 i = 0; i < count_; i++) devices_[i]->Release();
+        CoTaskMemFree(devices_);
+    }
+    DeviceList(const DeviceList&) = delete;
+    DeviceList& operator=(const DeviceList&) = delete;
+
+    UINT32 Count() const { return count_; }
+    IMFActivate* operator[](UINT32 i) const { return devices_[i]; }
+    std::wstring Attribute(UINT32 i, const GUID& key) const {
+        WCHAR* value = nullptr;
+        UINT32 length = 0;
+        devices_[i]->GetAllocatedString(key, &value, &length);
+        std::wstring s = value ? value : L"";
+        CoTaskMemFree(value);
+        return s;
+    }
+    std::wstring Name(UINT32 i) const { return Attribute(i, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME); }
+    std::optional<UINT32> Find(const DeviceSelector& device) const {
+        if (const int* index = std::get_if<int>(&device)) return (UINT32)*index < count_ ? std::optional<UINT32>(*index) : std::nullopt;
+        if (const std::wstring* namePart = std::get_if<std::wstring>(&device)) {
+            for (UINT32 i = 0; i < count_; i++)
+                if (ContainsIgnoreCase(Name(i), *namePart)) return i;
+            return std::nullopt;
         }
-        src->Shutdown();
+        return count_ ? std::optional<UINT32>(0) : std::nullopt;
+    }
+
+private:
+    IMFActivate** devices_ = nullptr;
+    UINT32 count_ = 0;
+};
+
+}
+
+class MfCapture::ReaderCallback final : public IMFSourceReaderCallback {
+public:
+    explicit ReaderCallback(MfCapture* owner) : owner_(owner) {}
+
+    void Detach() {
+        std::unique_lock lock(ownerMutex_);
+        owner_ = nullptr;
+    }
+
+    STDMETHODIMP QueryInterface(REFIID iid, void** ppv) override {
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(IMFSourceReaderCallback)) {
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        *ppv = static_cast<IMFSourceReaderCallback*>(this);
+        AddRef();
+        return S_OK;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG refs = --refs_;
+        if (!refs) delete this;
+        return refs;
+    }
+    STDMETHODIMP OnReadSample(HRESULT status, DWORD, DWORD flags, LONGLONG timestamp, IMFSample* sample) override {
+        std::shared_lock lock(ownerMutex_);
+        if (owner_) owner_->OnSample(status, flags, timestamp, sample);
+        return S_OK;
+    }
+    STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
+    STDMETHODIMP OnEvent(DWORD, IMFMediaEvent*) override { return S_OK; }
+
+private:
+    std::shared_mutex ownerMutex_;
+    MfCapture* owner_;
+    std::atomic<ULONG> refs_{1};
+};
+
+std::vector<VideoDevice> VideoDevices() {
+    DeviceList devices;
+    std::vector<VideoDevice> out;
+    for (UINT32 i = 0; i < devices.Count(); i++)
+        out.push_back({devices.Name(i), devices.Attribute(i, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK)});
+    return out;
+}
+
+void MfCapture::ListDevices() {
+    DeviceList devices;
+    for (UINT32 i = 0; i < devices.Count(); i++) {
+        LOGI("capture device [%u] %s", i, WideToUtf8(devices.Name(i).c_str()).c_str());
+        ComPtr<IMFMediaSource> source;
+        if (FAILED(devices[i]->ActivateObject(IID_PPV_ARGS(&source)))) continue;
+        ComPtr<IMFAttributes> attributes;
+        MFCreateAttributes(&attributes, 1);
+        attributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
+        ComPtr<IMFSourceReader> reader;
+        if (SUCCEEDED(MFCreateSourceReaderFromMediaSource(source.Get(), attributes.Get(), &reader)))
+            for (const NativeType& t : NativeTypes(reader.Get()))
+                LOGI("    %-5s %ux%u @ %.3f", PixFmtName(t.mode.format), t.mode.width, t.mode.height, t.mode.rateHz);
+        source->Shutdown();
     }
 }
 
-MfCapture::MfCapture() {
-    frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    flushEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-}
-MfCapture::~MfCapture() {
-    Stop();
-    if (frameEvent_) CloseHandle(frameEvent_);
-    if (flushEvent_) CloseHandle(flushEvent_);
-}
+MfCapture::MfCapture() : frameEvent_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
 
-STDMETHODIMP MfCapture::QueryInterface(REFIID iid, void** ppv) {
-    static const QITAB qit[] = {QITABENT(MfCapture, IMFSourceReaderCallback), {0}};
-    return QISearch(this, qit, iid, ppv);
+MfCapture::~MfCapture() {
+    if (callback_) callback_->Detach();
+    reader_.Reset();
+    if (source_) source_->Shutdown();
+    CloseHandle(frameEvent_);
 }
 
 bool MfCapture::Open(Device& dev, const CaptureRequest& req) {
     dev_ = &dev;
-    DeviceList dl;
-    if (dl.count == 0) { LOGE("no video capture devices"); return false; }
-    int idx = req.deviceIndex;
-    if (idx < 0) {
-        for (UINT32 i = 0; i < dl.count; i++) {
-            std::wstring n = dl.Name(i);
-            if (req.deviceSubstring.empty() || n.find(req.deviceSubstring) != std::wstring::npos) { idx = (int)i; break; }
-        }
-    }
-    if (idx < 0 || idx >= (int)dl.count) { LOGE("capture device not found"); return false; }
-    info_.deviceName = WideToUtf8(dl.Name(idx).c_str());
-    info_.symbolicLink = dl.Str(idx, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
-    HR_CHECK(dl.devs[idx]->ActivateObject(IID_PPV_ARGS(&source_)));
+    DeviceList devices;
+    const std::optional<UINT32> index = devices.Find(req.device);
+    if (!index) { LOGE("capture device not found (%u device(s))", devices.Count()); return false; }
+    info_.deviceName = WideToUtf8(devices.Name(*index).c_str());
+    info_.symbolicLink = devices.Attribute(*index, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+    if (!Succeeded(devices[*index]->ActivateObject(IID_PPV_ARGS(&source_)), "activate device")) return false;
 
-    ComPtr<IMFAttributes> ra;
-    HR_CHECK(MFCreateAttributes(&ra, 4));
-    HR_CHECK(ra->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, static_cast<IMFSourceReaderCallback*>(this)));
-    HR_CHECK(ra->SetUINT32(MF_LOW_LATENCY, TRUE));
-    HR_CHECK(ra->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE)); // native uncompressed only
-    HR_CHECK(ra->SetUINT32(MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN, TRUE));
-    HR_CHECK(MFCreateSourceReaderFromMediaSource(source_.Get(), ra.Get(), &reader_));
+    callback_.Attach(new ReaderCallback(this));
+    ComPtr<IMFAttributes> attributes;
+    if (!Succeeded(MFCreateAttributes(&attributes, 4), "reader attributes") ||
+        !Succeeded(attributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, callback_.Get()), "reader callback") ||
+        !Succeeded(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "low latency") ||
+        !Succeeded(attributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE), "disable converters") ||
+        !Succeeded(attributes->SetUINT32(MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN, TRUE), "disconnect on shutdown") ||
+        !Succeeded(MFCreateSourceReaderFromMediaSource(source_.Get(), attributes.Get(), &reader_), "create source reader"))
+        return false;
 
-    // Pick the native type: preferred format first, then any uncompressed format with matching size/rate.
-    const PixFmt order[] = {req.format, PixFmt::YUY2, PixFmt::NV12, PixFmt::RGB32, PixFmt::P010, PixFmt::RGB24};
-    ComPtr<IMFMediaType> chosen;
-    for (PixFmt want : order) {
-        for (DWORD k = 0; !chosen; k++) {
-            ComPtr<IMFMediaType> mt;
-            if (FAILED(reader_->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, k, &mt))) break;
-            GUID sub{}; mt->GetGUID(MF_MT_SUBTYPE, &sub);
-            UINT32 w = 0, h = 0, fn = 0, fd = 1;
-            MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &w, &h);
-            MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &fn, &fd);
-            double fps = fd ? (double)fn / fd : 0;
-            if (FromSubtype(sub) == want && w == req.width && h == req.height && std::abs(fps - req.fps) < 0.5) {
-                chosen = mt;
-                info_.format = want; info_.width = w; info_.height = h; info_.fps = fps;
-                UINT32 st = 0;
-                if (SUCCEEDED(mt->GetUINT32(MF_MT_DEFAULT_STRIDE, &st))) info_.stride = (int)st;
-            }
-        }
-        if (chosen) break;
+    const std::vector<NativeType> types = NativeTypes(reader_.Get());
+    for (const NativeType& t : types) info_.modes.push_back(t.mode);
+    const PixFmt formatOrder[] = {req.mode.format, PixFmt::YUY2, PixFmt::NV12, PixFmt::RGB32, PixFmt::P010, PixFmt::RGB24};
+    const NativeType* chosen = nullptr;
+    for (PixFmt format : formatOrder) {
+        const CaptureMode wanted{format, req.mode.width, req.mode.height, req.mode.rateHz};
+        const auto it = std::find_if(types.begin(), types.end(), [&](const NativeType& t) { return MatchesRequest(t.mode, wanted); });
+        if (it != types.end()) { chosen = &*it; break; }
     }
-    if (!chosen) { LOGE("no native media type %ux%u@%.2f found", req.width, req.height, req.fps); return false; }
-    HR_CHECK(reader_->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE));
-    HR_CHECK(reader_->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE));
-    HR_CHECK(reader_->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, chosen.Get()));
-    LOGI("capture: '%s' %s %ux%u @ %.3f fps (default stride %d)", info_.deviceName.c_str(), PixFmtName(info_.format),
-         info_.width, info_.height, info_.fps, info_.stride);
-    ConfigureRepeat();
+    if (!chosen) { LOGE("no native media type %ux%u@%.2f found", req.mode.width, req.mode.height, req.mode.rateHz); return false; }
+    info_.mode = chosen->mode;
+    info_.stride = chosen->stride;
+    info_.tagged = ReadColorTags(chosen->type.Get());
+    if (!Succeeded(reader_->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE), "deselect streams") ||
+        !Succeeded(reader_->SetStreamSelection(kVideoStream, TRUE), "select video stream") ||
+        !Succeeded(reader_->SetCurrentMediaType(kVideoStream, nullptr, chosen->type.Get()), "set media type"))
+        return false;
+    LOGI("capture: '%s' %s %ux%u @ %.3f fps (default stride %d)", info_.deviceName.c_str(), PixFmtName(info_.mode.format),
+         info_.mode.width, info_.mode.height, info_.mode.rateHz, info_.stride);
+    periodHns_ = kHnsPerSecond / info_.mode.rateHz;
     return CreateSlots();
 }
 
-// Repeat detection compares plane 0 (the luma plane for NV12 / P010) of each frame.
-void MfCapture::ConfigureRepeat() {
-    const int w = (int)info_.width, h = (int)info_.height;
-    switch (info_.format) {
-    case PixFmt::YUY2: repeat_.Configure(DiffLayout::Bytes8, w * 2, h, repeatConfig); break;
-    case PixFmt::NV12: repeat_.Configure(DiffLayout::Bytes8, w, h, repeatConfig); break;
-    case PixFmt::P010: repeat_.Configure(DiffLayout::HighBytes16, w * 2, h, repeatConfig); break;
-    case PixFmt::RGB24: repeat_.Configure(DiffLayout::Bytes8, w * 3, h, repeatConfig); break;
-    case PixFmt::RGB32: repeat_.Configure(DiffLayout::Bytes8, w * 4, h, repeatConfig); break;
-    default: repeat_.Configure(DiffLayout::Bytes8, 0, 0, repeatConfig); break;
-    }
-}
-
-void MfCapture::DetectRepeat(const BYTE* top, LONG pitch, RawFrame& f) {
-    f.repeatChecked = repeat_.Configured();
-    f.repeat = repeat_.Check(top, pitch);
-    f.changedFrac = (float)repeat_.LastChangedFrac();
-    f.meanAbsDiff = (float)repeat_.LastMeanAbsDiff();
-    f.repeatCheckMs = (float)repeat_.LastCostMs();
-    repeatCostMs_.store(repeat_.LastCostMs(), std::memory_order_relaxed);
-    if (f.repeat) repeatFrames_.fetch_add(1, std::memory_order_relaxed);
-}
-
 bool MfCapture::CreateSlots() {
-    const UINT w = info_.width, h = info_.height;
-    struct PlaneDesc { DXGI_FORMAT fmt; UINT w, h, bpp; };
-    std::vector<PlaneDesc> pd;
-    switch (info_.format) {
-    case PixFmt::YUY2: pd = {{DXGI_FORMAT_R8G8B8A8_UNORM, w / 2, h, 4}}; break;  // texel = Y0 U Y1 V
-    case PixFmt::NV12: pd = {{DXGI_FORMAT_R8_UNORM, w, h, 1}, {DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2, 2}}; break;
-    case PixFmt::P010: pd = {{DXGI_FORMAT_R16_UNORM, w, h, 2}, {DXGI_FORMAT_R16G16_UNORM, w / 2, h / 2, 4}}; break;
-    case PixFmt::RGB24: pd = {{DXGI_FORMAT_R8_UNORM, w * 3, h, 1}}; break;           // raw bytes, decoded in shader
-    case PixFmt::RGB32: pd = {{DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 4}}; break;
-    default: return false;
+    const UINT w = info_.mode.width, h = info_.mode.height;
+    switch (info_.mode.format) {
+    case PixFmt::YUY2: planes_ = {{DXGI_FORMAT_R8G8B8A8_UNORM, w / 2, h, 4}}; break;
+    case PixFmt::NV12: planes_ = {{DXGI_FORMAT_R8_UNORM, w, h, 1}, {DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2, 2}}; break;
+    case PixFmt::P010: planes_ = {{DXGI_FORMAT_R16_UNORM, w, h, 2}, {DXGI_FORMAT_R16G16_UNORM, w / 2, h / 2, 4}}; break;
+    case PixFmt::RGB24: planes_ = {{DXGI_FORMAT_R8_UNORM, w * 3, h, 1}}; break;
+    case PixFmt::RGB32: planes_ = {{DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 4}}; break;
     }
-    planeCount_ = (int)pd.size();
-    for (auto& s : slots_) {
-        for (size_t p = 0; p < pd.size(); p++) {
+    for (Slot& s : slots_) {
+        for (size_t p = 0; p < planes_.size(); p++) {
             D3D11_TEXTURE2D_DESC td{};
-            td.Width = pd[p].w; td.Height = pd[p].h; td.MipLevels = 1; td.ArraySize = 1;
-            td.Format = pd[p].fmt; td.SampleDesc.Count = 1;
+            td.Width = planes_[p].texelsPerRow; td.Height = planes_[p].rows; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = planes_[p].format; td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_DYNAMIC;
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            HR_CHECK(dev_->dev()->CreateTexture2D(&td, nullptr, &s.planes[p].tex));
-            HR_CHECK(dev_->dev()->CreateShaderResourceView(s.planes[p].tex.Get(), nullptr, &s.planes[p].srv));
-            s.planes[p].rowBytes = pd[p].w * pd[p].bpp;
-            s.planes[p].rows = pd[p].h;
+            if (!Succeeded(dev_->D3dDevice()->CreateTexture2D(&td, nullptr, &s.planes[p].tex), "upload texture") ||
+                !Succeeded(dev_->D3dDevice()->CreateShaderResourceView(s.planes[p].tex.Get(), nullptr, &s.planes[p].srv), "upload view"))
+                return false;
         }
     }
     return true;
 }
 
-void MfCapture::Start() {
-    if (detectRepeats) ConfigureRepeat();   // picks up repeatConfig set after Open(); resets the reference
-    running_ = true;
-    RequestNext();
-}
-
-void MfCapture::Stop() {
-    if (!running_.exchange(false)) return;
-    // Flush completes asynchronously (OnFlush); then wait for any OnReadSample still running
-    // so the callback object is never used after the app deletes it.
-    if (reader_) {
-        ResetEvent(flushEvent_);
-        if (SUCCEEDED(reader_->Flush((DWORD)MF_SOURCE_READER_ALL_STREAMS))) WaitForSingleObject(flushEvent_, 1000);
+void MfCapture::Start(const CaptureAnalysis& analysis) {
+    analysis_ = analysis;
+    if (analysis_.repeat) {
+        const DiffLayout layout = info_.mode.format == PixFmt::P010 ? DiffLayout::HighBytes16 : DiffLayout::Bytes8;
+        repeat_.Configure(layout, (int)planes_[0].RowBytes(), (int)planes_[0].rows, *analysis_.repeat);
     }
-    for (int i = 0; i < 200 && inCallback_.load() > 0; i++) Sleep(5);
-    reader_.Reset();
-    if (source_) { source_->Shutdown(); source_.Reset(); }
-    for (int i = 0; i < 200 && inCallback_.load() > 0; i++) Sleep(5);
+    RequestNext();
 }
 
 void MfCapture::RequestNext() {
-    if (!running_ || !reader_) return;
-    HRESULT hr = reader_->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, nullptr, nullptr, nullptr);
-    if (FAILED(hr)) { errors_++; LOGE("ReadSample failed: %s", HrToString(hr).c_str()); }
+    const HRESULT hr = reader_->ReadSample(kVideoStream, 0, nullptr, nullptr, nullptr, nullptr);
+    if (FAILED(hr)) LOGE("capture stopped: ReadSample failed: %s", HrToString(hr).c_str());
 }
 
-STDMETHODIMP MfCapture::OnReadSample(HRESULT hrStatus, DWORD, DWORD flags, LONGLONG timestamp, IMFSample* sample) {
+void MfCapture::OnSample(HRESULT status, DWORD flags, LONGLONG timestamp, IMFSample* sample) {
     const int64_t arrival = Qpc::Now();
-    struct InFlight { std::atomic<int>& c; InFlight(std::atomic<int>& x) : c(x) { c++; } ~InFlight() { c--; } } guard(inCallback_);
-    if (!running_) return S_OK;
-    // Issue the next read immediately so the source never starves.
-    RequestNext();
-    // Errors and stream discontinuities: the next frame must never be called a repeat of a stale frame.
-    if (FAILED(hrStatus)) { errors_++; repeat_.Reset(); LOGE("capture error: %s", HrToString(hrStatus).c_str()); return S_OK; }
-    if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { repeat_.Reset(); LOGW("capture end of stream"); return S_OK; }
+    if (FAILED(status)) { LOGE("capture stopped: %s", HrToString(status).c_str()); return; }
+    if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { LOGW("capture stopped: end of stream"); return; }
     if (flags & MF_SOURCE_READERF_STREAMTICK) repeat_.Reset();
-    if (!sample) return S_OK;
+    if (sample) Publish(sample, timestamp, arrival);
+    RequestNext();
+}
 
-    LONGLONG dur = 0;
-    sample->GetSampleDuration(&dur);
-    if (dur <= 0) dur = (LONGLONG)(1e7 / std::max(1.0, info_.fps));
-    // Frame steps from consecutive sample times, using a *measured* frame period: sources
-    // are often 59.94 Hz while advertising 60, and a nominal-period index would skip a
-    // number every ~17 s (a fake drop that corrupts the source clock fit).
+int64_t MfCapture::NextSourceIndex(LONGLONG timestamp, int64_t arrival) {
     int64_t steps = 1;
-    if (periodHns_ <= 0) periodHns_ = (double)dur;
     if (lastSampleTime_ >= 0) {
         const double gap = (double)(timestamp - lastSampleTime_);
-        steps = std::max<int64_t>(1, (int64_t)std::llround(gap / periodHns_));
-        if (steps == 1 && std::abs(gap - periodHns_) < 0.1 * periodHns_) periodHns_ += 0.02 * (gap - periodHns_);
+        steps = std::max<int64_t>(1, std::llround(gap / periodHns_));
+        if (steps == 1 && std::abs(gap - periodHns_) < kPeriodTrackTolerance * periodHns_) periodHns_ += kPeriodTrackGain * (gap - periodHns_);
         if (steps > 1) {
-            repeat_.Reset();   // frames were lost: compare the next one against nothing stale
-            uint64_t lost = (uint64_t)(steps - 1);
+            repeat_.Reset();
+            const uint64_t lost = (uint64_t)(steps - 1);
             dropped_ += lost;
-            static int64_t lastWarn = 0;
-            if (arrival - lastWarn > Qpc::FromMs(500)) {
-                LOGW("capture gap: %.1f ms (%llu frame(s) lost), callback-to-callback %.1f ms", gap / 1e4, (unsigned long long)lost,
-                     lastArrival_ ? Qpc::ToMs(arrival - lastArrival_) : 0.0);
-                lastWarn = arrival;
+            if (arrival - lastGapWarnQpc_ > Qpc::FromMs(kGapWarnIntervalMs)) {
+                LOGW("capture gap: %.1f ms (%llu frame(s) lost), callback-to-callback %.1f ms", gap / kHnsPerMs, (unsigned long long)lost,
+                     Qpc::ToMs(arrival - lastArrival_));
+                lastGapWarnQpc_ = arrival;
             }
         }
     }
     lastSampleTime_ = timestamp;
     lastArrival_ = arrival;
-    if (firstSampleTime_ < 0) firstSampleTime_ = timestamp;
+    return lastIndex_ += steps;
+}
 
+void MfCapture::Publish(IMFSample* sample, LONGLONG timestamp, int64_t arrival) {
     RawFrame f;
     f.seq = ++seq_;
     f.slot = (int)(f.seq % kSlots);
     f.arrivalQpc = arrival;
-    f.sampleDurQpc = Qpc::FromHns(dur);
-    {
-        // Source timeline index: +1 per frame, +k across a gap of k periods (dropped frames).
-        f.sourceIndex = lastIndex_ < 0 ? 0 : lastIndex_ + steps;
-        lastIndex_ = f.sourceIndex;
-    }
-    // Absolute device capture time (QPC in 100ns) when the driver provides it.
-    UINT64 devRef = 0;
-    if (SUCCEEDED(sample->GetUINT64(CAMSS_MFSampleExtension_DeviceReferenceSystemTime, &devRef)) && devRef)
-        f.sampleTimeQpc = Qpc::FromHns((int64_t)devRef);
-    else
-        f.sampleTimeQpc = Qpc::FromHns(timestamp); // MF sample time is QPC-based for capture sources
+    f.sourceIndex = NextSourceIndex(timestamp, arrival);
+    UINT64 deviceTime = 0;
+    const bool haveDeviceTime = SUCCEEDED(sample->GetUINT64(MFSampleExtension_DeviceReferenceSystemTime, &deviceTime)) && deviceTime;
+    f.sampleQpc = Qpc::FromHns(haveDeviceTime ? (int64_t)deviceTime : timestamp);
 
-    Slot& s = slots_[f.slot];
+    Slot& slot = slots_[f.slot];
     {
-        std::lock_guard<std::mutex> lk(s.lock);
-        if (!Upload(sample, s, f)) {
-            s.seq = 0;   // slot content is undefined now; never publish it
+        std::lock_guard lock(slot.lock);
+        if (!Upload(sample, slot, f)) {
+            slot.seq = 0;
             repeat_.Reset();
-            return S_OK;
+            LOG_EVERY_MS(LogLevel::Warn, 1000, "capture: frame upload failed");
+            return;
         }
-        s.seq = f.seq;
+        slot.seq = f.seq;
     }
     f.uploadedQpc = Qpc::Now();
     {
-        std::lock_guard<std::mutex> lk(latestMutex_);
-        latest_ = f;
+        std::lock_guard lock(pendingMutex_);
+        if (pending_.size() == kMaxPendingFrames) pending_.erase(pending_.begin());
         pending_.push_back(f);
-        if (pending_.size() > 64) pending_.erase(pending_.begin());
     }
     SetEvent(frameEvent_);
-    if (onFrame) onFrame(f);
-    return S_OK;
 }
 
-bool MfCapture::Upload(IMFSample* sample, Slot& s, RawFrame& f) {
-    ComPtr<IMFMediaBuffer> buf;
-    if (FAILED(sample->GetBufferByIndex(0, &buf))) { errors_++; return false; }
-    BYTE* base = nullptr;
-    LONG pitch = 0;
-    ComPtr<IMF2DBuffer> b2d;
-    DWORD curLen = 0;
-    bool locked2d = false;
-    if (SUCCEEDED(buf.As(&b2d)) && SUCCEEDED(b2d->Lock2D(&base, &pitch))) {
-        locked2d = true;
-    } else {
-        DWORD maxLen = 0;
-        if (FAILED(buf->Lock(&base, &maxLen, &curLen))) { errors_++; return false; }
-        pitch = info_.stride ? info_.stride : (LONG)s.planes[0].rowBytes;
-        if (pitch < 0) base += (size_t)(-pitch) * (info_.height - 1); // bottom-up contiguous buffer
-    }
-    // `base` points at scanline 0 (top row); `pitch` may be negative for bottom-up RGB.
-    const BYTE* src = base;
-    bool ok = true;
-    if (decodeTimecode) DecodeTimecode(base, pitch, f);
-    for (int p = 0; p < planeCount_; p++) {
-        Plane& pl = s.planes[p];
-        D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(dev_->ctx()->Map(pl.tex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { errors_++; ok = false; break; }
-        BYTE* dst = (BYTE*)m.pData;
-        if ((LONG)m.RowPitch == pitch && pitch == (LONG)pl.rowBytes) {
-            memcpy(dst, src, (size_t)pl.rowBytes * pl.rows);
-        } else {
-            for (UINT y = 0; y < pl.rows; y++) memcpy(dst + (size_t)y * m.RowPitch, src + (ptrdiff_t)y * pitch, pl.rowBytes);
-        }
-        dev_->ctx()->Unmap(pl.tex.Get(), 0);
-        // NV12/P010 chroma plane follows the luma plane with the same pitch.
-        src = src + (ptrdiff_t)pitch * pl.rows;
-    }
-    // After the copy, while the buffer is still locked: the frame was just read, so the
-    // compared rows come from cache (~50 us for 1080p YUY2 with the default rowStep 2).
-    if (ok && detectRepeats) DetectRepeat(base, pitch, f);
-    if (locked2d) b2d->Unlock2D(); else buf->Unlock();
-    return ok;
+bool MfCapture::Upload(IMFSample* sample, Slot& slot, RawFrame& f) {
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(sample->GetBufferByIndex(0, &buffer))) return false;
+    ComPtr<IMF2DBuffer> buffer2d;
+    const bool is2d = SUCCEEDED(buffer.As(&buffer2d));
+    BYTE* top = nullptr;
+    LONG pitch = info_.stride;
+    if (FAILED(is2d ? buffer2d->Lock2D(&top, &pitch) : buffer->Lock(&top, nullptr, nullptr))) return false;
+    if (!is2d && pitch < 0) top += (size_t)(-pitch) * (info_.mode.height - 1);
+    const bool copied = CopyPlanes(top, pitch, slot);
+    if (copied) Analyse(top, pitch, f);
+    if (is2d) buffer2d->Unlock2D(); else buffer->Unlock();
+    return copied;
 }
 
-bool DecodeTimecodeFrame(const uint8_t* top, ptrdiff_t pitch, PixFmt fmt, int W, int H, uint32_t* value) {
-    const int y = std::max(1, (int)(H * kTimecodeBandFrac * 0.5f));
-    const uint8_t* row = top + (ptrdiff_t)y * pitch;
-    auto luma = [&](int x) -> int {
-        switch (fmt) {
-        case PixFmt::YUY2: return row[x * 2];
-        case PixFmt::NV12: return row[x];
-        case PixFmt::P010: return row[x * 2 + 1];
-        case PixFmt::RGB24: return row[x * 3 + 1];
-        case PixFmt::RGB32: return row[x * 4 + 1];
-        default: return 0;
-        }
-    };
-    const float bw = (float)W / kTimecodeBlocks;
-    int vals[kTimecodeBlocks];
-    for (int b = 0; b < kTimecodeBlocks; b++) {
-        int cx = (int)((b + 0.5f) * bw), r = std::max(1, (int)(bw * 0.25f)), sum = 0, n = 0;
-        for (int x = std::max(0, cx - r); x <= std::min(W - 1, cx + r); x++) { sum += luma(x); n++; }
-        vals[b] = n ? sum / n : 0;
+bool MfCapture::CopyPlanes(const BYTE* top, LONG pitch, Slot& slot) {
+    const BYTE* src = top;
+    for (size_t p = 0; p < planes_.size(); p++) {
+        const PlaneLayout& layout = planes_[p];
+        ID3D11Texture2D* tex = slot.planes[p].tex.Get();
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(dev_->Context()->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return false;
+        BYTE* dst = (BYTE*)mapped.pData;
+        const UINT rowBytes = layout.RowBytes();
+        if ((LONG)mapped.RowPitch == pitch && pitch == (LONG)rowBytes)
+            memcpy(dst, src, (size_t)rowBytes * layout.rows);
+        else
+            for (UINT y = 0; y < layout.rows; y++) memcpy(dst + (size_t)y * mapped.RowPitch, src + (ptrdiff_t)y * pitch, rowBytes);
+        dev_->Context()->Unmap(tex, 0);
+        src += (ptrdiff_t)pitch * layout.rows;
     }
-    const int thr = (vals[0] + vals[kTimecodeBlocks - 1]) / 2;
-    if (vals[0] - vals[kTimecodeBlocks - 1] < 80) return false;   // markers not present
-    uint32_t v = 0;
-    for (int b = 1; b <= kTimecodeBits; b++) {
-        if (std::abs(vals[b] - thr) < 30) return false;               // ambiguous (mid-transition / scaled)
-        v = (v << 1) | (vals[b] > thr ? 1u : 0u);
-    }
-    *value = v;
     return true;
 }
 
-void MfCapture::DecodeTimecode(const BYTE* top, LONG pitch, RawFrame& f) const {
-    f.timecodeValid = DecodeTimecodeFrame(top, pitch, info_.format, (int)info_.width, (int)info_.height, &f.timecode);
-}
-
-RawFrame MfCapture::Latest() const {
-    std::lock_guard<std::mutex> lk(latestMutex_);
-    return latest_;
+void MfCapture::Analyse(const BYTE* top, LONG pitch, RawFrame& f) {
+    if (analysis_.decodeTimecode)
+        f.timecode = DecodeTimecode(top, pitch, info_.mode.format, (int)info_.mode.width, (int)info_.mode.height);
+    if (analysis_.repeat) {
+        const RepeatCheck check = repeat_.Check(top, pitch);
+        f.repeat = check.repeat;
+        f.repeatCheckMs = (float)check.costMs;
+    }
 }
 
 std::vector<RawFrame> MfCapture::Drain() {
-    std::lock_guard<std::mutex> lk(latestMutex_);
-    std::vector<RawFrame> out;
-    out.swap(pending_);
-    return out;
+    std::lock_guard lock(pendingMutex_);
+    std::vector<RawFrame> frames;
+    frames.swap(pending_);
+    return frames;
 }
 
 bool MfCapture::LockSlot(const RawFrame& f) {
-    if (f.slot < 0) return false;
-    slots_[f.slot].lock.lock();
-    if (slots_[f.slot].seq != f.seq) { slots_[f.slot].lock.unlock(); return false; }
-    return true;
+    Slot& slot = slots_[f.slot];
+    slot.lock.lock();
+    if (slot.seq == f.seq) return true;
+    slot.lock.unlock();
+    return false;
 }
+
 void MfCapture::UnlockSlot(const RawFrame& f) { slots_[f.slot].lock.unlock(); }
 
-} // namespace camss
+}

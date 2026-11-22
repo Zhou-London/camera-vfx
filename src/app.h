@@ -1,149 +1,199 @@
-// camss application: wires capture -> convert -> pacing -> interpolation -> SR/HDR -> present.
 #pragma once
-#include "util/common.h"
 #include "config.h"
-#include "util/stats.h"
-#include "gfx/device.h"
-#include "gfx/color_convert.h"
-#include "gfx/blit.h"
-#include "capture/mf_capture.h"
-#include "present/presenter.h"
-#include "pacing/clocks.h"
-#include "pacing/pacer.h"
-#include "interp/interpolator.h"
-#include "scale/rtx_video.h"
-#include "pacing/cadence.h"
 #include "audio/audio_monitor.h"
-#include "ui/telemetry.h"
+#include "capture/frame_source.h"
+#include "gfx/blit.h"
+#include "gfx/device.h"
+#include "gfx/gpu_profiler.h"
+#include "pacing/cadence.h"
+#include "pacing/clocks.h"
+#include "pacing/lead.h"
+#include "pacing/multiplier.h"
+#include "pacing/pacer.h"
+#include "present/present_monitor.h"
+#include "present/presenter.h"
 #include "ui/dashboard.h"
+#include "ui/telemetry.h"
+#include "util/stats.h"
+#include <atomic>
+#include <functional>
 #include <memory>
-#include <deque>
-#include <array>
+#include <optional>
+#include <string>
+#include <vector>
 
-namespace camss {
+namespace cameravfx {
 
 class VfxChain;
-extern std::atomic<bool> g_tuiActive;
-extern std::atomic<bool> g_quitRequested;   // the dashboard owns the console (crash handler restores it)
 
-int RunSelfTest(const Options& o);
+extern std::atomic<bool> g_quitRequested;
 
 class App {
 public:
-    explicit App(const Options& o);
+    explicit App(const Options& options);
     ~App();
+    App(const App&) = delete;
+    App& operator=(const App&) = delete;
     bool Init(HINSTANCE inst);
     int Run();
 
 private:
-    static constexpr int kStore = 16;   // source frames kept (covers content periods up to 4 with the pacing lag)
-    struct OutRecord {
-        uint64_t idx = 0;
-        UINT presentId = 0;
-        int64_t renderStart = 0, presentCall = 0, predictedV = 0, actualV = 0;
-        int64_t nA = 0, nB = 0; float t = 0;
-        double delayMs = 0, slackMs = 0; bool late = false, hold = false;
-        int64_t newestArrival = 0, newestSample = 0, contentSample = 0, newestUploaded = 0;
-        double renderCpuMs = 0;
-        float gpuMs = 0;
-        bool interp = false;
-        bool finalized = false;
+    struct OutputSlot {
+        PaceDecision decision;
+        int64_t renderStart = 0;
+        int64_t vblank = 0;
+        UINT syncInterval = 1;
+        int64_t presentAt = 0;
     };
+    struct SettingsMenu {
+        std::vector<SettingItem> items;
+        std::vector<CaptureMode> formats;
+        std::vector<CaptureMode> modes;
+        std::vector<int> srQualities;
+        std::vector<double> fgThresholds;
+        SettingItem& Add(SettingId id, SettingItem::Kind kind, const char* group, const char* label);
+    };
+    struct MeasuredLatency {
+        std::string metric;
+        Percentiles arrival;
+        std::optional<Percentiles> content;
+    };
+    struct Loading {
+        std::string label;
+        bool fgModel = false, srModel = false;
+        int64_t since = 0;
+    };
+    enum class LoadingIngest { None, KeepSourceClock };
 
-    void Ingest(int64_t now);
-    void IngestCaptured(const RawFrame& f);
-    SourceFrame* Frame(int64_t n);
-    // presentAt != 0: hold the Present() until that QPC time (VRR: the flip happens at present).
-    bool Render(const PaceDecision& d, int64_t renderStart, int64_t V, UINT sync, bool tearing, int64_t presentAt = 0);
-    void PollPresentStats();
-    void FinalizeRecord(OutRecord& r);
-    void Report(bool final);
-    void HandleKeys();
-    // Frame generation adapts to the content rate (repeat detection + cadence).
-    void OnContentRateChanged();
-    int ChooseMultiplier(double contentFps) const;
-    // (Re)creates the Maxine chain with the current quality settings (run-time F / Q keys).
+    static constexpr double kStatusPublishMs = 100;
+
+    bool SetupProcessing();
     bool BuildVfx();
-    void RebuildVfx(int oldFgMode, int oldSrQuality);   // falls back to these on failure
-    void WarmUp(bool initial);
-    void PrintDetail();
+    void WarmUpChain();
+    bool FgActive() const { return options_.fg && fgOn_; }
+
+    void ResetPacing(double contentPeriod);
+    CaptureAnalysis Analysis() const;
+    void OnContentRateChanged();
+    MultiplierChoice MultiplierFor(int requested, double thresholdFps) const;
+    bool UpdateMultiplier();
+    void RecheckMultiplier(int64_t now);
+    double SignalHz() const;
+    double ContentFps() const;
+    double OutputPeriodMs() const;
+    std::string ModeLabel() const;
+
+    void RunLoop(double untilSec);
+    bool KeepRunning(double untilSec) const;
+    std::optional<OutputSlot> NextSlot();
+    std::optional<OutputSlot> NextFixedSlot();
+    std::optional<OutputSlot> NextVrrSlot();
+    std::optional<OutputSlot> NextPassthroughSlot();
+    PaceDecision ShowNewest() const;
+    void Ingest(int64_t now);
+    void Render(const OutputSlot& slot);
+    PresentedFrame DescribePresented(const OutputSlot& slot, const SourceFrame& a, const SourceFrame* b, bool generated, int64_t submitted,
+                                     int64_t presentCall) const;
+    void HoldPresent(const OutputSlot& slot);
+    void AfterPresents(int64_t now);
+
+    void BeginPause(Loading loading);
+    void EndPause(int64_t t0, double settleSec);
+    bool WhileLoading(const std::function<bool()>& work, LoadingIngest ingest);
+    void ShowLoading(std::optional<float> progress);
+    void SwitchModels(int fgQuality, int srQuality);
+    void RestartCapture(const CaptureMode& mode);
+    std::unique_ptr<MfCapture> ReopenCapture(const CaptureMode& mode);
     void StartAudio();
-    // Terminal UI / recording: status snapshot for the dashboard (cheap, render thread).
+
+    void HandleKeys();
+    void PressKey(int key);
+    void RunKeyScript();
+    void PublishSettings();
+    void AddCaptureSettings(SettingsMenu& menu) const;
+    void AddFgSettings(SettingsMenu& menu) const;
+    void AddSrSettings(SettingsMenu& menu) const;
+    void AddAudioSettings(SettingsMenu& menu) const;
+    void AddToolSettings(SettingsMenu& menu) const;
+    void ApplySetting(SettingId id, int value);
+    void SetMatrix(int choice);
+    void SetRange(int choice);
+    void SetFgOn(bool on);
+    void SetFgMultiplier(int multiplier);
+    void SetFgThreshold(double thresholdFps);
+    void SetSrOn(bool on);
+    void SetAudioVolume(int percent);
+    void SaveSettings();
+
+    void Report(int64_t now, bool final);
+    void ResetStats();
+    void ShowNotice(std::string text, double seconds);
+    void UpdateStageTimes();
+    std::optional<MeasuredLatency> Latency() const;
+    std::string StatusLine(const std::optional<MeasuredLatency>& latency) const;
+    void WarnGpuOverBudget();
+    void WarnSlowOutput();
+    void PrintDetail();
     void PublishStatus(int64_t now);
-    void BumpGeneration() { generation_++; }
     void StartDashboard();
     void StopDashboard();
-    void RunFixed();
-    void RunVrr();
-    void RunPassthrough(double untilSec = 0, int sync = -1);
 
-    Options o_;
+    Options options_;
     Device dev_;
-    MfCapture* cap_ = nullptr;
-    ColorConverter conv_;
-    SyntheticSource synth_;
-    Presenter pres_;
+    StatBook stats_;
+    FrameSource source_{dev_, stats_};
+    Presenter presenter_;
     VsyncClock vsync_;
     Pacer pacer_;
-    Blitter blit_;
-    GpuProfiler prof_;
-    std::unique_ptr<Interpolator> interp_;
-    std::unique_ptr<RtxVideo> rtx_;
-    std::unique_ptr<VfxChain> vfx_;
     CadenceDetector cadence_;
+    LeadController lead_;
+    Blitter blit_;
+    GpuProfiler profiler_;
+    std::unique_ptr<VfxChain> vfx_;
     AudioMonitor audio_;
-    Telemetry tel_;
+    Telemetry telemetry_;
     Dashboard dash_;
-    bool tui_ = false;               // the dashboard owns the console
-    bool statusLine_ = false;        // plain interactive console: pinned status line
-    uint64_t generation_ = 0;        // settings generation (dashboard segments)
-    int64_t lastStatusPub_ = 0, lastHeavyStats_ = 0;
-    double stCapture_ = -1, stUpload_ = -1, stFg_ = -1, stSr_ = -1, stHdr_ = -1, stGpu_ = 0;   // stage p50 (ms)
+    PresentMonitor monitor_{presenter_, stats_, telemetry_};
+    PreciseSleeper sleeper_;
+    ComPtr<ID3D11Query> frameDone_;
+
+    PaceMode mode_ = PaceMode::Fixed;
+    bool probing_ = false;
+    bool detectRepeats_ = false;
+    bool fgOn_ = true;
+    bool srOn_ = true;
+    MultiplierLimit multiplierLimit_ = MultiplierLimit::None;
+    FrameSize outputSize_;
+    bool vfxReloading_ = false;
+    bool haveSlot_ = false;
+    int64_t shownSignal_ = -1;
+    double lastVfxGpuMs_ = 0;
+    uint64_t gpuBusyAtPresent_ = 0;
+
+    Device::Tex pauseTex_;
+    bool pauseValid_ = false;
+    std::optional<Loading> loading_;
+
+    bool tui_ = false;
+    uint64_t statsEpoch_ = 0;
+    bool settingsDirty_ = true;
+    SettingsMenu menu_;
+    size_t keyScriptPos_ = 0;
+    StageTimes stages_;
+    double publishedCaptureMs_ = kUnknownMs;
+    AudioStats audioStats_;
     std::string notice_;
     int64_t noticeUntil_ = 0;
-    AudioStats audioStats_;          // refreshed with the heavy stats (copies strings: not per frame)
-    AppStatus statusPub_;            // reused buffer for PublishStatus (string capacity kept)
-    StatBook stats_;
-    PreciseSleeper sleeper_;
-
-    std::array<SourceFrame, kStore> store_;
-    Device::Tex interpOut_;          // src res, RGBA8
-    Device::Tex vpOut_;              // out res, BGRA8 or R10G10B10A2
-    UINT srcW_ = 0, srcH_ = 0, outW_ = 0, outH_ = 0;
-    UINT rtxInW_ = 0, rtxInH_ = 0;   // input size of the RTX video processor stage
-    bool haveSlot_ = false;
-    ComPtr<ID3D11Query> doneQ_;      // GPU completion of the last submitted frame
-    uint64_t gpuBusyAtPresent_ = 0;          // swap-chain waitable consumed but not yet presented
-    bool interpOn_ = true, srOn_ = true;
-    bool hdrOut_ = false;
-
-    int64_t synthNext_ = 0, synthN_ = 0, synthT0_ = 0;
-    int64_t synthContent_ = -1;      // synthetic source: last content frame index rendered
-    bool adaptive_ = false;          // repeat-aware frame generation active
-    int64_t lastUniqueN_ = -1;       // newest source frame carrying new content
-    uint64_t repeats_ = 0;           // repeated source frames skipped
-    uint64_t lastSeq_ = 0;           // capture sequence of the last frame seen by the app
-    bool contentLost_ = false;       // a new-content frame was lost: treat the next frames as new until one is stored
-    int curK_ = 2;                   // output frames per content frame (VRR)
-    uint64_t lastReportOut_ = 0;     // output count at the previous report (output rate)
-    double lastOutFps_ = 0;
-    int64_t lastArrival_ = 0;
-    int64_t lastPresentCall_ = 0;
-    UINT lastStatsPresent_ = 0, lastStatsRefresh_ = 0;
-    double vrrRatio_ = 3.0;
-    bool vrrActive_ = false;
-    double presentIntervalEma_ = 0;
+    int64_t startQpc_ = 0;
+    int64_t lastReport_ = 0;
+    int64_t lastStatusPublish_ = 0;
+    int64_t lastMultiplierCheck_ = 0;
+    int64_t statsResetAt_ = 0;
+    uint64_t lastReportPresented_ = 0;
+    double outFps_ = 0;
+    int slowReports_ = 0;
+    uint64_t slowReportsEpoch_ = 0;
     bool warmupDone_ = false;
-    std::deque<OutRecord> records_;
-    uint64_t outCount_ = 0;
-    uint64_t missed_ = 0, finalizedCount_ = 0;
-    double leadMs_ = 3.0;
-    double lastVfxGpuMs_ = 0;
-    RollingStat frameCost_{300};   // recent per-frame cost (ms) for the render-lead estimate
-    int64_t lastMissQpc_ = 0, lastLeadAdjust_ = 0;
-    FILE* csv_ = nullptr;
-    int64_t startQpc_ = 0, lastReport_ = 0;
-    uint64_t timecodeHits_ = 0;
 };
 
-} // namespace camss
+}

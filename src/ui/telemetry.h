@@ -1,81 +1,109 @@
-// Telemetry from the real-time render thread to the (low-priority) UI / recording thread.
-//  * FrameSample: one per output frame, pushed into a lock-free single-producer single-consumer
-//    ring. The render thread never blocks or allocates; when the ring is full the sample is dropped
-//    (counted).
-//  * AppStatus: slow-changing state (settings, rates, counters, audio), published by the render
-//    thread about 10 times per second under a mutex (one struct copy).
-//  * Keys: the UI forwards key presses to the app (render thread polls them like window keys).
 #pragma once
+#include "../pacing/multiplier.h"
+#include "../util/common.h"
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
-#include <array>
+#include <vector>
 
-namespace camss {
+namespace cameravfx {
+
+constexpr float kUnknownMs = -1;
 
 struct FrameSample {
-    int64_t qpc = 0;              // Present() call time (QPC ticks)
-    float latencyMs = -1;         // newest source frame arrival -> flip (VRR/immediate) or scan-out (fixed); <0 unknown
-    float contentMs = -1;         // content sample time -> flip / scan-out; <0 unknown
-    float delayMs = 0;            // pacer D
-    float gpuMs = 0;              // VFX chain GPU time (CUDA events) of a recent frame, 0 if no VFX
-    float t = 0;                  // interpolation step actually used
-    uint8_t flags = 0;            // kLate | kHold | kInterp
-    static constexpr uint8_t kLate = 1, kHold = 2, kInterp = 4;
+    int64_t qpc = 0;
+    float latencyMs = kUnknownMs;
+    float contentMs = kUnknownMs;
+    float delayMs = 0;
+    float gpuMs = 0;
+    uint8_t flags = 0;
+    static constexpr uint8_t kLate = 1, kHold = 2;
+};
+
+struct StageTimes {
+    double captureMs = kUnknownMs, uploadMs = kUnknownMs, fgMs = kUnknownMs, srMs = kUnknownMs, hdrMs = kUnknownMs;
 };
 
 struct AppStatus {
-    uint64_t generation = 0;      // bumps whenever a setting below changes (segments in the history)
+    uint64_t statsEpoch = 0;
     double uptimeSec = 0;
     bool warmupDone = false;
     std::string configPath;
-    // source / display
-    std::string captureName;      // "UGREEN 25173" or "synthetic"
-    std::string captureFormat;    // "YUY2 1920x1080@60"
-    unsigned srcW = 0, srcH = 0, outW = 0, outH = 0, dispW = 0, dispH = 0;
-    double dispHz = 0;
+    std::string captureName;
+    std::string captureFormat;
+    FrameSize sourceSize, outputSize, displaySize;
+    double displayHz = 0;
     bool vrrActive = false;
-    // settings
-    std::string mode;             // "vrr" | "fixed" | "passthrough" | "auto (probing)"
-    std::string interp;           // none | blend | nvof | vfx
-    std::string fgQuality;        // low | medium | high (vfx) or "-"
-    std::string sr;               // none | rtx | vfx
-    std::string srQuality;        // e.g. hb-ultra (vfx) or "-"
-    std::string hdr;              // none | rtx | vfx
-    bool interpOn = true, srOn = true;
-    bool timecode = false;        // loopback timecode bar drawn on the output (T)
-    bool adaptive = false;        // repeat-aware frame generation
-    int multiplier = 1;           // VRR output frames per content frame
-    double targetFps = 0;         // fg-target-fps (0 = fixed multiplier)
-    // rates
+    std::string mode;
+    bool probing = false;
+    bool fg = false, sr = false, hdr = false;
+    std::string fgQuality, srQuality;
+    bool fgOn = true, srOn = true;
+    bool fgActive = false;
+    bool timecode = false;
+    bool detectRepeats = false;
+    int fgMultiplier = 1;
+    int fgMultiplierRequested = 2;
+    double fgThresholdFps = 0;
+    MultiplierLimit fgMultiplierLimit = MultiplierLimit::None;
     double signalHz = 0, contentFps = 0, outFps = 0;
     bool contentStatic = false;
-    // pacing
-    double delayMs = 0, leadMs = 0, minSlackMs = 0, gpuBudgetMs = 0;
-    std::string latencyMetric;    // "arrival->flip" | "arrival->scanout"
-    uint64_t late = 0, hold = 0, drops = 0, missed = 0, repeats = 0, gpuBusy = 0;
-    // audio
-    bool audioEnabled = false, audioRunning = false, audioPlaying = false, audioMuted = false;
+    double leadMs = 0, gpuBudgetMs = 0;
+    uint64_t late = 0, drops = 0, missed = 0;
+    bool audioEnabled = false, audioRunning = false, audioMuted = false;
     float audioVolume = 1;
-    double audioLatencyMs = 0, audioBufferMs = 0, audioSyncMs = 0;
+    double audioLatencyMs = 0, audioSyncMs = 0;
     uint64_t audioUnderruns = 0;
     std::string audioIn, audioOut;
-    // pipeline stage times (p50 ms over the recent window; <0 = not present)
-    double captureMs = -1;        // device sample -> arrival (USB + frame server)
-    double uploadMs = -1;         // arrival -> uploaded
-    double fgMs = -1, srMs = -1, hdrMs = -1;   // VFX stages (GPU)
-    std::string notice;           // short latest warning shown in the UI (e.g. GPU over budget), may be empty
+    StageTimes stages;
+    std::string notice;
+    std::string loading;
+    bool fgLoading = false, srLoading = false;
 };
 
-// Lock-free SPSC ring (power-of-two capacity).
+enum class SettingId : uint16_t {
+    CapFormat, CapMode, Matrix, Range,
+    Fg, FgQuality, FgMultiplier, FgThreshold,
+    Sr, SrQuality,
+    Mute, AudioVolume,
+    Timecode, PrintStats, ResetStats, Save,
+    Count
+};
+inline const char* SettingName(SettingId id) {
+    static const char* const kNames[] = {"format", "capture", "matrix", "range", "fg", "fg-quality", "fg-multiplier", "fg-threshold",
+                                         "sr", "sr-quality", "mute", "audio-volume", "timecode", "print-stats", "reset-stats", "save"};
+    static_assert(std::size(kNames) == (size_t)SettingId::Count);
+    return kNames[(size_t)id];
+}
+
+struct SettingItem {
+    enum class Kind : uint8_t { Toggle, Choice, Action };
+    SettingId id = SettingId::Count;
+    Kind kind = Kind::Choice;
+    std::string group, label;
+    std::vector<std::string> choices;
+    std::vector<std::string> choiceNotes;
+    int value = 0;
+    bool pausesPlayback = false;
+    bool saved = false;
+    bool enabled = true;
+    std::string note;
+};
+
+struct SettingCmd {
+    SettingId id = SettingId::Count;
+    int value = 0;
+};
+
 template <typename T, size_t N>
 class SpscRing {
-    static_assert((N & (N - 1)) == 0, "N must be a power of two");
+    static_assert((N & (N - 1)) == 0);
 public:
     bool Push(const T& v) noexcept {
         const size_t h = head_.load(std::memory_order_relaxed);
-        if (h - tail_.load(std::memory_order_acquire) >= N) { dropped_.fetch_add(1, std::memory_order_relaxed); return false; }
+        if (h - tail_.load(std::memory_order_acquire) >= N) return false;
         buf_[h & (N - 1)] = v;
         head_.store(h + 1, std::memory_order_release);
         return true;
@@ -87,32 +115,55 @@ public:
         tail_.store(t + 1, std::memory_order_release);
         return true;
     }
-    uint64_t Dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
 private:
     std::array<T, N> buf_{};
     alignas(64) std::atomic<size_t> head_{0};
     alignas(64) std::atomic<size_t> tail_{0};
-    std::atomic<uint64_t> dropped_{0};
 };
 
 class Telemetry {
 public:
-    // ---- render thread
     void PushFrame(const FrameSample& s) noexcept { frames_.Push(s); }
-    void PublishStatus(const AppStatus& s) { std::lock_guard<std::mutex> lk(m_); status_ = s; statusSeq_++; }
-    int PopKey() noexcept { return keys_.Pop(lastKey_) ? lastKey_ : 0; }   // 0 = none
-    // ---- UI thread
+    void PublishStatus(AppStatus s) {
+        std::unique_lock<std::mutex> lk(m_, std::try_to_lock);
+        if (!lk) return;
+        status_ = std::move(s);
+        statusSeq_++;
+    }
+    int PopKey() noexcept { int vk = 0; keys_.Pop(vk); return vk; }
+    bool PopSetting(SettingCmd& c) noexcept { return cmds_.Pop(c); }
+    void PublishSettings(std::vector<SettingItem> items) {
+        std::lock_guard<std::mutex> lk(m_);
+        settings_ = std::move(items);
+        settingsSeq_++;
+    }
+
     bool PopFrame(FrameSample& s) noexcept { return frames_.Pop(s); }
-    AppStatus Status(uint64_t* seq = nullptr) const { std::lock_guard<std::mutex> lk(m_); if (seq) *seq = statusSeq_; return status_; }
-    void PushKey(int vk) noexcept { keys_.Push(vk); }   // Windows virtual-key code ('F', VK_ESCAPE, VK_OEM_PLUS ...)
-    uint64_t DroppedFrames() const noexcept { return frames_.Dropped(); }
+    bool Status(uint64_t& seq, AppStatus& out) const {
+        std::lock_guard<std::mutex> lk(m_);
+        if (statusSeq_ == seq) return false;
+        out = status_;
+        seq = statusSeq_;
+        return true;
+    }
+    void PushKey(int vk) noexcept { keys_.Push(vk); }
+    void PushSetting(const SettingCmd& c) noexcept { cmds_.Push(c); }
+    bool Settings(uint64_t& seq, std::vector<SettingItem>& out) const {
+        std::lock_guard<std::mutex> lk(m_);
+        if (settingsSeq_ == seq) return false;
+        out = settings_;
+        seq = settingsSeq_;
+        return true;
+    }
 private:
     SpscRing<FrameSample, 4096> frames_;
     SpscRing<int, 64> keys_;
-    int lastKey_ = 0;
+    SpscRing<SettingCmd, 64> cmds_;
     mutable std::mutex m_;
     AppStatus status_;
     uint64_t statusSeq_ = 0;
+    std::vector<SettingItem> settings_;
+    uint64_t settingsSeq_ = 0;
 };
 
-} // namespace camss
+}
